@@ -67,7 +67,7 @@ If you find something is wrongly marked, please feel free to update it.
 |--------------------------:|:--------:|:--------:|:--------:|:--------:|:--------:|:--------:|:---------:|:---------:|
 |            **AutoPilot** 	|    ✓   	|    ✓   	|    ✓   	|    ✓   	|    ✓   	|    ✓   	|    ✓    	|    ✓    	|
 |     **Auto<br>Download** 	|    ✓   	|    ✓   	|    ✓   	|    ✓   	|    ✓   	|    ✓   	|    ✓    	|    ✕    	|
-|    **Online<br>Install** 	|    ✕   	|    ✓   	|    ✓   	|    ✓   	|    ✓   	|    ✓   	|    ✓    	|    ✓    	|
+|    **Online<br>Install** 	|    ✓   	|    ✓   	|    ✓   	|    ✓   	|    ✓   	|    ✓   	|    ✓    	|    ✓    	|
 |   **Offline<br>Install** 	|    ✓   	|    ✓   	|    ✓   	|    ✓   	|    ✓   	|    ✓   	|    ✓    	|    ✓    	|
 |       **QEMU<br>Script** 	|    ✓   	|    ✓   	|    ✓   	|    ✓   	|    ✓   	|    ✓¹   	|    ✓¹    	|    ✓¹    	|
 |      **Virt<br>Manager** 	|    ✓   	|    ✓   	|    ✓   	|    ✓   	|    ✓   	|    ?²  	|    ?²   	|    ?²   	|
