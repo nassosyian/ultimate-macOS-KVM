@@ -36,8 +36,8 @@ parser.add_argument("-f", "--force", dest="forceModel", metavar="<model>", help=
 args = parser.parse_args()
 
 detectChoice = 1
-latestOSName = "Sequoia"
-latestOSVer = "15"
+latestOSName = "Tahoe"
+latestOSVer = "26"
 runs = 0
 
 
@@ -79,7 +79,7 @@ def autoRun():
     for x in vgaGrep:
         #val = x.split('[', 1)[1].split(']')
         a = "aaaa"  # aaaaaaaa?
-        val = re.findall('\[.*?\]', x)
+        val = re.findall(r'\[.*?\]', x)
         vgaGrepT.append(val)
     gpuList = open("resources/gpuList.json")
     data = json.load(gpuList)

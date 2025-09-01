@@ -2,7 +2,7 @@
 # pylint: disable=C0301,C0116,C0103,R0903
 
 # AUTOPILOT BY COOPYDOOD
-# (c) Copyright Coopydood 2022-2024
+# (c) Copyright Coopydood 2022-2025
 
 """
 This script was created by Coopydood as part of the ultimate-macOS-KVM project.
@@ -28,6 +28,9 @@ import timeit
 import random
 import uuid
 import platform
+from tkinter import Tk
+from tkinter.filedialog import askopenfilename
+
 sys.path.append('./resources/python')
 from cpydColours import color
 try:
@@ -37,6 +40,7 @@ except:
 global FEATURE_LEVEL
 global repoDir
 global nrsDir
+global newGenDialogs
 
 script = "autopilot.py"
 scriptName = "AutoPilot"
@@ -50,6 +54,7 @@ parser.add_argument("--disable-rpc", dest="disableRPC", help="Disables Discord r
 parser.add_argument("--disable-blob-check", dest="disableBlobCheck", help="Bypasses checking of blob integrity",action="store_true")
 parser.add_argument("--disable-progress", dest="disableProgress", help="Disable progress bar UI displays",action="store_true")
 parser.add_argument("--disable-percentage", dest="disablePercentage", help="Disable progress bar percentages and data labels",action="store_true")
+parser.add_argument("--disable-new-dialogs", dest="disableDialogs", help="Disable the GUI file picker dialogs",action="store_true")
 parser.add_argument("--skip-summary", dest="skipSummary", help="Starts the AutoPilot flow immediately after questioning",action="store_true")
 parser.add_argument("--skip-notices", dest="skipNotices", help="Don't download and load notices",action="store_true")
 parser.add_argument("--no-auto-download", dest="customDownload", help="Asks the user what to download during run",action="store_true")
@@ -66,7 +71,7 @@ latestOSVer = "26"
 runs = 0
 
 ###############################
-FEATURE_LEVEL = 10                   # DO NOT CHANGE - WILL BREAK THINGS!
+FEATURE_LEVEL = 11                   # DO NOT CHANGE - WILL BREAK THINGS!
 ###############################
 
 enableLog = True
@@ -116,6 +121,11 @@ if args.disablePercentage == True:
    enablePercentage = False
 else:
    enablePercentage = True
+
+if args.disableDialogs == True:
+   newGenDialogs = 0
+else:
+   newGenDialogs = 1
 
 version = open(repoDir+"/.version")
 version = version.read()
@@ -291,6 +301,11 @@ def startup():
       print("   "+color.BOLD+color.YELLOW+"   ⚠ "+color.END+color.BOLD+" LOGGING DISABLED"+color.END)
       print("   "+color.END+"      The logfile has been disabled. \n         No diagnostic information will be recorded."+color.END)
       print("   "+"  "+color.BOLD+"───────────────────────────────────────────────────────────────────",color.END)
+   elif newGenDialogs == 0:
+      print("\n   "+"  "+color.BOLD+"───────────────────────────────────────────────────────────────────",color.END)
+      print("   "+color.BOLD+color.YELLOW+"   ⚠ "+color.END+color.BOLD+" NEW DIALOGS DISABLED"+color.END)
+      print("   "+color.END+"      The new file dialog GUIs have been disabled. \n         Manual file path entry will be used instead."+color.END)
+      print("   "+"  "+color.BOLD+"───────────────────────────────────────────────────────────────────",color.END)
 
       #print(color.YELLOW+"\n   ⚠"+color.END+color.BOLD+" WARNING"+color.END)
       #print("   Logging has been disabled")
@@ -421,6 +436,7 @@ def autopilot():
    global USR_TARGET_OS_NAME
    global FEATURE_LEVEL
    global USR_CREATE_XML
+   global newGenDialogs
    global startTime
 
    USR_CPU_SOCKS = 1
@@ -1010,6 +1026,7 @@ def autopilot():
    def stage12():
       global customValue
       global currentStage
+      global newGenDialogs
       global USR_BOOT_FILE
       defaultValue = "BaseSystem.img"
       currentStage = 12
@@ -1068,11 +1085,28 @@ def autopilot():
 
 
       if customValue == 1:
+
+         
+
          cpydLog("info",str("Custom value requested, setting up"))
       #   print(color.BOLD+color.PURPLE+"\n   FORMAT:"+color.YELLOW+""+color.END+color.BOLD,"<file>"+color.YELLOW+".img"+color.END+"\n   Enter a custom value.\n   \n   ")
-         print(color.BOLD+color.PURPLE+"\n   FORMAT:",color.YELLOW+""+color.END+color.BOLD+"<file>"+color.YELLOW+".img"+color.END+"\n   Enter the full path to a bootable macOS Recovery image file.\n   It will be automatically copied into the root repo directory, or you\n   can place it there now and type \"BaseSystem.img\" without a path.\n   You",color.UNDERLINE+color.BOLD+"must"+color.END,"include any text in"+color.YELLOW,"yellow"+color.END+".\n\n      "+color.BOLD+"TIP:"+color.END,"You can drag and drop a file onto this window.\n   \n   ")
          cpydLog("wait",("Waiting for user input"))
-         customInput = str(input(color.BOLD+"Value> "+color.END))
+
+         if newGenDialogs == 1: 
+            print(color.BOLD+color.PURPLE+"\n   Using filesystem dialog..."+"\n   "+color.END)
+            cpydLog("info",str("New gen dialogs enabled, using GUI filepicker"))
+            Tk().withdraw() 
+            customInput = askopenfilename(master=None, filetypes=[("macOS Recovery image", ".dmg .img")],title="Select macOS Recovery image...")
+            if len(customInput) < 3:
+               cpydLog("error",str("Never received a response from the GUI dialog! Did we break? Falling back!"))
+               customValue = 0
+               stage12()
+            else:
+               cpydLog("ok",str("Successfully got response from GUI dialog"))
+         else:
+            print(color.BOLD+color.PURPLE+"\n   FORMAT:",color.YELLOW+""+color.END+color.BOLD+"<file>"+color.YELLOW+".img"+color.END+"\n   Enter the full path to a bootable macOS Recovery image file.\n   It will be automatically copied into the root repo directory, or you\n   can place it there now and type \"BaseSystem.img\" without a path.\n   You",color.UNDERLINE+color.BOLD+"must"+color.END,"include any text in"+color.YELLOW,"yellow"+color.END+".\n\n      "+color.BOLD+"TIP:"+color.END,"You can drag and drop a file onto this window.\n   \n   ")
+         
+            customInput = str(input(color.BOLD+"Value> "+color.END))
          cpydLog("ok",("User input received"))
 
          USR_BOOT_FILE = customInput
@@ -1544,6 +1578,7 @@ def autopilot():
       global USR_HDD_ISPHYSICAL
       global customValue
       global currentStage
+      global newGenDialogs
       currentStage = 8
       
       global stageHooks
@@ -1625,9 +1660,21 @@ def autopilot():
       elif customValue == 2:
          cpydLog("info",str("Custom value requested, setting up"))
       #   print(color.BOLD+color.PURPLE+"\n   FORMAT:"+color.YELLOW+""+color.END+color.BOLD,"<>"+color.YELLOW+""+color.END+"\n   Enter a custom value.\n   \n   ")
-         print(color.BOLD+color.PURPLE+"\n   FORMAT:",color.YELLOW+""+color.END+color.BOLD+"<full path to HDD file>"+color.END+"\n   Drag the *.qcow2 file onto this window (or type the path) and hit ENTER.\n"+color.END+"\n   ")
          cpydLog("wait",("Waiting for user input"))
-         customInput = str(input(color.BOLD+"File> "+color.END))
+         if newGenDialogs == 1: 
+            print(color.BOLD+color.PURPLE+"\n   Using filesystem dialog..."+"\n   "+color.END)
+            cpydLog("info",str("New gen dialogs enabled, using GUI filepicker"))
+            Tk().withdraw() 
+            customInput = askopenfilename(master=None, filetypes=[("Virtual hard disk files", ".qcow2 .img")],title="Select virtual HDD file...")
+            if len(customInput) < 3:
+               cpydLog("error",str("Never received a response from the GUI dialog! Did we break? Falling back!"))
+               customValue = 0
+               stage8()
+            else:
+               cpydLog("ok",str("Successfully got response from GUI dialog"))
+         else:
+            print(color.BOLD+color.PURPLE+"\n   FORMAT:",color.YELLOW+""+color.END+color.BOLD+"<full path to HDD file>"+color.END+"\n   Drag the *.qcow2 file onto this window (or type the path) and hit ENTER.\n"+color.END+"\n   ")
+            customInput = str(input(color.BOLD+"File> "+color.END))
          cpydLog("ok",("User input received"))
          USR_HDD_PATH = customInput
          USR_HDD_PATH = USR_HDD_PATH.replace("'","")
@@ -1742,6 +1789,8 @@ def autopilot():
       global currentStage
       currentStage = 7
       defaultValue = "4G"
+
+      if USR_TARGET_OS >= 15 and USR_TARGET_OS < 99: defaultValue = "8G"
 
       global stageHooks
       global activeNotice
@@ -3285,7 +3334,7 @@ def autopilot():
             configData = file.read()
          configData = configData.replace("$USR_CPU_SOCKS",str(USR_CPU_SOCKS))
          configData = configData.replace("$USR_CPU_CORES",str(USR_CPU_CORES))
-         configData = configData.replace("$USR_CPU_THREADS",str(USR_CPU_TOTAL_F))
+         configData = configData.replace("$USR_CPU_THREADS",str(USR_CPU_THREADS))
          configData = configData.replace("$USR_CPU_MODEL",str(USR_CPU_MODEL))
          configData = configData.replace("$USR_CPU_FEATURE_ARGS",str(USR_CPU_FEATURE_ARGS))
          configData = configData.replace("$USR_ALLOCATED_RAM",str(USR_ALLOCATED_RAM))
@@ -3476,11 +3525,11 @@ def autopilot():
          progressUpdate(12)
          time.sleep(2)
          cpydLog("info",("Copying "+str(USR_BOOT_FILE)+" to repository directory"))
-         os.system("cp "+USR_BOOT_FILE+" ./")
+         os.system("cp "+USR_BOOT_FILE+" ./ > /dev/null 2>&1")
          progressUpdate(88)
          cpydLog("info",("Setting up file name"))
-         os.system("mv ./*.dmg BaseSystem.dmg")
-         os.system("mv ./*.img BaseSystem.img")
+         os.system("mv ./*.dmg BaseSystem.dmg > /dev/null 2>&1")
+         os.system("mv ./*.img BaseSystem.img > /dev/null 2>&1")
          progressUpdate(92)
          if os.path.exists("./BaseSystem.dmg"):
             cpydLog("warn",("BaseSystem image is still in the DMG format, will convert now"))
