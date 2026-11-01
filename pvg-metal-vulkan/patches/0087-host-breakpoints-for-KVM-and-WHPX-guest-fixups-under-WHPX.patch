@@ -1,0 +1,633 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Sun, 1 Nov 2026 16:10:00 +0200
+Subject: [PATCH] host breakpoints for KVM and WHPX: guest fixups under WHPX
+
+The pvg guest fixups patch Tahoe's Metal code right before it runs, from
+an instruction breakpoint owned by host code; that was KVM only
+(kvm_set_host_breakpoints, kvm_walk_user_pages). Now behind an
+accelerator-neutral API, system/host-breakpoints.h:
+
+- host_set_breakpoints(): KVM as before; WHPX loads the addresses into the
+  guest's DR0..DR3/DR7 on each vCPU's next entry and intercepts #DB while
+  any are set (all vCPUs paused to change that partition property). A hit
+  runs the callback with the BQL and resumes with RF set; other #DBs are
+  injected back as before.
+- the debug registers are guest-visible under WHPX, so the fixups re-arm
+  them every 2 s (host_breakpoints_need_rearm()).
+- guest_walk_user_pages(): the x86 page walk, moved out of kvm.c.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ target/i386/whpx/whpx-all.c       |  118 +++++++++++++++++++++++++++++++++++++
+ include/system/host-breakpoints.h |   43 +++++++++++++
+ target/i386/host-breakpoints.c    |  103 ++++++++++++++++++++++++++++++++
+ target/i386/meson.build           |    1 
+ include/system/kvm.h              |   23 ++-----
+ target/i386/kvm/kvm.c             |   63 --------------------
+ include/system/whpx-common.h      |    1 
+ target/i386/whpx/whpx-i386.h      |    5 ++
+ hw/display/pvg/pvg-guest-fixups.c |   37 ++++++++----
+ 9 files changed, 299 insertions(+), 95 deletions(-)
+
+diff --git a/target/i386/whpx/whpx-all.c b/target/i386/whpx/whpx-all.c
+index 113f79a..8bed0ff 100644
+--- a/target/i386/whpx/whpx-all.c
++++ b/target/i386/whpx/whpx-all.c
+@@ -1479,6 +1528,45 @@ uint64_t whpx_get_supported_msr_feature(uint32_t index)
+     return 0;
+ }
+ 
++/*
++ * Instruction breakpoints owned by host code (whpx_set_host_breakpoints): hardware breakpoints
++ * in DR0..DRn-1, which the gdbstub leaves alone (it uses INT3). The debug registers are the
++ * guest's own here, so callers re-arm now and then (host_breakpoints_need_rearm()).
++ */
++static struct {
++    uint64_t addr[HOST_BP_MAX];
++    int n;
++    HostBreakpointFn *fn;
++    void *opaque;
++    unsigned gen;               /* bumped by every update: vCPUs reload their registers */
++} host_bp;
++
++void whpx_set_host_breakpoints(const uint64_t *addrs, int n, HostBreakpointFn *fn,
++                               void *opaque)
++{
++    CPUState *cpu;
++    bool intercept = n > 0, was = qatomic_read(&host_bp.n) > 0;
++
++    n = MIN(MAX(n, 0), HOST_BP_MAX);
++    host_bp.fn = fn;
++    host_bp.opaque = opaque;
++    for (int i = 0; i < n; i++) {
++        host_bp.addr[i] = addrs[i];
++    }
++    if (intercept != was) {
++        /* #DB exits on or off: a partition property, only changed with all vCPUs stopped */
++        pause_all_vcpus();
++        qatomic_set(&host_bp.n, n);
++        whpx_set_exception_exit_bitmap(whpx_global.exception_exit_bitmap);
++        resume_all_vcpus();
++    }
++    qatomic_set(&host_bp.n, n);
++    qatomic_store_release(&host_bp.gen, host_bp.gen + 1);
++    CPU_FOREACH(cpu) {
++        cpu_exit(cpu);          /* loaded on the next entry (whpx_host_bp_load) */
++    }
++}
++
+ static UINT64 whpx_get_default_exceptions(void)
+ {
+     struct whpx_state *whpx = &whpx_global;
+@@ -1487,6 +1575,9 @@ static UINT64 whpx_get_default_exceptions(void)
+     if (whpx->intercept_msr_gp) {
+         intercepts |= 1UL << WHvX64ExceptionTypeGeneralProtectionFault;
+     }
++    if (qatomic_read(&host_bp.n)) {
++        intercepts |= 1UL << WHvX64ExceptionTypeDebugTrapOrFault;
++    }
+ 
+     return intercepts;
+ }
+@@ -1504,7 +1595,10 @@ HRESULT whpx_set_exception_exit_bitmap(UINT64 exceptions)
+     WHV_PARTITION_PROPERTY prop;
+     HRESULT hr;
+ 
+-    if (exceptions == whpx->exception_exit_bitmap) {
++    static UINT64 default_exceptions_set;
++
++    if (exceptions == whpx->exception_exit_bitmap &&
++        whpx_get_default_exceptions() == default_exceptions_set) {
+         return S_OK;
+     }
+ 
+@@ -1538,6 +1632,7 @@ HRESULT whpx_set_exception_exit_bitmap(UINT64 exceptions)
+ 
+     if (SUCCEEDED(hr)) {
+         whpx->exception_exit_bitmap = exceptions;
++        default_exceptions_set = whpx_get_default_exceptions();
+     } else {
+         error_report("WHPX: Failed to set exception exit bitmap, hr=%08lx", hr);
+     }
+@@ -2198,6 +2293,69 @@ static void whpx_inject_exceptions(CPUState* cpu)
+     }
+ }
+ 
++/* vCPU thread, before entering the guest: load changed host breakpoints */
++static void whpx_host_bp_load(CPUState *cpu)
++{
++    AccelCPUState *vcpu = cpu->accel;
++    unsigned gen = qatomic_load_acquire(&host_bp.gen);
++    static const WHV_REGISTER_NAME names[] = {
++        WHvX64RegisterDr0, WHvX64RegisterDr1, WHvX64RegisterDr2, WHvX64RegisterDr3,
++        WHvX64RegisterDr6, WHvX64RegisterDr7,
++    };
++    WHV_REGISTER_VALUE values[ARRAY_SIZE(names)] = {};
++    int n = qatomic_read(&host_bp.n);
++    HRESULT hr;
++
++    if (vcpu->host_bp_gen == gen) {
++        return;
++    }
++    vcpu->host_bp_gen = gen;
++    for (int i = 0; i < n; i++) {
++        values[i].Reg64 = host_bp.addr[i];
++    }
++    values[4].Reg64 = 0xffff0ff0;
++    /* execute breakpoints (R/W 00, LEN 00), globally enabled; bit 10 reads as 1 */
++    values[5].Reg64 = 0x400 | (n ? 0x200 : 0);
++    for (int i = 0; i < n; i++) {
++        values[5].Reg64 |= 2 << (i * 2);
++    }
++    hr = whp_dispatch.WHvSetVirtualProcessorRegisters(whpx_global.partition, cpu->cpu_index,
++                                                      names, ARRAY_SIZE(names), values);
++    if (FAILED(hr)) {
++        error_report("WHPX: Failed to set host breakpoints, hr=%08lx", hr);
++    }
++}
++
++/* #DB exit with the state read: a host breakpoint? Then run its callback and resume */
++static bool whpx_host_bp_hit(CPUState *cpu)
++{
++    AccelCPUState *vcpu = cpu->accel;
++    CPUX86State *env = &X86_CPU(cpu)->env;
++    uint64_t pc = vcpu->exit_ctx.VpContext.Rip;
++    int n = qatomic_read(&host_bp.n);
++    WHV_REGISTER_VALUE reg = {};
++    bool hit = false;
++
++    for (int i = 0; i < n; i++) {
++        hit |= host_bp.addr[i] == pc;
++    }
++    if (!hit) {
++        return false;
++    }
++    bql_lock();
++    if (host_bp.fn) {
++        host_bp.fn(cpu, pc, host_bp.opaque);
++    }
++    bql_unlock();
++    /* execute the instruction without trapping again */
++    env->eflags |= RF_MASK;
++    reg.Reg64 = vcpu->exit_ctx.VpContext.Rflags | RF_MASK;
++    whpx_set_reg(cpu, WHvX64RegisterRflags, reg);
++    reg.Reg64 = 0xffff0ff0;
++    whpx_set_reg(cpu, WHvX64RegisterDr6, reg);
++    return true;
++}
++
+ int whpx_vcpu_run(CPUState *cpu)
+ {
+     HRESULT hr;
+@@ -2293,6 +2451,7 @@ int whpx_vcpu_run(CPUState *cpu)
+         }
+ 
+         whpx_inject_exceptions(cpu);
++        whpx_host_bp_load(cpu);
+ 
+         hr = whp_dispatch.WHvRunVirtualProcessor(
+             whpx->partition, cpu->cpu_index,
+@@ -2661,6 +2820,12 @@ int whpx_vcpu_run(CPUState *cpu)
+ 
+             whpx_get_registers(cpu, WHPX_LEVEL_FULL_STATE);
+ 
++            if ((vcpu->exit_ctx.VpException.ExceptionType ==
++                 WHvX64ExceptionTypeDebugTrapOrFault) &&
++                !cpu_single_stepping(cpu) && whpx_host_bp_hit(cpu)) {
++                ret = 0;
++                break;
++            }
+             if ((vcpu->exit_ctx.VpException.ExceptionType ==
+                  WHvX64ExceptionTypeDebugTrapOrFault) &&
+                 (vcpu->exit_ctx.VpException.InstructionByteCount >= 1) &&
+diff --git a/include/system/host-breakpoints.h b/include/system/host-breakpoints.h
+new file mode 100644
+index 0000000..36f0888
+--- /dev/null
++++ b/include/system/host-breakpoints.h
+@@ -0,0 +1,43 @@
++/*
++ * Instruction breakpoints owned by host code (not the gdbstub), and walks of a vCPU's user page
++ * tables: what device models need to patch guest code right before it runs (x86; KVM or WHPX).
++ *
++ * Copyright (c) 2026
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef SYSTEM_HOST_BREAKPOINTS_H
++#define SYSTEM_HOST_BREAKPOINTS_H
++
++/* fn runs on the vCPU thread, CPU state synchronized; the vCPU then executes the instruction */
++typedef void HostBreakpointFn(CPUState *cpu, uint64_t pc, void *opaque);
++typedef bool GuestUserPageFn(uint64_t va, uint64_t pa, void *opaque);
++
++#define HOST_BP_MAX 2
++
++/* the accelerator in use can set host breakpoints */
++bool host_breakpoints_available(void);
++
++/*
++ * Breakpoints at guest linear addresses addrs[0..n) on every vCPU (at most HOST_BP_MAX, in
++ * debug registers the gdbstub leaves free); n 0 removes them. Call with the BQL held, outside
++ * vCPU threads.
++ */
++void host_set_breakpoints(const uint64_t *addrs, int n, HostBreakpointFn *fn, void *opaque);
++
++/*
++ * The breakpoints live in guest-visible debug registers that the guest may overwrite (WHPX):
++ * call host_set_breakpoints() again now and then. Under KVM the hypervisor owns them.
++ */
++bool host_breakpoints_need_rearm(void);
++
++/*
++ * Call fn(va, pa) for each present page of start..end (page aligned) in cpu's current address
++ * space, in address order, until it returns true. Only while the vCPU runs in user mode (its
++ * page tables then map that process); returns false otherwise. Call on the vCPU's thread with
++ * its state synchronized.
++ */
++bool guest_walk_user_pages(CPUState *cpu, uint64_t start, uint64_t end, GuestUserPageFn *fn,
++                           void *opaque);
++
++#endif
+diff --git a/target/i386/host-breakpoints.c b/target/i386/host-breakpoints.c
+new file mode 100644
+index 0000000..36cbd1b
+--- /dev/null
++++ b/target/i386/host-breakpoints.c
+@@ -0,0 +1,103 @@
++/*
++ * Host-owned instruction breakpoints and user page-table walks (include/system/host-breakpoints.h)
++ * for x86: dispatch to KVM or WHPX, and a 4-level long mode page walk.
++ *
++ * Copyright (c) 2026
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "cpu.h"
++#include "system/kvm.h"
++#include "system/whpx.h"
++#include "system/host-breakpoints.h"
++#ifdef CONFIG_WHPX
++#include "whpx/whpx-i386.h"
++#endif
++
++bool host_breakpoints_available(void)
++{
++    return kvm_enabled() || whpx_enabled();
++}
++
++void host_set_breakpoints(const uint64_t *addrs, int n, HostBreakpointFn *fn, void *opaque)
++{
++#ifdef CONFIG_KVM
++    if (kvm_enabled()) {
++        kvm_set_host_breakpoints(addrs, n, fn, opaque);
++    }
++#endif
++#ifdef CONFIG_WHPX
++    if (whpx_enabled()) {
++        whpx_set_host_breakpoints(addrs, n, fn, opaque);
++    }
++#endif
++}
++
++bool host_breakpoints_need_rearm(void)
++{
++    return whpx_enabled();
++}
++
++bool guest_walk_user_pages(CPUState *cs, uint64_t start, uint64_t end, GuestUserPageFn *fn,
++                           void *opaque)
++{
++    CPUX86State *env = &X86_CPU(cs)->env;
++    const uint64_t addr_mask = 0x000ffffffffff000ULL;
++    uint64_t pml4, va;
++
++    /* user mode, 4-level long mode paging, lower half only */
++    if ((env->hflags & HF_CPL_MASK) != 3 || !(env->hflags & HF_LMA_MASK) ||
++        (env->cr[4] & CR4_LA57_MASK) || end > (1ULL << 47) || start >= end) {
++        return false;
++    }
++    pml4 = env->cr[3] & addr_mask;
++    for (va = start; va < end;) {
++        uint64_t e = x86_ldq_phys(cs, pml4 + ((va >> 39) & 0x1ff) * 8);
++        uint64_t next = (va | ((1ULL << 39) - 1)) + 1;
++
++        if (e & PG_PRESENT_MASK) {
++            uint64_t pdpt = e & addr_mask;
++
++            for (; va < MIN(next, end);) {
++                uint64_t e3 = x86_ldq_phys(cs, pdpt + ((va >> 30) & 0x1ff) * 8);
++                uint64_t next3 = (va | ((1ULL << 30) - 1)) + 1;
++
++                if ((e3 & PG_PRESENT_MASK) && (e3 & PG_PSE_MASK)) {
++                    if (fn(va, (e3 & addr_mask & ~((1ULL << 30) - 1)) + (va & ((1ULL << 30) - 1)),
++                           opaque)) {
++                        return true;
++                    }
++                } else if (e3 & PG_PRESENT_MASK) {
++                    uint64_t pd = e3 & addr_mask;
++
++                    for (; va < MIN(next3, end);) {
++                        uint64_t e2 = x86_ldq_phys(cs, pd + ((va >> 21) & 0x1ff) * 8);
++                        uint64_t next2 = (va | ((1ULL << 21) - 1)) + 1;
++
++                        if ((e2 & PG_PRESENT_MASK) && (e2 & PG_PSE_MASK)) {
++                            if (fn(va, (e2 & addr_mask & ~((1ULL << 21) - 1)) +
++                                   (va & ((1ULL << 21) - 1)), opaque)) {
++                                return true;
++                            }
++                        } else if (e2 & PG_PRESENT_MASK) {
++                            uint64_t pt = e2 & addr_mask;
++
++                            for (; va < MIN(next2, end); va += 4096) {
++                                uint64_t e1 = x86_ldq_phys(cs, pt + ((va >> 12) & 0x1ff) * 8);
++
++                                if ((e1 & PG_PRESENT_MASK) && fn(va, e1 & addr_mask, opaque)) {
++                                    return true;
++                                }
++                            }
++                        }
++                        va = next2;
++                    }
++                }
++                va = next3;
++            }
++        }
++        va = next;
++    }
++    return true;
++}
+diff --git a/target/i386/meson.build b/target/i386/meson.build
+index b4fbf8a..91e3032 100644
+--- a/target/i386/meson.build
++++ b/target/i386/meson.build
+@@ -22,6 +22,7 @@ i386_system_ss.add(files(
+   'monitor.c',
+   'cpu-apic.c',
+   'cpu-system.c',
++  'host-breakpoints.c',
+ ))
+ i386_system_ss.add(when: 'CONFIG_SEV', if_true: files('sev.c'),
+                                        if_false: files('sev-system-stub.c'))
+diff --git a/include/system/kvm.h b/include/system/kvm.h
+index e03641b..6273754 100644
+--- a/include/system/kvm.h
++++ b/include/system/kvm.h
+@@ -462,28 +462,15 @@ int kvm_arch_on_vmfd_change(MachineState *ms, KVMState *s);
+ void kvm_cpu_synchronize_state(CPUState *cpu);
+ 
+ /*
+- * Instruction breakpoints at guest linear addresses addrs[0..n) on every vCPU, owned by host
+- * code rather than the gdbstub (x86 KVM only; at most KVM_HOST_BP_MAX, in debug registers the
+- * gdbstub leaves free). fn runs on the vCPU thread with the CPU state synchronized; the vCPU
+- * then executes the instruction and continues. n 0 removes them. Call with the BQL held,
+- * outside vCPU threads.
++ * Host-owned instruction breakpoints (x86 KVM only): see host_set_breakpoints() in
++ * system/host-breakpoints.h, which calls this under KVM.
+  */
+-#define KVM_HOST_BP_MAX 2
+-typedef void KVMHostBreakpointFn(CPUState *cpu, uint64_t pc, void *opaque);
++#include "system/host-breakpoints.h"
++#define KVM_HOST_BP_MAX HOST_BP_MAX
++typedef HostBreakpointFn KVMHostBreakpointFn;
+ void kvm_set_host_breakpoints(const uint64_t *addrs, int n, KVMHostBreakpointFn *fn,
+                               void *opaque);
+ 
+-/*
+- * x86: call fn(va, pa) for each present page of start..end (page aligned) in cpu's current
+- * address space, in address order, until it returns true. Only while the vCPU runs in user
+- * mode (its page tables then map that process); returns false otherwise. Call on the vCPU's
+- * thread with its state synchronized.
+- */
+-typedef bool KVMUserPageFn(uint64_t va, uint64_t pa, void *opaque);
+-bool kvm_walk_user_pages(CPUState *cpu, uint64_t start, uint64_t end, KVMUserPageFn *fn,
+-                         void *opaque);
+-
+-
+ void kvm_init_cpu_signals(CPUState *cpu);
+ 
+ /**
+diff --git a/target/i386/kvm/kvm.c b/target/i386/kvm/kvm.c
+index 3479726..7c0e07a 100644
+--- a/target/i386/kvm/kvm.c
++++ b/target/i386/kvm/kvm.c
+@@ -6269,69 +6269,6 @@ void kvm_set_host_breakpoints(const uint64_t *addrs, int n, KVMHostBreakpointFn
+     }
+ }
+ 
+-bool kvm_walk_user_pages(CPUState *cs, uint64_t start, uint64_t end, KVMUserPageFn *fn,
+-                         void *opaque)
+-{
+-    CPUX86State *env = &X86_CPU(cs)->env;
+-    const uint64_t addr_mask = 0x000ffffffffff000ULL;
+-    uint64_t pml4, va;
+-
+-    /* user mode, 4-level long mode paging, lower half only */
+-    if ((env->hflags & HF_CPL_MASK) != 3 || !(env->hflags & HF_LMA_MASK) ||
+-        (env->cr[4] & CR4_LA57_MASK) || end > (1ULL << 47) || start >= end) {
+-        return false;
+-    }
+-    pml4 = env->cr[3] & addr_mask;
+-    for (va = start; va < end;) {
+-        uint64_t e = x86_ldq_phys(cs, pml4 + ((va >> 39) & 0x1ff) * 8);
+-        uint64_t next = (va | ((1ULL << 39) - 1)) + 1;
+-
+-        if (e & PG_PRESENT_MASK) {
+-            uint64_t pdpt = e & addr_mask;
+-
+-            for (; va < MIN(next, end);) {
+-                uint64_t e3 = x86_ldq_phys(cs, pdpt + ((va >> 30) & 0x1ff) * 8);
+-                uint64_t next3 = (va | ((1ULL << 30) - 1)) + 1;
+-
+-                if ((e3 & PG_PRESENT_MASK) && (e3 & PG_PSE_MASK)) {
+-                    if (fn(va, (e3 & addr_mask & ~((1ULL << 30) - 1)) + (va & ((1ULL << 30) - 1)),
+-                           opaque)) {
+-                        return true;
+-                    }
+-                } else if (e3 & PG_PRESENT_MASK) {
+-                    uint64_t pd = e3 & addr_mask;
+-
+-                    for (; va < MIN(next3, end);) {
+-                        uint64_t e2 = x86_ldq_phys(cs, pd + ((va >> 21) & 0x1ff) * 8);
+-                        uint64_t next2 = (va | ((1ULL << 21) - 1)) + 1;
+-
+-                        if ((e2 & PG_PRESENT_MASK) && (e2 & PG_PSE_MASK)) {
+-                            if (fn(va, (e2 & addr_mask & ~((1ULL << 21) - 1)) +
+-                                   (va & ((1ULL << 21) - 1)), opaque)) {
+-                                return true;
+-                            }
+-                        } else if (e2 & PG_PRESENT_MASK) {
+-                            uint64_t pt = e2 & addr_mask;
+-
+-                            for (; va < MIN(next2, end); va += 4096) {
+-                                uint64_t e1 = x86_ldq_phys(cs, pt + ((va >> 12) & 0x1ff) * 8);
+-
+-                                if ((e1 & PG_PRESENT_MASK) && fn(va, e1 & addr_mask, opaque)) {
+-                                    return true;
+-                                }
+-                            }
+-                        }
+-                        va = next2;
+-                    }
+-                }
+-                va = next3;
+-            }
+-        }
+-        va = next;
+-    }
+-    return true;
+-}
+-
+ static int kvm_handle_debug(X86CPU *cpu,
+                             struct kvm_debug_exit_arch *arch_info)
+ {
+diff --git a/include/system/whpx-common.h b/include/system/whpx-common.h
+index 79710e2..abd9194 100644
+--- a/include/system/whpx-common.h
++++ b/include/system/whpx-common.h
+@@ -9,6 +9,7 @@ struct AccelCPUState {
+     bool ready_for_pic_interrupt;
+     uint64_t tpr;
+     bool interruption_pending;
++    unsigned host_bp_gen;           /* host breakpoints loaded into the debug registers */
+     /* Must be the last field as it may have a tail */
+     WHV_RUN_VP_EXIT_CONTEXT exit_ctx;
+ };
+diff --git a/target/i386/whpx/whpx-i386.h b/target/i386/whpx/whpx-i386.h
+index a1cf732..3f9006d 100644
+--- a/target/i386/whpx/whpx-i386.h
++++ b/target/i386/whpx/whpx-i386.h
+@@ -10,3 +10,8 @@ bool whpx_has_xsave(void);
+ bool whpx_has_xsaves(void);
+ bool whpx_has_rdtscp(void);
+ bool whpx_has_invpcid(void);
++
++#include "system/host-breakpoints.h"
++/* host_set_breakpoints() under WHPX: guest debug registers, #DB exits */
++void whpx_set_host_breakpoints(const uint64_t *addrs, int n, HostBreakpointFn *fn,
++                               void *opaque);
+diff --git a/hw/display/pvg/pvg-guest-fixups.c b/hw/display/pvg/pvg-guest-fixups.c
+index aae25e9..6523778 100644
+--- a/hw/display/pvg/pvg-guest-fixups.c
++++ b/hw/display/pvg/pvg-guest-fixups.c
+@@ -13,13 +13,14 @@
+  *
+  * The code is in the dyld shared cache, which is compressed and sealed on disk, so it can only
+  * be patched in RAM, and its page is first read in by the very call that crashes: scanning RAM
+- * always loses that race. So with KVM the branch also gets an instruction breakpoint: the
++ * always loses that race. So with KVM or WHPX the branch also gets an instruction breakpoint: the
+  * cache is mapped at the same address (its unslid address plus a per-boot slide, found from
+  * the cache header in a vCPU's page tables) in every process, and when any process reaches the
+  * branch its page is resident and is patched before the instruction runs.
+  *
+  * A clean page can be dropped and read back from disk: a background thread also scans guest
+- * RAM for each signature (fallback without KVM) and re-checks the patched sites.
++ * RAM for each signature (fallback without breakpoints) and re-checks the patched sites. Under
++ * WHPX the breakpoints are in the guest's own debug registers: they are re-armed periodically.
+  *
+  * Copyright (c) 2026
+  * SPDX-License-Identifier: GPL-2.0-or-later
+@@ -33,7 +34,7 @@
+ #include "system/ramblock.h"
+ #include "qemu/timer.h"
+ #include "hw/core/cpu.h"
+-#include "system/kvm.h"
++#include "system/host-breakpoints.h"
+ #include "system/hw_accel.h"
+ #include "system/address-spaces.h"
+ #include "pvg-guest-fixups.h"
+@@ -111,6 +112,8 @@ static const struct {
+ };
+ /* vCPUs are rarely caught in user mode: sample often (a cheap walk) until it is armed */
+ #define SLIDE_SEARCH_MS     50
++/* guest-visible debug registers (WHPX): load the breakpoints again this often */
++#define BP_REARM_MS         2000
+ 
+ static const uint8_t cache_magic[16] = "dyld_v1 x86_64h";
+ 
+@@ -131,6 +134,7 @@ struct PVGGuestFixups {
+     uint64_t patches;
+     QEMUTimer *bp_timer;        /* main loop: looks for the cache slide until the bp is armed */
+     uint64_t bp_addr;           /* breakpoints armed (the first one's address; 0: none) */
++    uint64_t bp_addrs[ARRAY_SIZE(breakpoints)];
+     uint64_t slide;             /* of the shared cache, this boot */
+     uint64_t bp_hits;
+ };
+@@ -315,7 +319,7 @@ static void find_cache_header(CPUState *cs, run_on_cpu_data data)
+ 
+     cpu_synchronize_state(cs);
+     /* the slid cache lies above its unslid base, below the end of user space */
+-    kvm_walk_user_pages(cs, SHARED_CACHE_BASE, 1ULL << 47, check_cache_header, c);
++    guest_walk_user_pages(cs, SHARED_CACHE_BASE, 1ULL << 47, check_cache_header, c);
+ }
+ 
+ /* main loop: find the shared cache slide from any vCPU's address space, then arm the bp */
+@@ -324,6 +328,12 @@ static void bp_search(void *opaque)
+     PVGGuestFixups *f = opaque;
+     CPUState *cs;
+ 
++    if (f->bp_addr) {
++        /* armed, the guest may have overwritten its debug registers */
++        host_set_breakpoints(f->bp_addrs, ARRAY_SIZE(f->bp_addrs), branch_bp_hit, f);
++        timer_mod(f->bp_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + BP_REARM_MS);
++        return;
++    }
+     CPU_FOREACH(cs) {
+         SlideCtx c = { 0 };
+ 
+@@ -331,16 +341,17 @@ static void bp_search(void *opaque)
+         if (c.header_va) {
+             uint64_t slide = c.header_va - SHARED_CACHE_BASE;
+ 
+-            uint64_t addrs[ARRAY_SIZE(breakpoints)];
+-
+             f->slide = slide;
+             for (size_t i = 0; i < ARRAY_SIZE(breakpoints); i++) {
+-                addrs[i] = breakpoints[i].unslid + slide;
++                f->bp_addrs[i] = breakpoints[i].unslid + slide;
+             }
+-            qatomic_set(&f->bp_addr, addrs[0]);
+-            kvm_set_host_breakpoints(addrs, ARRAY_SIZE(addrs), branch_bp_hit, f);
++            qatomic_set(&f->bp_addr, f->bp_addrs[0]);
++            host_set_breakpoints(f->bp_addrs, ARRAY_SIZE(f->bp_addrs), branch_bp_hit, f);
+             fx_log(f, "guest fixup: shared cache slide 0x%" PRIx64 ", %zu breakpoints", slide,
+-                   ARRAY_SIZE(addrs));
++                   ARRAY_SIZE(f->bp_addrs));
++            if (host_breakpoints_need_rearm()) {
++                timer_mod(f->bp_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + BP_REARM_MS);
++            }
+             return;
+         }
+     }
+@@ -354,7 +365,7 @@ void pvg_guest_fixups_reset(PVGGuestFixups *f)
+     }
+     if (f->bp_addr) {
+         qatomic_set(&f->bp_addr, 0);
+-        kvm_set_host_breakpoints(NULL, 0, NULL, NULL);     /* the next boot has another slide */
++        host_set_breakpoints(NULL, 0, NULL, NULL);     /* the next boot has another slide */
+     }
+     timer_mod(f->bp_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + SLIDE_SEARCH_MS);
+ }
+@@ -368,7 +379,7 @@ PVGGuestFixups *pvg_guest_fixups_start(PVGGuestFixupLog log, void *opaque)
+     qemu_mutex_init(&f->lock);
+     qemu_cond_init(&f->cond);
+     qemu_thread_create(&f->thread, "pvg-fixups", fixup_thread, f, QEMU_THREAD_JOINABLE);
+-    if (kvm_enabled()) {
++    if (host_breakpoints_available()) {
+         f->bp_timer = timer_new_ms(QEMU_CLOCK_REALTIME, bp_search, f);
+         timer_mod(f->bp_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + SLIDE_SEARCH_MS);
+     }
+@@ -383,7 +394,7 @@ void pvg_guest_fixups_stop(PVGGuestFixups *f)
+     if (f->bp_timer) {
+         timer_free(f->bp_timer);
+         if (f->bp_addr) {
+-            kvm_set_host_breakpoints(NULL, 0, NULL, NULL);
++            host_set_breakpoints(NULL, 0, NULL, NULL);
+         }
+     }
+     qemu_mutex_lock(&f->lock);
+-- 
+2.43.0
+

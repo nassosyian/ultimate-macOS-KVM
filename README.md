@@ -57,6 +57,8 @@ Experience the latest macOS has to offer with built-in support from macOS High S
 Hardware acceleration for any GPU that supports Vulkan 1.3
 <li><b>OSX-Host file drag-n-drop & clipboard sharing<a href="#metal-gpu-acceleration-without-passthrough">⎋</a></b></li> 
 The `pvg-metal-vulkan` branch implements host<->OSX file drag and drop and clipboard sharing (text, images, files)
+<li><b>Windows 10/11 host support <a href="pvg-metal-vulkan/docs/windows.md">⎋</a></b></li> 
+The `pvg-metal-vulkan` branch also runs on Windows 10 and 11 (Windows Hypervisor Platform), with Metal acceleration, clipboard sharing and a guided setup (`setup-windows.cmd`)
 
 <li><b>AutoPilot <a href="https://github.com/Coopydood/ultimate-macOS-KVM/wiki/AutoPilot">⎋</a></b></li> 
 Automatically generates a valid, customised, and ready-to-use QEMU config script in seconds.
@@ -160,7 +162,7 @@ All of the dependencies, both required and optional, are listed below.
 
 ***
 
-## 🐧》Oh, and you NEED Linux.
+## 🐧》Oh, and you NEED Linux (or Windows, for Metal acceleration).
 
 Shocker; KVM is a module built into the *Linux kernel*, not **Windows Subsystem for Linux** or some UNIX-like terminal. You need a <ins>full install</ins> of at least base Linux **on your host**. Don't try any of that VM inception shenanigans.
 
@@ -168,6 +170,9 @@ The easiest way to do this is by grabbing some mainstream Linux distribution, li
 
 > [!NOTE]
 > Testing of ULTMOS on different distributions is underway - but please note that is has been primarily developed and tested on **Arch** and **Debian**-based systems.
+
+> [!TIP]
+> **Windows 10/11 is now supported** by the [`pvg-metal-vulkan`](#metal-gpu-acceleration-without-passthrough) branch: the macOS VM, with Metal acceleration on your GPU, runs on Windows with QEMU and the **Windows Hypervisor Platform** (WHPX) instead of KVM - no Linux install, no WSL. Double-click `pvg-metal-vulkan\setup-windows.cmd` and follow [the Windows guide](pvg-metal-vulkan/docs/windows.md). ULTMOS's own menus (AutoPilot, the passthrough assistants, `main.py`) still need Linux; on Windows the setup creates a new VM or imports one made with ULTMOS on Linux.
 
 ***
 
@@ -231,20 +236,22 @@ Oh, and speaking of...
 
 ## 🎨》Metal GPU acceleration without passthrough
 
-The `pvg-metal-vulkan` branch adds a paravirtual GPU for QEMU, `pvg-linux-pci`. It implements the host side of Apple's ParavirtualizedGraphics, the device macOS's own `AppleParavirtGPU` driver uses. The guest's Metal command buffers run on your host GPU through Vulkan, and its shaders are translated to SPIR-V. No GPU passthrough, no second GPU and no extra kexts are needed. The desktop, Liquid Glass, Safari, Maps, Photos and SceneKit 3D render. Currently it gives ~25-30fps on an NVIDIA RTX 3060 Ti.
+The `pvg-metal-vulkan` branch adds a paravirtual GPU for QEMU, `pvg-linux-pci`. It implements the host side of Apple's ParavirtualizedGraphics, the device macOS's own `AppleParavirtGPU` driver uses. The guest's Metal command buffers run on your host GPU through Vulkan, and its shaders are translated to SPIR-V. No GPU passthrough, no second GPU and no extra kexts are needed. The desktop, Liquid Glass, Safari, Maps, Photos and SceneKit 3D render. Currently it gives ~25-30fps on an NVIDIA RTX 3060 Ti on Linux, and ~18-20fps on Windows 10/11.
 
 > [!WARNING]
-> This is experimental. It has only been tested on one host (NVIDIA RTX 3060 Ti) and one macOS Tahoe build.
+> This is experimental. It has only been tested on one PC (NVIDIA RTX 3060 Ti; Linux and Windows 10) and one macOS Tahoe build.
 > **USE AT YOUR OWN RISK**
 
 **Requirements**
 
-- A Linux host with KVM and a Vulkan 1.3 GPU. Only NVIDIA with the proprietary driver has been tested.
+- A Linux host with KVM, or a **Windows 10/11** host with the Windows Hypervisor Platform, and a Vulkan 1.3 GPU. Only NVIDIA with the proprietary driver has been tested.
 - LLVM 19 or newer and Vulkan development files (`llvm-config`, the Vulkan headers and loader), plus QEMU's usual build dependencies.
-- A macOS Tahoe (26) x86_64 VM created with ULTMOS (AutoPilot).
+- A macOS Tahoe (26) x86_64 VM created with ULTMOS (AutoPilot). On Windows the setup can also create one and install macOS.
 - dosfstools and mtools, for the one-time copy of the option ROM out of the guest.
 
-**Usage**: run `./main.py`, open **Extras**, then **6. Metal GPU acceleration**. Build QEMU (once), collect the option ROM from macOS (once), then boot. The same steps as scripts:
+**Usage on Windows**: double-click `pvg-metal-vulkan\setup-windows.cmd`. It checks the PC, enables the Windows Hypervisor Platform, installs MSYS2, builds QEMU, imports or creates the VM, gets the option ROM and creates a desktop shortcut. See the [Windows guide](pvg-metal-vulkan/docs/windows.md).
+
+**Usage on Linux**: run `./main.py`, open **Extras**, then **6. Metal GPU acceleration**. Build QEMU (once), collect the option ROM from macOS (once), then boot. The same steps as scripts:
 
 ```sh
 pvg-metal-vulkan/scripts/build-qemu.sh     # clone QEMU 11.1.3, apply the patches, build

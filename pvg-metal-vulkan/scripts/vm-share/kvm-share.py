@@ -43,11 +43,17 @@ VERSION = 1
 CONF_DIR = os.path.expanduser("~/.config/kvm-osx")
 TOKEN_FILE = os.path.join(CONF_DIR, "share-token")
 SOCK_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "kvm-osx")
+# control socket (drops, `send`, `status`): a unix socket path, or tcp:HOST:PORT where Python has
+# no AF_UNIX (Windows); QEMU_GTK_DROP_SOCKET takes the same forms
+WINDOWS = os.name == "nt"
 # overrides for tests (a private X server, port and folders)
-CTL_SOCK = os.environ.get("KVM_SHARE_CTL", os.path.join(SOCK_DIR, "share.sock"))
+CTL_SOCK = os.environ.get("KVM_SHARE_CTL", "tcp:127.0.0.1:7330" if not hasattr(socket, "AF_UNIX")
+                          else os.path.join(SOCK_DIR, "share.sock"))
 CACHE = os.environ.get("KVM_SHARE_CACHE", os.path.expanduser("~/.cache/kvm-share"))
 DOWNLOADS = os.environ.get("KVM_SHARE_DOWNLOADS", os.path.expanduser("~/Downloads"))
-LISTEN = tuple(os.environ.get("KVM_SHARE_LISTEN", "192.168.122.1,127.0.0.1").split(","))
+# virbr0 (libvirt bridge) and loopback (user networking: the guest's 10.0.2.2); Windows has no virbr0
+LISTEN = tuple(os.environ.get("KVM_SHARE_LISTEN",
+                              "127.0.0.1" if WINDOWS else "192.168.122.1,127.0.0.1").split(","))
 CLIP_MAX = 64 << 20             # text/image clipboard parts
 CLIP_FILES_MAX = 1 << 30        # files copied to the clipboard (transferred eagerly)
 KEEP_CLIP_BATCHES = 8
@@ -90,11 +96,32 @@ def unique_dest(folder, name):
 
 
 def notify(summary, body=""):
+    if WINDOWS:
+        return          # no notify-send; the log has it
     try:
         subprocess.Popen(["notify-send", "-a", "macOS VM", "-i", "computer", summary, body],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
         pass
+
+
+def uri_path(uri):
+    """Local path of a file:// URI (file:///C:/x on Windows), or None."""
+    if not uri.startswith("file://"):
+        return None
+    p = urllib.parse.unquote(urllib.parse.urlparse(uri).path)
+    if WINDOWS:
+        import urllib.request
+        p = urllib.request.url2pathname(p)
+    return p
+
+
+def ctl_socket():
+    """An unconnected control socket and its address (unix path or tcp:HOST:PORT)."""
+    if CTL_SOCK.startswith("tcp:"):
+        host, port = CTL_SOCK[4:].rsplit(":", 1)
+        return socket.socket(socket.AF_INET, socket.SOCK_STREAM), (host, int(port))
+    return socket.socket(socket.AF_UNIX, socket.SOCK_STREAM), CTL_SOCK
 
 
 # ---- framing ----
@@ -297,7 +324,8 @@ def daemon():
                     log("rejected", addr, "(bad token)")
                     sock.close()
                     return
-            except (OSError, ValueError, json.JSONDecodeError):
+            except (OSError, ValueError, json.JSONDecodeError) as e:
+                log("handshake from", addr, "failed:", e)
                 sock.close()
                 return
             sock.settimeout(None)
@@ -374,9 +402,7 @@ def daemon():
             lines = [l.strip() for l in raw.replace("\r", "").split("\n") if l.strip()]
             if target == "x-special/gnome-copied-files" and lines and lines[0] in ("copy", "cut"):
                 lines = lines[1:]
-            paths = [urllib.parse.unquote(urllib.parse.urlparse(u).path)
-                     for u in lines if u.startswith("file://")]
-            paths = [p for p in paths if os.path.exists(p)]
+            paths = [p for p in map(uri_path, lines) if p and os.path.exists(p)]
             if not paths:
                 return
             h = hashlib.sha256(("files" + "\n".join(paths)).encode()).hexdigest()
@@ -492,14 +518,17 @@ def daemon():
             threading.Thread(target=app.on_guest, args=(c, a), daemon=True).start()
 
     def serve_ctl():
-        os.makedirs(SOCK_DIR, exist_ok=True)
-        try:
-            os.unlink(CTL_SOCK)
-        except FileNotFoundError:
-            pass
-        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        srv.bind(CTL_SOCK)
-        os.chmod(CTL_SOCK, 0o600)
+        srv, addr = ctl_socket()
+        if srv.family == socket.AF_INET:
+            srv.bind(addr)          # loopback only (the default): no token needed
+        else:
+            os.makedirs(SOCK_DIR, exist_ok=True)
+            try:
+                os.unlink(addr)
+            except FileNotFoundError:
+                pass
+            srv.bind(addr)
+            os.chmod(addr, 0o600)
         srv.listen(8)
         while True:
             c, _ = srv.accept()
@@ -507,8 +536,7 @@ def daemon():
                 try:
                     req = json.loads(c.makefile().readline() or "{}")
                     if req.get("t") == "drop":
-                        paths = [urllib.parse.unquote(urllib.parse.urlparse(u).path)
-                                 if u.startswith("file://") else u for u in req.get("paths", [])]
+                        paths = [uri_path(u) or u for u in req.get("paths", [])]
                         reply = app.send_drop(paths)
                     elif req.get("t") == "status":
                         g = app.current_guest()
@@ -523,15 +551,20 @@ def daemon():
         threading.Thread(target=serve_tcp, args=(a,), daemon=True).start()
     threading.Thread(target=serve_ctl, daemon=True).start()
     log("kvm-share daemon ready; token in", TOKEN_FILE)
-    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, 15, Gtk.main_quit)
-    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, 2, Gtk.main_quit)
+    if WINDOWS:
+        import signal
+        signal.signal(signal.SIGINT, lambda *a: GLib.idle_add(Gtk.main_quit))
+        GLib.timeout_add(500, lambda: True)     # lets Python run the handler during Gtk.main
+    else:
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, 15, Gtk.main_quit)
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, 2, Gtk.main_quit)
     Gtk.main()
 
 
 def ctl(req):
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s, addr = ctl_socket()
     try:
-        s.connect(CTL_SOCK)
+        s.connect(addr)
     except OSError:
         print("kvm-share daemon is not running", file=sys.stderr)
         return 1

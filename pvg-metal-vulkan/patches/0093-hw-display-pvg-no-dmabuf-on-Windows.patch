@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Sun, 1 Nov 2026 19:30:00 +0200
+Subject: [PATCH] hw/display/pvg: no dmabuf on Windows
+
+With a GL display the device registered the console with GL ops, which
+declare dmabuf scanout; Windows displays have no dmabufs and console setup
+failed ("The console requires display DMABUF support"). On Windows the
+dmabuf property is forced off: presents take the CPU path.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-pci.c |    3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index 3120151..a5e75a7 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -2801,6 +2801,9 @@ static void pvg_linux_realize(PCIDevice *dev, Error **errp)
+     if (s->guest_fixups_enable) {
+         s->guest_fixups = pvg_guest_fixups_start(pvg_exec_log, s);
+     }
++#ifdef _WIN32
++    s->dmabuf = false;      /* no dmabufs on Windows: GL displays get CPU-path surfaces too */
++#endif
+     if (s->display_ports) {
+         s->con = qemu_graphic_console_create(DEVICE(dev), 0,
+                                              s->dmabuf && display_opengl &&
+-- 
+2.43.0
+

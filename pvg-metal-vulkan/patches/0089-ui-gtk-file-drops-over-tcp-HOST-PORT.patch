@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Sun, 1 Nov 2026 16:10:00 +0200
+Subject: [PATCH] ui/gtk: file drops over tcp:HOST:PORT
+
+QEMU_GTK_DROP_SOCKET may also be tcp:HOST:PORT, for hosts where the sharing
+daemon's Python has no AF_UNIX (Windows); qemu_send_full() instead of
+qemu_write_full() so it works with Windows sockets.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ui/gtk.c |   14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/ui/gtk.c b/ui/gtk.c
+index f912dc4..c9a6b29 100644
+--- a/ui/gtk.c
++++ b/ui/gtk.c
+@@ -2198,7 +2198,8 @@ static void gd_vcs_init(GtkDisplayState *s)
+ 
+ /*
+  * Files dropped on the guest display are handed to a host-side sharing daemon (which copies
+- * them into the guest) over the unix socket named by $QEMU_GTK_DROP_SOCKET: one line
++ * them into the guest) over the socket named by $QEMU_GTK_DROP_SOCKET (a unix socket path, or
++ * tcp:HOST:PORT): one line
+  * {"t": "drop", "paths": ["file:///...", ...]}. Without the variable the window takes no drops.
+  */
+ static void gd_drag_data_received(GtkWidget *widget, GdkDragContext *ctx, gint x, gint y,
+@@ -2222,12 +2223,19 @@ static void gd_drag_data_received(GtkWidget *widget, GdkDragContext *ctx, gint x
+     if (!n || !path) {
+         return;
+     }
+-    fd = unix_connect(path, NULL);
++    if (g_str_has_prefix(path, "tcp:")) {
++        /* tcp:HOST:PORT: hosts without unix sockets in the daemon's language (Windows) */
++        g_autoptr(SocketAddress) addr = socket_parse(path, NULL);
++
++        fd = addr ? socket_connect(addr, NULL) : -1;
++    } else {
++        fd = unix_connect(path, NULL);
++    }
+     if (fd < 0) {
+         warn_report("gtk: file drop: sharing daemon not reachable at %s", path);
+         return;
+     }
+-    if (qemu_write_full(fd, msg->str, msg->len) != (ssize_t)msg->len) {
++    if (qemu_send_full(fd, msg->str, msg->len) != (ssize_t)msg->len) {
+         warn_report("gtk: file drop: could not hand %d file(s) to the sharing daemon", n);
+     }
+     close(fd);
+-- 
+2.43.0
+

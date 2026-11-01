@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Sun, 1 Nov 2026 16:10:00 +0200
+Subject: [PATCH] target/i386/whpx: emulate Intel MSRs that fault on AMD hosts
+
+With intercept-msr-gp=on, MSR accesses that fault in Hyper-V are emulated:
+
+- IA32_SYSENTER_CS/ESP/EIP writes: Hyper-V on AMD raises #GP for the 64-bit
+  values 64-bit Intel guests write (macOS: its early CPU setup). AMD keeps
+  32 bits of them, and SYSENTER is unusable in long mode there anyway.
+- IA32_MISC_ENABLE: Intel only; KVM emulates it, macOS reads it while it
+  populates the commpage.
+- any other MSR: with ignore-unknown-msr (the default) reads return 0 and
+  writes are dropped, as for unhandled MSR exits (and KVM's ignore_msrs);
+  each MSR is reported once.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ target/i386/whpx/whpx-all.c |   57 ++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 53 insertions(+), 4 deletions(-)
+
+diff --git a/target/i386/whpx/whpx-all.c b/target/i386/whpx/whpx-all.c
+index 113f79a..8bed0ff 100644
+--- a/target/i386/whpx/whpx-all.c
++++ b/target/i386/whpx/whpx-all.c
+@@ -1292,6 +1292,33 @@ static target_ulong read_cr(CPUState *cpu, int cr)
+     return val.Reg64;
+ }
+ 
++/*
++ * An MSR access that faulted in Hyper-V and that we do not emulate: with ignore-unknown-msr
++ * (the default) reads return 0 and writes are dropped, as for unhandled MSR exits (and KVM's
++ * ignore_msrs, which macOS guests are run with). Each MSR is reported once.
++ */
++static bool whpx_ignore_faulting_msr(uint32_t msr, bool write, uint64_t data)
++{
++    static uint32_t reported[64];
++    static int nreported;
++    bool seen = false;
++
++    for (int i = 0; i < nreported; i++) {
++        seen |= reported[i] == msr;
++    }
++    if (!seen && nreported < ARRAY_SIZE(reported)) {
++        reported[nreported++] = msr;
++        if (write) {
++            warn_report("WHPX: %s wrmsr 0x%x val 0x%" PRIx64,
++                        whpx_global.ignore_unknown_msr ? "ignored" : "unknown", msr, data);
++        } else {
++            warn_report("WHPX: %s rdmsr 0x%x",
++                        whpx_global.ignore_unknown_msr ? "ignored (0)" : "unknown", msr);
++        }
++    }
++    return whpx_global.ignore_unknown_msr;
++}
++
+ static bool whpx_simulate_rdmsr(CPUState *cs)
+ {
+     X86CPU *cpu = X86_CPU(cs);
+@@ -1300,11 +1327,15 @@ static bool whpx_simulate_rdmsr(CPUState *cs)
+     uint64_t val = 0;
+ 
+     switch (msr) {
++    case MSR_IA32_MISC_ENABLE:      /* Intel only: Hyper-V on AMD faults, KVM emulates it */
++        val = env->msr_ia32_misc_enable;
++        break;
+     default:
+-        error_report("WHPX: unknown msr 0x%x", msr);
++        if (whpx_ignore_faulting_msr(msr, false, 0)) {
++            break;
++        }
+         x86_emul_raise_exception(&X86_CPU(cpu)->env, EXCP0D_GPF, 0);
+         return 1;
+-        break;
+     }
+ 
+     RAX(env) = (uint32_t)val;
+@@ -1321,11 +1352,29 @@ static bool whpx_simulate_wrmsr(CPUState *cs)
+     uint64_t data = ((uint64_t)EDX(env) << 32) | EAX(env);
+ 
+     switch (msr) {
++    /*
++     * An Intel CPU model on an AMD host: AMD keeps only 32 bits of the SYSENTER MSRs and
++     * Hyper-V raises #GP for a 64-bit value, which 64-bit Intel guests write (macOS: its
++     * early CPU setup). SYSENTER is unusable in long mode on AMD anyway: keep what AMD keeps.
++     */
++    case MSR_IA32_SYSENTER_CS:
++        env->sysenter_cs = (uint32_t)data;
++        break;
++    case MSR_IA32_SYSENTER_ESP:
++        env->sysenter_esp = (uint32_t)data;
++        break;
++    case MSR_IA32_SYSENTER_EIP:
++        env->sysenter_eip = (uint32_t)data;
++        break;
++    case MSR_IA32_MISC_ENABLE:
++        env->msr_ia32_misc_enable = data;
++        break;
+     default:
+-        error_report("WHPX: unknown msr 0x%x val %llx", msr, data);
++        if (whpx_ignore_faulting_msr(msr, true, data)) {
++            break;
++        }
+         x86_emul_raise_exception(&X86_CPU(cpu)->env, EXCP0D_GPF, 0);
+         return 1;
+-        break;
+     }
+ 
+     return 0;
+-- 
+2.43.0
+

@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Sun, 1 Nov 2026 19:30:00 +0200
+Subject: [PATCH] ui/sdl2: Windows: OpenGL without EGL, square cursor canvas
+
+-display sdl,gl=on crashed on Windows at startup: SDL's GL context is WGL
+there and libepoxy's eglGetCurrentDisplay is a NULL pointer. Skip the EGL
+display and the dmabuf probe on Windows (surfaces are uploaded as textures).
+
+Cursors get the square canvas of the system cursor size, as in ui/gtk.c
+(Windows stretches the image but keeps the hotspot).
+
+Measured with the pvg-linux-pci macOS guest (Mission Control toggles):
+sdl,gl=on and gtk both ~18-20 presents/s. -display sdl without GL hangs at
+startup on this host (not fixed; run-pvg-vm.ps1 maps sdl to sdl,gl=on).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ui/sdl2-gl.c |    4 ++++
+ ui/sdl2.c    |   32 +++++++++++++++++++++++++++++---
+ 2 files changed, 33 insertions(+), 3 deletions(-)
+
+diff --git a/ui/sdl2-gl.c b/ui/sdl2-gl.c
+index 1547ad2..7c99cbf 100644
+--- a/ui/sdl2-gl.c
++++ b/ui/sdl2-gl.c
+@@ -310,7 +310,11 @@ void sdl2_gl_console_init(struct sdl2_console *scon)
+      * to the console.  To break this chicken-egg problem we pre-check
+      * dma-buf availability beforehand using a dummy SDL window.
+      */
++#ifdef _WIN32
++    scon->has_dmabuf = false;       /* no EGL / dmabufs: surfaces are uploaded as textures */
++#else
+     scon->has_dmabuf = qemu_egl_has_dmabuf();
++#endif
+ 
+     sdl2_window_destroy(scon);
+     qemu_free_displaysurface(scon->surface);
+diff --git a/ui/sdl2.c b/ui/sdl2.c
+index 1c97d23..84d4254 100644
+--- a/ui/sdl2.c
++++ b/ui/sdl2.c
+@@ -123,7 +123,8 @@ void sdl2_window_create(struct sdl2_console *scon)
+         scon->winctx = SDL_GL_CreateContext(scon->real_window);
+         SDL_GL_SetSwapInterval(0);
+ 
+-#ifdef CONFIG_OPENGL
++#if defined(CONFIG_OPENGL) && !defined(_WIN32)
++        /* Windows: WGL, no EGL (eglGetCurrentDisplay is a NULL pointer in libepoxy there) */
+         qemu_egl_display = eglGetCurrentDisplay();
+ #endif
+     } else {
+@@ -759,6 +760,7 @@ static void sdl_mouse_warp(DisplayChangeListener *dcl,
+ static void sdl_mouse_define(DisplayChangeListener *dcl,
+                              QEMUCursor *c)
+ {
++    int hot_x = c->hot_x, hot_y = c->hot_y;
+ 
+     if (guest_sprite) {
+         SDL_FreeCursor(guest_sprite);
+@@ -776,8 +778,32 @@ static void sdl_mouse_define(DisplayChangeListener *dcl,
+         fprintf(stderr, "Failed to make rgb surface from %p\n", c);
+         return;
+     }
+-    guest_sprite = SDL_CreateColorCursor(guest_sprite_surface,
+-                                         c->hot_x, c->hot_y);
++#ifdef _WIN32
++    {
++        /*
++         * Windows stretches a cursor image to the (square) system cursor size but keeps the
++         * hotspot in image pixels: put the glyph unscaled on a transparent square canvas of
++         * that size (scaled down, hotspot too, only if it does not fit). See ui/gtk.c.
++         */
++        int n = MAX(GetSystemMetrics(SM_CXCURSOR), GetSystemMetrics(SM_CYCURSOR));
++        SDL_Surface *sq = n > 0 ? SDL_CreateRGBSurface(0, n, n, 32, 0xff0000, 0x00ff00, 0xff,
++                                                       0xff000000) : NULL;
++
++        if (sq) {
++            double f = MIN(1.0, (double)n / MAX(c->width, c->height));
++            SDL_Rect dst = { 0, 0, MAX(1, (int)(c->width * f)), MAX(1, (int)(c->height * f)) };
++
++            SDL_FillRect(sq, NULL, 0);
++            SDL_SetSurfaceBlendMode(guest_sprite_surface, SDL_BLENDMODE_NONE);
++            SDL_BlitScaled(guest_sprite_surface, NULL, sq, &dst);
++            SDL_FreeSurface(guest_sprite_surface);
++            guest_sprite_surface = sq;
++            hot_x = MIN((int)(hot_x * f), n - 1);
++            hot_y = MIN((int)(hot_y * f), n - 1);
++        }
++    }
++#endif
++    guest_sprite = SDL_CreateColorCursor(guest_sprite_surface, hot_x, hot_y);
+     if (!guest_sprite) {
+         fprintf(stderr, "Failed to make color cursor from %p\n", c);
+         return;
+-- 
+2.43.0
+

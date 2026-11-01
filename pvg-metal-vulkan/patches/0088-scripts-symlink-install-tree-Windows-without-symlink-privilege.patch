@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Sun, 1 Nov 2026 16:10:00 +0200
+Subject: [PATCH] scripts/symlink-install-tree: Windows without symlink privilege
+
+Without Developer Mode (or administrator rights) Windows refuses symlinks and
+configure failed. Warn and go on: run the build tree's QEMU with
+-L pc-bios -L build/pc-bios (scripts/run-pvg-vm.ps1 does).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ scripts/symlink-install-tree.py |    5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/scripts/symlink-install-tree.py b/scripts/symlink-install-tree.py
+index b725638..3141cf3 100644
+--- a/scripts/symlink-install-tree.py
++++ b/scripts/symlink-install-tree.py
+@@ -29,6 +29,11 @@ def destdir_join(d1: str, d2: str) -> str:
+         os.symlink(source, bundle_dest)
+     except BaseException as e:
+         if not isinstance(e, OSError) or e.errno != errno.EEXIST:
++            if os.name == 'nt' and isinstance(e, OSError):
++                # no symlink privilege: run the build with -L pc-bios -L build/pc-bios instead
++                print(f'warning: no qemu-bundle link for {dest} (Developer Mode is off)',
++                      file=sys.stderr)
++                continue
+             if os.name == 'nt':
+                 print('Please enable Developer Mode to support soft link '
+                       'without Administrator permission')
+-- 
+2.43.0
+

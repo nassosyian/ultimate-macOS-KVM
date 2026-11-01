@@ -1,11 +1,14 @@
-// Clipboard and file sharing between the macOS guest and the Linux host (guest side).
+// Clipboard and file sharing between the macOS guest and the host (Linux or Windows; guest side).
 // Protocol and host side: scripts/vm-share/kvm-share.py. Built and installed by
-// scripts/vm-share/install-guest.sh (swiftc in the guest, a LaunchAgent starts it at login).
+// scripts/vm-share/guest/install.sh (swiftc in the guest, as VMShare.app: macOS's Local Network
+// privacy only lets a bundle with NSLocalNetworkUsageDescription ask for access; a bare binary
+// started by launchd gets EHOSTUNREACH for the host). A LaunchAgent starts it at login.
 //
-// - connects to TCP 7329 on the host (192.168.122.1 bridged, 10.0.2.2 user networking), retries
+// - connects to TCP 7329 on the host (192.168.122.1 bridged / Windows, 10.0.2.2 user networking),
+//   retries
 // - clipboard: text and images (PNG) both ways; copied Finder files are sent and offered as files
 // - menu bar item (arrows): drop files on it to send them to the host's ~/Downloads, or use
-//   "Send Files to Linux…"; files sent by the host land in ~/Downloads and are shown in Finder
+//   "Send Files to Host…"; files sent by the host land in ~/Downloads and are shown in Finder
 import AppKit
 import Foundation
 
@@ -31,8 +34,10 @@ func log(_ s: String) {
 final class Conn {
     let fd: Int32
     init(fd: Int32) { self.fd = fd }
+    static var lastError: Int32 = 0     // of the last failed open()
 
     static func open(_ host: String) -> Conn? {
+        lastError = 0
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         if fd < 0 { return nil }
         var one: Int32 = 1
@@ -50,12 +55,13 @@ final class Conn {
                 connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
-        if r != 0 && errno != EINPROGRESS { close(fd); return nil }
+        if r != 0 && errno != EINPROGRESS { lastError = errno; close(fd); return nil }
         var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
         var err: Int32 = 0
         var len = socklen_t(MemoryLayout<Int32>.size)
         if r != 0 && (poll(&pfd, 1, 2000) != 1 ||
                       getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0 || err != 0) {
+            lastError = err != 0 ? err : ETIMEDOUT
             close(fd)
             return nil
         }
@@ -222,8 +228,8 @@ final class Share: NSObject {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let b = statusItem.button {
             b.image = NSImage(systemSymbolName: "arrow.left.arrow.right",
-                              accessibilityDescription: "Linux host sharing")
-            b.toolTip = "Linux host: drop files here to send them to Linux ~/Downloads"
+                              accessibilityDescription: "Host sharing")
+            b.toolTip = "Host sharing: drop files here to send them to the host's Downloads"
             // the drop target is a view over the button (the item's window doesn't exist yet)
             let drop = DropView(frame: b.bounds)
             drop.autoresizingMask = [.width, .height]
@@ -235,7 +241,7 @@ final class Share: NSObject {
         stateItem = NSMenuItem(title: "Not connected", action: nil, keyEquivalent: "")
         m.addItem(stateItem)
         m.addItem(.separator())
-        let send = NSMenuItem(title: "Send Files to Linux…", action: #selector(chooseFiles),
+        let send = NSMenuItem(title: "Send Files to Host…", action: #selector(chooseFiles),
                               keyEquivalent: "")
         send.target = self
         m.addItem(send)
@@ -248,7 +254,7 @@ final class Share: NSObject {
 
     func setState(_ connected: Bool, _ host: String = "") {
         DispatchQueue.main.async {
-            self.stateItem.title = connected ? "Connected to Linux (\(host))" : "Not connected"
+            self.stateItem.title = connected ? "Connected to host (\(host))" : "Not connected"
             self.statusItem.button?.appearsDisabled = !connected
         }
     }
@@ -258,7 +264,7 @@ final class Share: NSObject {
         p.canChooseFiles = true
         p.canChooseDirectories = true
         p.allowsMultipleSelection = true
-        p.prompt = "Send to Linux"
+        p.prompt = "Send to Host"
         NSApp.activate(ignoringOtherApps: true)
         if p.runModal() == .OK { sendFiles(p.urls, purpose: "drop") }
     }
@@ -266,9 +272,19 @@ final class Share: NSObject {
 
     // ---- connection ----
     func connectLoop() {
+        var reported: [String: Int32] = [:]
         while true {
             for h in hosts {
-                guard let c = Conn.open(h) else { continue }
+                guard let c = Conn.open(h) else {
+                    let e = Conn.lastError
+                    if reported[h] != e {
+                        reported[h] = e
+                        log("\(h): \(String(cString: strerror(e)))" +
+                            (e == EHOSTUNREACH ? " (Local Network access denied?)" : ""))
+                    }
+                    continue
+                }
+                reported[h] = nil
                 do {
                     try c.send(["t": "hello", "token": token, "version": 1,
                                 "agent": ProcessInfo.processInfo.operatingSystemVersionString])

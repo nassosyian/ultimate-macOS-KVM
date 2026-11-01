@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Sun, 1 Nov 2026 19:00:00 +0200
+Subject: [PATCH] ui/gtk: Windows: cursors on a square canvas of the system size
+
+Windows stretches a cursor image to the (square) system cursor size but
+keeps the hotspot in image pixels. The macOS guest's arrow glyph is 32x64:
+with a 48 px system cursor it was stretched 1.5x across and squeezed down,
+and clicks landed left of the arrow's tip. The glyph is now placed unscaled
+on a transparent canvas of the system cursor size (scaled down, hotspot
+too, only if it does not fit).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ui/gtk.c |   26 +++++++++++++++++++++++++-
+ 1 file changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/ui/gtk.c b/ui/gtk.c
+index c9a6b29..5b49ca6 100644
+--- a/ui/gtk.c
++++ b/ui/gtk.c
+@@ -479,6 +479,7 @@ static void gd_cursor_define(DisplayChangeListener *dcl,
+     VirtualConsole *vc = container_of(dcl, VirtualConsole, gfx.dcl);
+     GdkPixbuf *pixbuf;
+     GdkCursor *cursor;
++    int hot_x = c->hot_x, hot_y = c->hot_y;
+ 
+     if (!gtk_widget_get_realized(vc->gfx.drawing_area)) {
+         return;
+@@ -488,9 +489,32 @@ static void gd_cursor_define(DisplayChangeListener *dcl,
+                                       GDK_COLORSPACE_RGB, true, 8,
+                                       c->width, c->height, c->width * 4,
+                                       NULL, NULL);
++#ifdef G_OS_WIN32
++    {
++        /*
++         * Windows stretches a cursor image to the (square) system cursor size but keeps the
++         * hotspot in image pixels: a non-square glyph (macOS: 32x64) gets its hotspot off the
++         * arrow's tip. Put the glyph unscaled on a transparent square canvas of that size
++         * (scaled down, hotspot too, only if it does not fit).
++         */
++        int n = MAX(GetSystemMetrics(SM_CXCURSOR), GetSystemMetrics(SM_CYCURSOR));
++        double f = MIN(1.0, (double)n / MAX(c->width, c->height));
++        int w = MAX(1, (int)(c->width * f)), h = MAX(1, (int)(c->height * f));
++        GdkPixbuf *sq = n > 0 ? gdk_pixbuf_new(GDK_COLORSPACE_RGB, true, 8, n, n) : NULL;
++
++        if (sq) {
++            gdk_pixbuf_fill(sq, 0);
++            gdk_pixbuf_scale(pixbuf, sq, 0, 0, w, h, 0, 0, f, f, GDK_INTERP_BILINEAR);
++            g_object_unref(pixbuf);
++            pixbuf = sq;
++            hot_x = MIN((int)(hot_x * f), n - 1);
++            hot_y = MIN((int)(hot_y * f), n - 1);
++        }
++    }
++#endif
+     cursor = gdk_cursor_new_from_pixbuf
+         (gtk_widget_get_display(vc->gfx.drawing_area),
+-         pixbuf, c->hot_x, c->hot_y);
++         pixbuf, hot_x, hot_y);
+     gdk_window_set_cursor(gtk_widget_get_window(vc->gfx.drawing_area), cursor);
+     g_object_unref(pixbuf);
+     g_object_unref(cursor);
+-- 
+2.43.0
+

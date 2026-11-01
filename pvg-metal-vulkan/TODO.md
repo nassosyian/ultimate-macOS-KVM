@@ -118,3 +118,70 @@
 
 ## Done
 - Boot picker without VGA; wallpaper colours; icons; Spotlight; crash loop (guest fixup); perf (cached arena)
+
+## Windows 10 / WHPX host (patches 0085-0089, scripts/*.ps1)
+- [x] MSYS2 UCRT64 build (build-qemu.sh: --enable-whpx, symlink-less configure: patch 0088)
+- [x] CPUID leaves 2/4/5/0x80000005/6 from the CPU model (patch 0085; was divide error in cpu_thread_alloc)
+- [x] SYSENTER / MISC_ENABLE / unknown faulting MSRs emulated (patch 0086, intercept-msr-gp=on);
+      the OpenCore sysenter NOP patch (../scripts/whpx-oc-patch.py) is no longer needed
+- [x] APIC in QEMU (kernel-irqchip=off): with Hyper-V's APIC "Failed to start CPU 01"
+- [x] Desktop with pvg-linux-pci (Vulkan on the Windows NVIDIA driver), guest fixups on
+- [x] Host breakpoints under WHPX (patch 0087): armed (slide found), no crash after pausing vCPUs
+      for the #DB exit-bitmap change (was WHV_E_INVALID_VP_STATE)
+- [x] WHPX breakpoint hit verified: PVG_FIXUPS_NO_SCAN=1 (patch 0091), launching apps ->
+      "sliceIDForDevice nil-architecture branch patched (breakpoint, hit #1)" 26 s after arming
+- [x] Sharing: was NOT libslirp (nc from the guest's Terminal reaches 192.168.122.1:7329). macOS
+      Local Network privacy refused the agent (so_error 65 EHOSTUNREACH, no SYN sent): a bare
+      binary started by launchd cannot get the permission; it only worked on Linux because
+      install-guest.sh started it from ssh. Now VMShare.app with NSLocalNetworkUsageDescription
+      (guest/install.sh), installed on the real disk via install-guest.ps1 (VMSHARE FAT disk).
+      Fresh boot: agent connects by itself (58 s); host->guest file, both clipboards verified
+- [x] Mouse hotspot left of the arrow's tip (GTK on Windows): guest glyph is 32x64, Windows
+      stretches cursors to the square system size (48 here) -> square canvas (patch 0090)
+- [x] User confirmed the GTK hotspot fix
+- [ ] User: confirm the cursor in the SDL window (same canvas fix, patch 0092)
+- [x] Upload cache: off by default on Linux too (upload-cache=false), so WHPX's all-dirty log
+      costs nothing by default; zero-copy import works on Windows
+- [x] Frame rate (Mission Control toggles): gtk ~15.5 presents/s, sdl,gl=on ~18 (patches 0092/0093:
+      SDL GL crashed on EGL, pvg required dmabuf); Linux: gtk 10.8, gtk-gl 25, dbus 29
+- [ ] gtk,gl=on on Windows: QEMU's GtkGLArea path assumes EGL and calls GL from vCPU threads
+      (WGL needs the context current per thread): crashes; not supported upstream either
+- [ ] SDL 2D renderer (-display sdl without gl) hangs at QEMU startup on Windows (monitor never
+      listens); not investigated, run-pvg-vm.ps1 maps sdl to sdl,gl=on
+- [~] Linux build with patch 0087: target/i386/host-breakpoints.c syntax-checked with
+      -DCONFIG_KVM against QEMU's linux-headers on Windows; kvm.c only loses the moved walker
+- [x] collect-rom.ps1 end to end: guest collect.sh rom -> transfer disk -> re/collected, ROM identical
+      (fixed: mtools takes "C:" as its own drive letter -> relative target)
+- [ ] Linux: reinstall the guest agent (install-guest.sh) so it survives a guest reboot there too
+
+## Windows setup / docs
+- [x] setup-windows.cmd -> scripts/setup-windows.ps1: guided, idempotent 9-step setup (-Status);
+      tested: status on this PC, the fresh-VM path in a scratch ULTMOS folder (download, convert,
+      64 GB disk, installer VM reaches macOS Recovery), shortcut creation
+- [x] docs/windows.md: full guide (requirements, steps, running, updating, troubleshooting, manual setup)
+- [x] .gitattributes: LF for patches / shell / Python / Swift (Windows checkouts with autocrlf)
+- [ ] Not tested on a clean PC: WHPX enabling + reboot, winget MSYS2 install + first pacman update,
+      a full macOS installation from Recovery under WHPX, copy-an-existing-VM path
+- [ ] Replace "<repository URL>" in docs/windows.md once the fork is pushed
+
+## Windows frame rate (measured 2026-11-01; Mission Control toggles, 32 s windows)
+- [x] Display path: gtk 17.7, sdl 18.0, headless 18.0-20.4 presents/s (16 s windows were too noisy:
+      15.5 / 18 / 21 earlier). No CPU frame readback (test switch): ~20 -> a native DirectX/Vulkan
+      swapchain window could gain at most a few %. Not built.
+- [x] Interrupt path: done->stamp (main-loop publish without irqfd) 15-30 us: not a problem.
+      WHPX halt polling (200 us) tried: 18.1, reverted. 4 vCPUs: 18.7.
+- [x] GPU clocks locked (nvidia-smi -lgc 1500,2100 / -lmc 7001): previous-frame GPU waits
+      11-19 -> 2-3 ms, 20.0 headless / 19.5 gtk (+5-10 %). Documented: NVIDIA "Prefer maximum
+      performance" for qemu-system-x86_64.exe.
+- [ ] The remaining gap to Linux (28/s) is guest speed under WHPX (exits for timer/APIC with
+      kernel-irqchip=off). Hyper-V's APIC (kernel-irqchip=on, -x2apic) boots but crawls (progress
+      bar 30 -> 40 % in 8 min): find why (timer/IPI delivery) - the most promising lead
+- [ ] Worker queue wait 5-7 ms per job (same on Linux: 7-9 ms) - frame pipelining, not Windows
+
+## Guest app issues (both hosts)
+- [ ] Desktop & Dock pane: rare SIGBUS KERN_MEMORY_ERROR at Metal+0x208b31 while decoding the HEIC
+      wallpaper thumbnail (CMPhoto/ImageIO -> IOSurface); 3 reports (2 on Linux Oct 31, 1 on Windows),
+      0 of 7 reproductions; not on a fixup-patched page; no kernel log errors
+- [ ] Blender 4.5: Metal backend needs argument buffers tier 2, barycentrics and MTLGPUFamilyMac2
+      (Apple's x86 PVG plugin has no argument buffers at all); crashes in GPU_storagebuf_update
+      instead of reporting it. Blender 4.5 has no OpenGL backend on macOS (3.6 LTS untested)

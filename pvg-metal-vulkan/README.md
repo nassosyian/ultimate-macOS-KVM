@@ -1,14 +1,15 @@
 # pvg-metal-vulkan
 
-Metal hardware acceleration for a macOS (Tahoe, x86_64) guest under QEMU/KVM on a Linux host with a
-Vulkan GPU. A new QEMU device, `pvg-linux-pci`, reimplements the host side of Apple's
-ParavirtualizedGraphics (PCI `106b:eeee`, the device the guest's `AppleParavirtGPU.kext` drives).
-The guest's Metal command buffers are executed on the host GPU: AIR shaders are translated to
-SPIR-V (`air2spv`), and render, compute and blit work is replayed with Vulkan 1.3.
+Metal hardware acceleration for a macOS (Tahoe, x86_64) guest under QEMU/KVM on a Linux host, or
+QEMU/WHPX on a Windows 10/11 host (see [Windows host](#windows-host)), with a Vulkan GPU. A new QEMU
+device, `pvg-linux-pci`, reimplements the host side of Apple's ParavirtualizedGraphics (PCI
+`106b:eeee`, the device the guest's `AppleParavirtGPU.kext` drives). The guest's Metal command
+buffers are executed on the host GPU: AIR shaders are translated to SPIR-V (`air2spv`), and render,
+compute and blit work is replayed with Vulkan 1.3.
 
 Status: login window and desktop, wallpaper (VideoToolbox YCbCr kernels), Liquid Glass
 materials, Spotlight, System Settings/Dock icons, Safari, Maps, Photos and Chess (SceneKit 3D) render.
-It is tested on an RTX 3060 Ti. 
+It is tested on an RTX 3060 Ti, on Linux and on Windows 10 (Windows 10/11 setup: [docs/windows.md](docs/windows.md)).
 
 ## Disclaimer
 
@@ -17,8 +18,8 @@ This was all written by Claude Opus 5.5 (high).
 
 ## Requirements
 
-- A Linux host with KVM and a Vulkan 1.3 GPU. Only NVIDIA (RTX 3060 Ti, proprietary driver) has
-  been tested.
+- A Linux host with KVM, or a Windows 10/11 host with the Windows Hypervisor Platform, and a
+  Vulkan 1.3 GPU. Only NVIDIA (RTX 3060 Ti, proprietary driver) has been tested.
 - LLVM 19 or newer and Vulkan development files (`llvm-config`, `vulkan/vulkan.h`, the loader),
   plus QEMU's usual build dependencies (ninja, python3, glib2, pixman, libslirp, gtk3, SDL2, epoxy).
 - macOS Tahoe (26), x86_64, installed with ultimate-macOS-KVM (ULTMOS). The guest fixups match the
@@ -30,9 +31,10 @@ This was all written by Claude Opus 5.5 (high).
 | Path | What |
 |------|------|
 | `patches/` | the QEMU changes, as `git format-patch` files on top of QEMU v11.1.3 |
-| `scripts/build-qemu.sh` | clones QEMU, applies the patches and builds it into `src/qemu/build` |
-| `scripts/collect-rom.sh` | one-time copy of the PVG option ROM out of the guest |
-| `scripts/run-pvg-vm.sh` | boots the ULTMOS VM with the paravirtual GPU |
+| `scripts/build-qemu.sh` | clones QEMU, applies the patches and builds it into `src/qemu/build` (Linux, or MSYS2 UCRT64 on Windows) |
+| `scripts/collect-rom.sh`, `collect-rom.ps1` | one-time copy of the PVG option ROM out of the guest (Linux, Windows) |
+| `scripts/run-pvg-vm.sh`, `run-pvg-vm.ps1` | boots the ULTMOS VM with the paravirtual GPU (Linux, Windows) |
+| `setup-windows.cmd` (`scripts/setup-windows.ps1`) | guided Windows setup, see [docs/windows.md](docs/windows.md) |
 | `scripts/` | also trace/capture tools and `a2s-check` (offline shader translation check) |
 | `guest/collect.sh` | runs in the guest, copies the PVG framework (and optionally more) to the transfer disk |
 
@@ -170,7 +172,7 @@ from source. The guest disk is never modified.
 
 The code is in the dyld shared cache, which is compressed and sealed on disk, and its page is first
 read in by the very call that aborts, so a RAM scan alone loses that race (one crash per boot,
-placeholder icons in apps open at that moment). With KVM the device therefore finds the cache's
+placeholder icons in apps open at that moment). With KVM or WHPX the device therefore finds the cache's
 per-boot slide from a vCPU's page tables and sets an instruction breakpoint on the branch: the
 first process to reach it gets the page patched before the instruction runs. The RAM scan remains
 as a fallback. The signatures and the branch address belong to the tested Tahoe build.
@@ -183,14 +185,74 @@ encoder.
 
 ## Known limitations
 
-- Frame rate is limited by synchronous execution on the vCPU thread and per-command-buffer copies
-  (see TODO.md, step 4).
+- Frame rate is limited by the executor pipeline: command buffers wait 5-9 ms in the worker's
+  queue (see TODO.md). On Windows the guest itself also runs slower under WHPX (~18-20 against
+  ~25-29 presents/s in Mission Control).
 - Atomics, SIMD-group operations, indirect draws/dispatches and MSAA are implemented, but no
   captured workload uses them yet; they are only tested offline (shader translation) or by the
   validation layer.
 - Shared/managed textures (IOSurfaces) are uploaded and written back for every command buffer:
   the guest does not signal CPU writes to them, and the dirty-logging cache (`upload-cache=on`)
   costs about what it saves.
+- No argument buffers (Apple's x86 paravirtual Metal plugin implements none): VFX effects that need
+  them do not draw, and Blender 4.x (argument buffers tier 2, barycentrics, Metal 2.2 family)
+  crashes at start.
+- System Settings -> Desktop & Dock rarely crashes (SIGBUS in Metal while it decodes the
+  wallpaper preview); not reproducible on demand.
+
+## Windows host
+
+Tested on Windows 10 22H2 (19045), Ryzen 9 5950X, RTX 3060 Ti (driver 617.42): the desktop renders
+through the paravirtual GPU, with the guest fixups. The accelerator is WHPX (Hyper-V) instead of KVM;
+patches 0085-0093 make that work for macOS:
+
+- **CPUID** (0085): WHPX answered the cache/topology leaves (2, 4, 5, 0x80000005/6) from the host;
+  with the Intel CPU model on an AMD host leaf 4 was empty and macOS divided by zero in
+  `cpu_thread_alloc`. They now come from the CPU model, as under KVM.
+- **MSRs** (0086, needs `-accel whpx,intercept-msr-gp=on`): Hyper-V on AMD faults on the 64-bit
+  SYSENTER MSR writes of macOS's early CPU setup, and on Intel-only MSRs (`IA32_MISC_ENABLE`).
+  These are emulated; other faulting MSRs read 0 and ignore writes (KVM's `ignore_msrs`).
+- **Guest fixup breakpoints** (0087): an accelerator-neutral host breakpoint API. Under WHPX the
+  breakpoints use the guest's own debug registers (#DB exits; re-armed every 2 s, since the guest
+  can overwrite them).
+- **Build** (0088): configure works without symlink privilege (Developer Mode off).
+- **File drops** (0089): `QEMU_GTK_DROP_SOCKET=tcp:HOST:PORT`.
+- **Mouse pointer** (0090): Windows stretches cursor images to the square system cursor size but
+  keeps the hotspot; the guest's 32x64 arrow is now put on a square canvas (clicks landed left of
+  the tip).
+- **Testing** (0091): `PVG_FIXUPS_NO_SCAN=1` applies the guest fixups through breakpoints only
+  (verified under WHPX: "patched (breakpoint, hit #1)").
+- **SDL with OpenGL** (0092, 0093): `-display sdl,gl=on` no longer assumes EGL (Windows has WGL),
+  SDL cursors get the same square canvas, and the device needs no dmabuf on Windows.
+
+Use the APIC in QEMU (`kernel-irqchip=off`, the default of `run-pvg-vm.ps1`): with Hyper-V's APIC
+macOS fails to start its other CPUs ("Failed to start CPU 01"), and with x2APIC hidden it boots but
+extremely slowly. No dmabuf scanout on Windows
+(presents take the CPU path); the upload cache (`upload-cache=on`, off by default) gains nothing
+under WHPX, which reports all RAM dirty; zero-copy guest RAM import works. Displays, Mission
+Control toggles, 32 s windows: `gtk`, `sdl` (SDL with OpenGL) and headless all ~18-20 presents/s (Linux: gtk 10.8, gtk-gl 25,
+dbus 29). `gtk` stays the default (file drops, menus). `gtk,gl=on` crashes (QEMU's GtkGLArea code
+needs EGL and a GL context on any thread; Windows has WGL) and SDL's 2D renderer hangs at startup,
+so `run-pvg-vm.ps1 -DisplayMode sdl` means `sdl,gl=on`. `qxl-vga` is not built (no SPICE);
+`-NoPvg` uses `VGA`.
+
+**Setup: double-click `setup-windows.cmd`.** It checks the PC, enables the Windows Hypervisor
+Platform, installs MSYS2 and the build packages, builds QEMU, copies or creates the macOS VM
+(downloading and installing macOS Tahoe if needed), gets the PVG option ROM, installs the sharing
+agent and creates a desktop shortcut, asking before each step and skipping what is done.
+**[docs/windows.md](docs/windows.md)** is the full guide: requirements, every step and its manual
+equivalent, running the VM, updating, troubleshooting.
+
+Guest networking is QEMU's user mode with the libvirt bridge's addresses (`192.168.122.0/24`, host
+`192.168.122.1`, where the sharing agent looks first). Clipboard / file sharing works as on Linux:
+`kvm-share.py` runs under MSYS2's Python (control socket `tcp:127.0.0.1:7330`, drops on the GTK
+window). Install the guest agent once with `scripts\vm-share\install-guest.ps1` (boots the VM with a
+small disk; in macOS run `sh /Volumes/VMSHARE/install.sh`), or `install-guest.sh` over ssh
+(`-SshPort`). The agent is now an app bundle (`~/Applications/VMShare.app`): macOS's Local Network
+privacy refuses connections to the host (`EHOSTUNREACH`) from a bare binary started by launchd,
+which is what the earlier install was (it only worked until the next login; reinstall on Linux
+too). The Linux-only tools (`trace-boot.sh`, `bench-pvg.sh`, `setup-*.sh`, qemu-rdw, ...) are not
+ported.
 
 ## License
 

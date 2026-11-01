@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Sun, 1 Nov 2026 19:00:00 +0200
+Subject: [PATCH] hw/display/pvg: PVG_FIXUPS_NO_SCAN: breakpoints only, for tests
+
+The RAM scan usually patches the Metal code before any process reaches the
+breakpoint, so the breakpoint path is rarely exercised. With
+PVG_FIXUPS_NO_SCAN set the scan is skipped and only breakpoints apply the
+fixups (to test them, e.g. under WHPX).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/pvg-guest-fixups.c |    8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/hw/display/pvg/pvg-guest-fixups.c b/hw/display/pvg/pvg-guest-fixups.c
+index 6523778..a89b9d3 100644
+--- a/hw/display/pvg/pvg-guest-fixups.c
++++ b/hw/display/pvg/pvg-guest-fixups.c
+@@ -218,6 +218,7 @@ static void *fixup_thread(void *opaque)
+ {
+     PVGGuestFixups *f = opaque;
+     int64_t last_scan = INT64_MIN / 2;
++    bool no_scan = g_getenv("PVG_FIXUPS_NO_SCAN") != NULL;
+ 
+     rcu_register_thread();
+     qemu_mutex_lock(&f->lock);
+@@ -246,8 +247,11 @@ static void *fixup_thread(void *opaque)
+         }
+         /* either site fixes the bug (the .cold page may never be paged in once the branch is) */
+         missing = !found_any && !qatomic_read(&f->bp_addr);
+-        /* full scans are expensive (all of guest RAM): often until found, then rarely */
+-        if (now - last_scan >= (missing ? SCAN_MISSING_MS : RESCAN_MS)) {
++        /*
++         * full scans are expensive (all of guest RAM): often until found, then rarely.
++         * PVG_FIXUPS_NO_SCAN (testing): breakpoints only.
++         */
++        if (now - last_scan >= (missing ? SCAN_MISSING_MS : RESCAN_MS) && !no_scan) {
+             ScanCtx c = { .f = f };
+ 
+             last_scan = now;
+-- 
+2.43.0
+

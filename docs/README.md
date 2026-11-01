@@ -6,6 +6,8 @@ This is where you'll find my lovingly-created pieces of information designed to 
 
 Anything in here, other than this readme, will likely just be offline versions of the wiki, available online at https://github.com/Coopydood/ultimate-macOS-KVM/wiki
 
+> **Windows 10/11:** the `pvg-metal-vulkan` branch also runs on Windows (Windows Hypervisor Platform instead of KVM), with Metal acceleration. See [pvg-metal-vulkan/docs/windows.md](../pvg-metal-vulkan/docs/windows.md).
+
 Anyway, good luck - you'll probably need it! <3
 
 ***

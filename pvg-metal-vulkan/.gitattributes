@@ -1,0 +1,8 @@
+# Unix line endings in the working tree, whatever core.autocrlf says (Windows checkouts):
+# the patches must apply byte for byte, and the shell scripts run in MSYS2 / the macOS guest.
+*.patch -text
+*.sh text eol=lf
+*.py text eol=lf
+*.swift text eol=lf
+guest/* text eol=lf
+*.cmd text eol=crlf

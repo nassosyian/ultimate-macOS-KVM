@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Sun, 1 Nov 2026 16:10:00 +0200
+Subject: [PATCH] target/i386/whpx: CPUID cache and topology leaves from the CPU model
+
+WHPX answers every CPUID leaf that is not in its exit list from the host.
+With an Intel CPU model on an AMD host (macOS guests), leaf 4 is then empty
+and macOS divides by the core counts derived from it (divide error in
+cpu_thread_alloc <- smp_init). Leaves 2, 4, 5, 0x80000005 and 0x80000006 now
+come from the CPU model, like leaves 1 and 0xb already do.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ target/i386/whpx/whpx-all.c |   11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/target/i386/whpx/whpx-all.c b/target/i386/whpx/whpx-all.c
+index 113f79a..8bed0ff 100644
+--- a/target/i386/whpx/whpx-all.c
++++ b/target/i386/whpx/whpx-all.c
+@@ -3039,9 +3204,14 @@ int whpx_accel_init(AccelState *as, MachineState *ms)
+     WHV_PROCESSOR_FEATURES_BANKS processor_features;
+     WHV_PROCESSOR_PERFMON_FEATURES perfmon_features;
+ 
+-    UINT32 cpuidExitList[] = {0x0, 0x1, 0x6, 0x7, 0xb, 0xd, 0x14, 0x24, 0x29, 0x1E,
+-        0x40000000, 0x40000001, 0x40000010, 0x80000000, 0x80000001,
+-        0x80000002, 0x80000003, 0x80000004, 0x80000007, 0x80000008,
++    /*
++     * Leaves 2, 4, 5, 0x80000005 and 0x80000006 (cache and core topology) come from the CPU
++     * model too: with an Intel model on an AMD host the host's answers are empty (leaf 4) or
++     * describe another topology, and macOS divides by the core counts derived from them.
++     */
++    UINT32 cpuidExitList[] = {0x0, 0x1, 0x2, 0x4, 0x5, 0x6, 0x7, 0xb, 0xd, 0x14, 0x24, 0x29,
++        0x1E, 0x40000000, 0x40000001, 0x40000010, 0x80000000, 0x80000001,
++        0x80000002, 0x80000003, 0x80000004, 0x80000005, 0x80000006, 0x80000007, 0x80000008,
+         0x8000000A, 0x80000021, 0x80000022, 0xC0000000, 0xC0000001};
+ 
+     X86MachineState *x86ms = X86_MACHINE(ms);
+-- 
+2.43.0
+
