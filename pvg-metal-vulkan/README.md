@@ -186,8 +186,8 @@ encoder.
 ## Known limitations
 
 - Frame rate is limited by the executor pipeline: command buffers wait 5-9 ms in the worker's
-  queue (see TODO.md). On Windows the guest itself also runs slower under WHPX (~18-20 against
-  ~25-29 presents/s in Mission Control).
+  queue (see TODO.md). On Windows ~22-25 presents/s in Mission Control in a window (~29
+  headless), against ~25-29 on Linux.
 - Atomics, SIMD-group operations, indirect draws/dispatches and MSAA are implemented, but no
   captured workload uses them yet; they are only tested offline (shader translation) or by the
   validation layer.
@@ -204,7 +204,7 @@ encoder.
 
 Tested on Windows 10 22H2 (19045), Ryzen 9 5950X, RTX 3060 Ti (driver 617.42): the desktop renders
 through the paravirtual GPU, with the guest fixups. The accelerator is WHPX (Hyper-V) instead of KVM;
-patches 0085-0094 make that work for macOS:
+patches 0085-0096 make that work for macOS:
 
 - **CPUID** (0085): WHPX answered the cache/topology leaves (2, 4, 5, 0x80000005/6) from the host;
   with the Intel CPU model on an AMD host leaf 4 was empty and macOS divided by zero in
@@ -227,13 +227,23 @@ patches 0085-0094 make that work for macOS:
 - **Hyper-V's APIC** (0094): with `kernel-irqchip=on` macOS's INIT/STARTUP IPIs never started its
   other CPUs ("Failed to start CPU 01"); QEMU now delivers them (INIT/SIPI exit trap, Hyper-V's
   StartupSuspend state).
+- **Apple SMC key enumeration** (0095): QEMU's `isa-applesmc` answered only key reads, so macOS
+  retried its key-by-index and key-type queries without end (~160k port accesses/s, 220k VM
+  exits/s, each a round trip into QEMU under WHPX). It now enumerates its keys (`#KEY`, sorted
+  table), reports key types and acknowledges writes: 32k exits/s. Applies to Linux builds too.
+- **120 Hz modes, early present completion** (0096): WindowServer paces frames to the refresh
+  rate; at 60 Hz, frames under WHPX landed on every 3rd tick (~19/s). The device now reports
+  `refresh-hz=120` (property) for every mode, and completes a present as soon as its frame is
+  copied out, with the copy to the window throttled to every 16 ms. Mission Control: gtk
+  17.7 -> 22.5-25.6, sdl 18.0 -> 22.5, headless 18.6 -> 28.8 presents/s. Also applies on Linux
+  (not yet measured there); `-device pvg-linux-pci,refresh-hz=60` restores the old modes.
 
 `run-pvg-vm.ps1` uses QEMU's APIC (`kernel-irqchip=off`); Hyper-V's (`-IrqChip on`) works since
-0094 and gives the same frame rate, but has seen less testing. No dmabuf scanout on Windows
+0094 and gave the same frame rate, but has seen less testing. No dmabuf scanout on Windows
 (presents take the CPU path); the upload cache (`upload-cache=on`, off by default) gains nothing
 under WHPX, which reports all RAM dirty; zero-copy guest RAM import works. Displays, Mission
-Control toggles, 32 s windows: `gtk`, `sdl` (SDL with OpenGL) and headless all ~18-20 presents/s (Linux: gtk 10.8, gtk-gl 25,
-dbus 29). `gtk` stays the default (file drops, menus). `gtk,gl=on` crashes (QEMU's GtkGLArea code
+Control toggles, 32 s windows: `gtk` ~24, `sdl` (SDL with OpenGL) ~22.5, headless ~29 presents/s
+(Linux, before 0096: gtk 10.8, gtk-gl 25, dbus 29). `gtk` stays the default (file drops, menus). `gtk,gl=on` crashes (QEMU's GtkGLArea code
 needs EGL and a GL context on any thread; Windows has WGL) and SDL's 2D renderer hangs at startup,
 so `run-pvg-vm.ps1 -DisplayMode sdl` means `sdl,gl=on`. `qxl-vga` is not built (no SPICE);
 `-NoPvg` uses `VGA`.

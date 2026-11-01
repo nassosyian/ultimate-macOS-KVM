@@ -236,7 +236,7 @@ Oh, and speaking of...
 
 ## 🎨》Metal GPU acceleration without passthrough
 
-The `pvg-metal-vulkan` branch adds a paravirtual GPU for QEMU, `pvg-linux-pci`. It implements the host side of Apple's ParavirtualizedGraphics, the device macOS's own `AppleParavirtGPU` driver uses. The guest's Metal command buffers run on your host GPU through Vulkan, and its shaders are translated to SPIR-V. No GPU passthrough, no second GPU and no extra kexts are needed. The desktop, Liquid Glass, Safari, Maps, Photos and SceneKit 3D render. Currently it gives ~25-30fps on an NVIDIA RTX 3060 Ti on Linux, and ~18-20fps on Windows 10/11.
+The `pvg-metal-vulkan` branch adds a paravirtual GPU for QEMU, `pvg-linux-pci`. It implements the host side of Apple's ParavirtualizedGraphics, the device macOS's own `AppleParavirtGPU` driver uses. The guest's Metal command buffers run on your host GPU through Vulkan, and its shaders are translated to SPIR-V. No GPU passthrough, no second GPU and no extra kexts are needed. The desktop, Liquid Glass, Safari, Maps, Photos and SceneKit 3D render. Currently it gives ~25-30fps on an NVIDIA RTX 3060 Ti on Linux, and ~22-25fps on Windows 10/11.
 
 > [!WARNING]
 > This is experimental. It has only been tested on one PC (NVIDIA RTX 3060 Ti; Linux and Windows 10) and one macOS Tahoe build.

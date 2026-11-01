@@ -1,0 +1,210 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Mon, 2 Nov 2026 01:00:00 +0200
+Subject: [PATCH] hw/misc/applesmc: key enumeration, key types and writes
+
+macOS enumerates the SMC's keys with GET_KEY_BY_INDEX (0x12). QEMU only implemented READ (0x10),
+answered "bad command", and the guest retried for ever: ~30000 commands/s, each several VM exits
+(status port 0x304, error port 0x31e: ~160000 exits/s). Under KVM that costs some CPU; under WHPX,
+where every exit is a round trip through the hypervisor into QEMU, it took about a host core.
+
+Implement the commands macOS uses:
+- GET_KEY_BY_INDEX: the n-th key by name (a sorted table), BAD_INDEX past the end;
+- GET_KEY_TYPE: length, type and attributes;
+- WRITE: key, length and data are acknowledged and dropped (macOS writes NTOK, MSDW, QENA, HE0N);
+- a #KEY key with the number of keys.
+The index and type queries answer after the 4th key byte: macOS sends no length byte there (a
+length byte afterwards, as Linux's applesmc driver sends, is accepted).
+
+Measured (macOS Tahoe guest, WHPX): VM exits 220000/s -> 32000/s, SMC port accesses ~160000/s ->
+~40/s; boots to the desktop as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/misc/applesmc.c |  111 +++++++++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 105 insertions(+), 6 deletions(-)
+
+diff --git a/hw/misc/applesmc.c b/hw/misc/applesmc.c
+index d004e8b..130f5af 100644
+--- a/hw/misc/applesmc.c
++++ b/hw/misc/applesmc.c
+@@ -115,6 +115,9 @@ struct AppleSMCState {
+     uint8_t data[255];
+     char *osk;
+     QLIST_HEAD(, AppleSMCData) data_def;
++    const struct AppleSMCData **sorted;     /* data_def by key name, for GET_KEY_BY_INDEX */
++    uint32_t nkeys;
++    uint8_t nkeys_be[4];                    /* the #KEY key */
+ };
+ 
+ static void applesmc_io_cmd_write(void *opaque, hwaddr addr, uint64_t val,
+@@ -126,6 +129,13 @@ static void applesmc_io_cmd_write(void *opaque, hwaddr addr, uint64_t val,
+     smc_debug("CMD received: 0x%02x\n", (uint8_t)val);
+     switch (val) {
+     case APPLESMC_READ_CMD:
++    case APPLESMC_WRITE_CMD:
++    case APPLESMC_GET_KEY_BY_INDEX_CMD:
++    case APPLESMC_GET_KEY_TYPE_CMD:
++        /*
++         * macOS enumerates the keys with GET_KEY_BY_INDEX; refused, it retried forever (~30000
++         * commands/s, each several VM exits). All send 4 key (or index) bytes, then a length.
++         */
+         /* did last command run through OK? */
+         if (status == APPLESMC_ST_CMD_DONE || status == APPLESMC_ST_NEW_CMD) {
+             s->cmd = val;
+@@ -157,6 +167,23 @@ static const struct AppleSMCData *applesmc_find_key(AppleSMCState *s)
+     return NULL;
+ }
+ 
++static const char *applesmc_key_type(const struct AppleSMCData *d)
++{
++    if (!memcmp(d->key, "#KEY", 4)) {
++        return "ui32";
++    }
++    if (!memcmp(d->key, "REV ", 4)) {
++        return "{rev";
++    }
++    return d->len == 1 ? "ui8 " : "ch8*";
++}
++
++static int applesmc_key_cmp(const void *a, const void *b)
++{
++    return memcmp((*(const struct AppleSMCData *const *)a)->key,
++                  (*(const struct AppleSMCData *const *)b)->key, 4);
++}
++
+ static void applesmc_io_data_write(void *opaque, hwaddr addr, uint64_t val,
+                                    unsigned size)
+ {
+@@ -166,29 +193,80 @@ static void applesmc_io_data_write(void *opaque, hwaddr addr, uint64_t val,
+     smc_debug("DATA received: 0x%02x\n", (uint8_t)val);
+     switch (s->cmd) {
+     case APPLESMC_READ_CMD:
++    case APPLESMC_GET_KEY_BY_INDEX_CMD:
++    case APPLESMC_GET_KEY_TYPE_CMD:
+         if ((s->status & 0x0f) == APPLESMC_ST_CMD_DONE) {
+             break;
+         }
+         if (s->read_pos < 4) {
+             s->key[s->read_pos] = val;
+             s->status = APPLESMC_ST_ACK;
+-        } else if (s->read_pos == 4) {
+-            d = applesmc_find_key(s);
++        }
++        /*
++         * READ_CMD answers after the length byte that follows the key; the index and type
++         * queries already after the 4th byte (macOS sends no length; a length byte after it,
++         * as Linux's driver sends, leaves the answer alone).
++         */
++        if (s->cmd != APPLESMC_READ_CMD && s->read_pos > 3) {
++            s->read_pos++;
++            break;
++        }
++        if (s->read_pos == (s->cmd == APPLESMC_READ_CMD ? 4 : 3)) {
++            if (s->cmd == APPLESMC_GET_KEY_BY_INDEX_CMD) {
++                uint32_t i = ldl_be_p(s->key);
++
++                d = i < s->nkeys ? s->sorted[i] : NULL;
++            } else {
++                d = applesmc_find_key(s);
++            }
+             if (d != NULL) {
+-                memcpy(s->data, d->data, d->len);
+-                s->data_len = d->len;
++                if (s->cmd == APPLESMC_GET_KEY_BY_INDEX_CMD) {
++                    memcpy(s->data, d->key, 4);
++                    s->data_len = 4;
++                } else if (s->cmd == APPLESMC_GET_KEY_TYPE_CMD) {
++                    /* length, type, attributes (readable) */
++                    s->data[0] = d->len;
++                    memcpy(s->data + 1, applesmc_key_type(d), 4);
++                    s->data[5] = 0x90;
++                    s->data_len = 6;
++                } else {
++                    memcpy(s->data, d->data, d->len);
++                    s->data_len = d->len;
++                }
+                 s->data_pos = 0;
+                 s->status = APPLESMC_ST_ACK | APPLESMC_ST_DATA_READY;
+                 s->status_1e = APPLESMC_ST_CMD_DONE;  /* clear on valid key */
+             } else {
+-                smc_debug("READ_CMD: key '%c%c%c%c' not found!\n",
++                smc_debug("cmd 0x%02x: key '%c%c%c%c' not found!\n", s->cmd,
+                           s->key[0], s->key[1], s->key[2], s->key[3]);
+                 s->status = APPLESMC_ST_CMD_DONE;
+-                s->status_1e = APPLESMC_ST_1E_NOEXIST;
++                s->status_1e = s->cmd == APPLESMC_GET_KEY_BY_INDEX_CMD ?
++                               APPLESMC_ST_1E_BAD_INDEX : APPLESMC_ST_1E_NOEXIST;
+             }
+         }
+         s->read_pos++;
+         break;
++    case APPLESMC_WRITE_CMD:
++        /* key, length, data: acknowledged and dropped (no writable keys) */
++        if ((s->status & 0x0f) == APPLESMC_ST_CMD_DONE) {
++            break;
++        }
++        if (s->read_pos < 4) {
++            s->key[s->read_pos] = val;
++        } else if (s->read_pos == 4) {
++            s->data_len = val;
++            s->data_pos = 0;
++        } else {
++            s->data_pos++;
++        }
++        s->read_pos++;
++        if (s->read_pos > 4 && s->data_pos >= s->data_len) {
++            s->status = APPLESMC_ST_CMD_DONE;
++            s->status_1e = APPLESMC_ST_CMD_DONE;
++        } else {
++            s->status = APPLESMC_ST_ACK;
++        }
++        break;
+     default:
+         s->status = APPLESMC_ST_CMD_DONE;
+         s->status_1e = APPLESMC_ST_1E_STILL_BAD_CMD;
+@@ -208,6 +286,8 @@ static uint64_t applesmc_io_data_read(void *opaque, hwaddr addr, unsigned size)
+ 
+     switch (s->cmd) {
+     case APPLESMC_READ_CMD:
++    case APPLESMC_GET_KEY_BY_INDEX_CMD:
++    case APPLESMC_GET_KEY_TYPE_CMD:
+         if (!(s->status & APPLESMC_ST_DATA_READY)) {
+             break;
+         }
+@@ -336,6 +416,24 @@ static void applesmc_isa_realize(DeviceState *dev, Error **errp)
+     applesmc_add_key(s, "NATJ", 1, "\x00");
+     applesmc_add_key(s, "MSSP", 1, "\x00");
+     applesmc_add_key(s, "MSSD", 1, "\x03");
++
++    /* #KEY (the number of keys, itself included) and the keys by name, for GET_KEY_BY_INDEX */
++    {
++        struct AppleSMCData *d;
++        uint32_t n = 1;
++
++        QLIST_FOREACH(d, &s->data_def, node) {
++            n++;
++        }
++        stl_be_p(s->nkeys_be, n);
++        applesmc_add_key(s, "#KEY", 4, (const char *)s->nkeys_be);
++        s->sorted = g_new(const struct AppleSMCData *, n);
++        s->nkeys = 0;
++        QLIST_FOREACH(d, &s->data_def, node) {
++            s->sorted[s->nkeys++] = d;
++        }
++        qsort(s->sorted, s->nkeys, sizeof(*s->sorted), applesmc_key_cmp);
++    }
+ }
+ 
+ static void applesmc_unrealize(DeviceState *dev)
+@@ -348,6 +446,7 @@ static void applesmc_unrealize(DeviceState *dev)
+         QLIST_REMOVE(d, node);
+         g_free(d);
+     }
++    g_clear_pointer(&s->sorted, g_free);
+ }
+ 
+ static const Property applesmc_isa_properties[] = {
+-- 
+2.43.0
+

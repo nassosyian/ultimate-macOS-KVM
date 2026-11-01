@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Mon, 2 Nov 2026 01:00:00 +0200
+Subject: [PATCH] hw/display/pvg: 120 Hz modes, complete presents before the console copy
+
+WindowServer paces frames to the display's refresh: a frame that misses a tick waits for the
+next one. With 60 Hz modes, Mission Control under WHPX landed on every 3rd tick (~19 presents/s;
+Linux/KVM on every 2nd, ~29). The pipeline itself manages more: present latency was ~10 ms of a
+53 ms frame, the vCPUs mostly idle.
+
+- refresh-hz (default 120): the refresh rate of every mode the guest sees. Headless, Mission
+  Control 18-19 -> 28.8 presents/s (240 Hz: 28.6, the pipeline's own rate).
+- In a window the extra frames were copied and drawn on the main loop, and "presented" was only
+  signalled after that copy: GTK fell to ~11. Now the present is completed as soon as its frame is
+  in present_buf; the copy to the console surface (pvg_present_copy) runs at most every 16 ms,
+  the rest from gfx_update. GTK 22.5-25.6, SDL 22.5 presents/s (were 17.7 / 18.0 at 60 Hz).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-pci.c |   64 ++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 50 insertions(+), 14 deletions(-)
+
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index a5e75a7..78a744d 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -369,6 +369,9 @@ struct PVGLinuxPCIState {
+     uint32_t mmio_size;
+     uint32_t msi_vectors;
+     uint32_t display_ports;
++    uint32_t refresh_hz;            /* property: refresh rate of every mode the guest sees */
++    bool copy_pending;              /* present rows not copied to the console yet */
++    int64_t last_copy_us;
+     bool gpu_enable;
+     bool gpu_validation;
+     PVGGpu gpu;
+@@ -919,7 +922,7 @@ static bool pvg_display_update_modes(PVGLinuxPCIState *s)
+ 
+         changed |= ds_update16(s, off, m->width);
+         changed |= ds_update16(s, off + 2, m->height);
+-        changed |= ds_update32(s, off + 4, m->refresh_hz << 16);
++        changed |= ds_update32(s, off + 4, (s->refresh_hz ? s->refresh_hz : m->refresh_hz) << 16);
+         changed |= ds_update(s, off + 8, &flags, 1);
+     }
+     s->modes_pending = false;
+@@ -1081,6 +1084,8 @@ static void pvg_display_ensure_surface(PVGLinuxPCIState *s, int w, int h)
+ }
+ 
+ /* No GPU rendering yet: background plus a software copy of the cursor */
++static void pvg_present_copy(PVGLinuxPCIState *s);
++
+ static void pvg_display_redraw(PVGLinuxPCIState *s)
+ {
+     uint32_t *fb;
+@@ -1092,6 +1097,9 @@ static void pvg_display_redraw(PVGLinuxPCIState *s)
+     if (s->scanout_valid) {
+         /* frames come from Transaction3; the UI draws the cursor itself */
+         s->redraw_dirty = true;
++        if (s->copy_pending) {
++            pvg_present_copy(s);        /* rows a throttled present left behind */
++        }
+         return;
+     }
+     if (s->regs[PVG_REG_EFI_DISPLAY / 4] && s->regs[PVG_REG_EFI_FB_START / 4] &&
+@@ -1534,22 +1542,21 @@ static bool pvg_present_show_dmabuf(PVGLinuxPCIState *s)
+ }
+ 
+ /* main loop: put the rows the worker found changed on the console and complete the present */
+-static void pvg_present_show(PVGLinuxPCIState *s)
++/*
++ * Copy the rows changed since the last copy into the console surface and tell the UI. At most
++ * once per PVG_COPY_INTERVAL_US: copying and drawing every frame (~30/s at 120 Hz) on the main
++ * loop held the BQL long enough to slow the guest down in a window (GTK: 29 -> 11 presents/s).
++ */
++#define PVG_COPY_INTERVAL_US    16000
++
++static void pvg_present_copy(PVGLinuxPCIState *s)
+ {
+-    uint32_t done = qatomic_read(&s->presents_done), y0, y1, w, h;
++    uint32_t y0, y1, w, h;
+     uint32_t *fb;
+     int stride;
+ 
+-    if (done == s->presents_shown || !s->con) {
+-        return;
+-    }
+-    s->presents_shown = done;
+-    if (pvg_present_show_dmabuf(s)) {
+-        pvg_display_event(s, DS_EVENT_PRESENTED);
+-        trace_pvg_linux_present_shown(0, s->scan_info.height,
+-                                      g_get_monotonic_time() - s->present_queued_us);
+-        return;
+-    }
++    s->copy_pending = false;
++    s->last_copy_us = g_get_monotonic_time();
+     qemu_mutex_lock(&s->present_lock);
+     w = s->present_w;
+     h = s->present_h;
+@@ -1590,8 +1597,31 @@ static void pvg_present_show(PVGLinuxPCIState *s)
+             qemu_console_update(s->con, 0, y0, w, y1 - y0);
+         }
+     }
++}
++
++/* main loop: a present finished on the worker: show it (or soon) and complete it */
++static void pvg_present_show(PVGLinuxPCIState *s)
++{
++    uint32_t done = qatomic_read(&s->presents_done);
++
++    if (done == s->presents_shown || !s->con) {
++        return;
++    }
++    s->presents_shown = done;
++    if (pvg_present_show_dmabuf(s)) {
++        pvg_display_event(s, DS_EVENT_PRESENTED);
++        trace_pvg_linux_present_shown(0, s->scan_info.height,
++                                      g_get_monotonic_time() - s->present_queued_us);
++        return;
++    }
++    /* the frame is in present_buf: the guest may go on; the console catches up (gfx_update) */
++    if (g_get_monotonic_time() - s->last_copy_us >= PVG_COPY_INTERVAL_US || !s->scanout_valid) {
++        pvg_present_copy(s);
++    } else {
++        s->copy_pending = true;
++    }
+     pvg_display_event(s, DS_EVENT_PRESENTED);
+-    trace_pvg_linux_present_shown(y0, y1, g_get_monotonic_time() - s->present_queued_us);
++    trace_pvg_linux_present_shown(0, 0, g_get_monotonic_time() - s->present_queued_us);
+ }
+ 
+ /* ---- executor glue ---- */
+@@ -3010,6 +3040,12 @@ static const Property pvg_linux_properties[] = {
+     DEFINE_PROP_UINT32("msi-vectors", PVGLinuxPCIState, msi_vectors, 1),
+     /* guestDisplayPortCount (0x122c); only port 0 is implemented */
+     DEFINE_PROP_UINT32("display-ports", PVGLinuxPCIState, display_ports, 1),
++    /*
++     * WindowServer paces frames to the display's refresh: a frame that misses a tick waits for
++     * the next. At 60 Hz the pipeline's latency made Mission Control land on every 3rd tick
++     * under WHPX (~19 presents/s); 120 Hz gave 28-29, the pipeline's own rate.
++     */
++    DEFINE_PROP_UINT32("refresh-hz", PVGLinuxPCIState, refresh_hz, 120),
+     DEFINE_PROP_BOOL("guest-fixups", PVGLinuxPCIState, guest_fixups_enable, true),
+     DEFINE_PROP_BOOL("async", PVGLinuxPCIState, async_exec, true),
+     DEFINE_PROP_BOOL("damage-limit", PVGLinuxPCIState, damage_limit, true),
+-- 
+2.43.0
+

@@ -69,7 +69,7 @@ changed them.
 
 ### Step 5: build QEMU
 Runs `scripts/build-qemu.sh` in MSYS2: it downloads QEMU 11.1.3, applies the patches in
-`patches/` (the paravirtual GPU device plus the Windows/WHPX fixes 0085-0094) and builds it into
+`patches/` (the paravirtual GPU device plus the Windows/WHPX fixes 0085-0096) and builds it into
 `src\qemu\build`. The first build takes about 20-30 minutes. After a `git pull` that brings new
 patches, the setup rebuilds only what changed.
 
@@ -129,7 +129,7 @@ Useful options (all of them are listed at the top of `scripts\run-pvg-vm.ps1`):
 
 | Option | Effect |
 |---|---|
-| `-DisplayMode sdl` | SDL window with OpenGL instead of GTK: same frame rate, but no file drops and no menu bar |
+| `-DisplayMode sdl` | SDL window with OpenGL instead of GTK: about the same frame rate, but no file drops and no menu bar |
 | `-DisplayMode vnc` | no window; connect a VNC viewer to `127.0.0.1:5901` |
 | `-Overlay` | throwaway session: nothing the guest writes is kept |
 | `-Ram 12G`, `-Cores 8` | VM size (default 8 GB, 8 cores) |
@@ -193,10 +193,11 @@ Network → allow VMShare, or reinstall it (step 8). On Windows, `logs\kvm-share
 **Keys type the wrong characters.** QEMU sends key positions, not characters: set the same
 keyboard layout in macOS (System Settings → Keyboard → Input Sources) as on Windows.
 
-**Low frame rate.** Expect ~18-20 frames/s in animations (Mission Control) on Windows, against
-~25-29 on Linux on the same PC. Measured: the window type (GTK, SDL, none), the CPU copy of each
-frame, the interrupt controller, the number of vCPUs and halt polling make no difference; the
-gap comes from running under WHPX instead of KVM. What helps a little (~5-10 %): keeping the GPU at full clocks.
+**Low frame rate.** Expect ~22-25 frames/s in animations (Mission Control) in a window on
+Windows (~29 without one), against ~25-29 on Linux on the same PC. Below ~20, check that QEMU
+was built with patches 0095 and 0096 (`setup-windows.cmd` step 4 rebuilds it): without them
+macOS floods the emulated SMC chip with queries and paces its frames to 60 Hz, which under
+WHPX lands on every 3rd refresh. What also helps (~5-10 %): keeping the GPU at full clocks.
 NVIDIA Control Panel -> Manage 3D settings -> Program settings -> add
 `src\qemuuild\qemu-system-x86_64.exe` -> *Power management mode: Prefer maximum
 performance* (the GPU otherwise idles at its lowest clocks between the guest's small frames).
@@ -205,13 +206,15 @@ performance* (the GPU otherwise idles at its lowest clocks between the guest's s
 
 - No dmabuf scanout: frames are copied through the CPU (Linux displays them directly from the
   GPU); `-display gtk,gl=on` is not supported.
-- Frame rate: ~18-20 frames/s in animations, against ~25-29 on Linux on the same PC. Measured and
-  ruled out: the display path, interrupt delivery (QEMU's and Hyper-V's interrupt controller give
-  the same rate), halt polling, the number of vCPUs; full GPU clocks help a little (see *Low frame
-  rate* above). The rest of the gap comes from running under WHPX instead of KVM; its exact cause
-  is not identified yet.
+- Frame rate: ~22-25 frames/s in animations in a window (~29 headless), against ~25-29 on Linux.
+  The guest reports 120 Hz displays (patch 0096) because macOS paces frames to the refresh
+  rate and, under WHPX, missed every other 60 Hz tick. The remaining gap in a window is the
+  CPU copy and drawing of each frame on QEMU's main loop (no dmabuf on Windows). Ruled out:
+  interrupt delivery (both interrupt controllers), halt polling, the number of vCPUs, Vulkan
+  submit/fence times (a DirectX port would not be faster).
 - The launcher uses QEMU's interrupt controller (`kernel-irqchip=off`). Hyper-V's (`-IrqChip on`)
   works too since patch 0094, at the same frame rate, but has had less testing.
+- macOS shows its displays as 120 Hz. `-PvgProps refresh-hz=60` gives the old 60 Hz modes.
 - macOS on an AMD host runs as an Intel CPU model; Intel-only CPU registers are emulated by the
   Windows patches (0085, 0086).
 - Only the tools needed to build and run are ported; the Linux tracing and benchmark scripts are

@@ -177,9 +177,17 @@
       INIT/SIPI had no effect) -> patch 0094: INIT/SIPI exit trap, QEMU delivers them (do_cpu_init
       + StartupSuspend, apic_sipi + clear), whpx-apic keeps wait_for_sipi. Boots with 8 CPUs, x2APIC
       on; frame rate unchanged (18.0/s) -> not the bottleneck. Launcher default stays off (less tested)
-- [ ] Remaining gap to Linux (28/s): not display, interrupts (both APIC modes), halt polling, vCPU
-      count, GPU clocks (+5-10 %), HAGS (already on). Next candidates: per-frame Vulkan
-      submit/fence latency on the Windows driver, WHPX exit costs for the guest's other exits
+- [x] Vulkan submit/fence on the Windows driver: vkQueueSubmit 17-19 us, full round trips rare,
+      previous-frame waits < 0.1 ms -> not the bottleneck; a DirectX port would not be faster
+- [x] WHPX exits: 220k/s, ~160k/s of them port I/O to the SMC (0x300/0x304): macOS retried
+      GET_KEY_BY_INDEX/GET_KEY_TYPE without end -> patch 0095 (key enumeration, #KEY, types,
+      writes acked): 32k exits/s, SMC ~40 accesses/s. Frame rate alone unchanged
+- [x] Root cause of ~19/s: WindowServer's 60 Hz pacing, frames on every 3rd tick under WHPX ->
+      patch 0096: refresh-hz=120 (headless 18.6 -> 28.8; 240 Hz 28.6) + present completed before
+      the console copy, copy throttled to 16 ms (gtk 22.5/24.8/25.6, sdl 22.5; was 17.7/18.0)
+- [ ] Remaining window gap (24 vs 29 headless): CPU copy + draw on the main loop. Candidate: a
+      copy outside the BQL / a direct swapchain window (only a few presents/s to gain)
+- [ ] Measure 0095/0096 on Linux (refresh-hz=120 and the SMC changes apply there too)
 - [ ] Worker queue wait 5-7 ms per job (same on Linux: 7-9 ms) - frame pipelining, not Windows
 
 ## Guest app issues (both hosts)
