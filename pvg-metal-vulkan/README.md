@@ -204,7 +204,7 @@ encoder.
 
 Tested on Windows 10 22H2 (19045), Ryzen 9 5950X, RTX 3060 Ti (driver 617.42): the desktop renders
 through the paravirtual GPU, with the guest fixups. The accelerator is WHPX (Hyper-V) instead of KVM;
-patches 0085-0093 make that work for macOS:
+patches 0085-0094 make that work for macOS:
 
 - **CPUID** (0085): WHPX answered the cache/topology leaves (2, 4, 5, 0x80000005/6) from the host;
   with the Intel CPU model on an AMD host leaf 4 was empty and macOS divided by zero in
@@ -224,10 +224,12 @@ patches 0085-0093 make that work for macOS:
   (verified under WHPX: "patched (breakpoint, hit #1)").
 - **SDL with OpenGL** (0092, 0093): `-display sdl,gl=on` no longer assumes EGL (Windows has WGL),
   SDL cursors get the same square canvas, and the device needs no dmabuf on Windows.
+- **Hyper-V's APIC** (0094): with `kernel-irqchip=on` macOS's INIT/STARTUP IPIs never started its
+  other CPUs ("Failed to start CPU 01"); QEMU now delivers them (INIT/SIPI exit trap, Hyper-V's
+  StartupSuspend state).
 
-Use the APIC in QEMU (`kernel-irqchip=off`, the default of `run-pvg-vm.ps1`): with Hyper-V's APIC
-macOS fails to start its other CPUs ("Failed to start CPU 01"), and with x2APIC hidden it boots but
-extremely slowly. No dmabuf scanout on Windows
+`run-pvg-vm.ps1` uses QEMU's APIC (`kernel-irqchip=off`); Hyper-V's (`-IrqChip on`) works since
+0094 and gives the same frame rate, but has seen less testing. No dmabuf scanout on Windows
 (presents take the CPU path); the upload cache (`upload-cache=on`, off by default) gains nothing
 under WHPX, which reports all RAM dirty; zero-copy guest RAM import works. Displays, Mission
 Control toggles, 32 s windows: `gtk`, `sdl` (SDL with OpenGL) and headless all ~18-20 presents/s (Linux: gtk 10.8, gtk-gl 25,

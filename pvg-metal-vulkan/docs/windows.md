@@ -69,7 +69,7 @@ changed them.
 
 ### Step 5: build QEMU
 Runs `scripts/build-qemu.sh` in MSYS2: it downloads QEMU 11.1.3, applies the patches in
-`patches/` (the paravirtual GPU device plus the Windows/WHPX fixes 0085-0093) and builds it into
+`patches/` (the paravirtual GPU device plus the Windows/WHPX fixes 0085-0094) and builds it into
 `src\qemu\build`. The first build takes about 20-30 minutes. After a `git pull` that brings new
 patches, the setup rebuilds only what changed.
 
@@ -195,8 +195,8 @@ keyboard layout in macOS (System Settings → Keyboard → Input Sources) as on 
 
 **Low frame rate.** Expect ~18-20 frames/s in animations (Mission Control) on Windows, against
 ~25-29 on Linux on the same PC. Measured: the window type (GTK, SDL, none), the CPU copy of each
-frame, the number of vCPUs and halt polling make no difference; the gap is the guest running
-slower under WHPX than under KVM. What helps a little (~5-10 %): keeping the GPU at full clocks.
+frame, the interrupt controller, the number of vCPUs and halt polling make no difference; the
+gap comes from running under WHPX instead of KVM. What helps a little (~5-10 %): keeping the GPU at full clocks.
 NVIDIA Control Panel -> Manage 3D settings -> Program settings -> add
 `src\qemuuild\qemu-system-x86_64.exe` -> *Power management mode: Prefer maximum
 performance* (the GPU otherwise idles at its lowest clocks between the guest's small frames).
@@ -205,13 +205,13 @@ performance* (the GPU otherwise idles at its lowest clocks between the guest's s
 
 - No dmabuf scanout: frames are copied through the CPU (Linux displays them directly from the
   GPU); `-display gtk,gl=on` is not supported.
-- Frame rate: ~18-20 frames/s in animations, against ~25-29 on Linux on the same PC. The display
-  path, interrupt delivery and the number of vCPUs were measured and are not the cause; the guest
-  itself runs slower under WHPX (its timer and interrupt-controller accesses exit to QEMU). Full GPU
-  clocks help a little (see *Low frame rate* above).
-- Hyper-V's own interrupt controller (`-IrqChip on`) does not start macOS's other CPUs; with x2APIC
-  hidden it boots, but extremely slowly. QEMU's is used (`kernel-irqchip=off`, the launcher's
-  default). Making Hyper-V's work is the main open lead for a faster guest.
+- Frame rate: ~18-20 frames/s in animations, against ~25-29 on Linux on the same PC. Measured and
+  ruled out: the display path, interrupt delivery (QEMU's and Hyper-V's interrupt controller give
+  the same rate), halt polling, the number of vCPUs; full GPU clocks help a little (see *Low frame
+  rate* above). The rest of the gap comes from running under WHPX instead of KVM; its exact cause
+  is not identified yet.
+- The launcher uses QEMU's interrupt controller (`kernel-irqchip=off`). Hyper-V's (`-IrqChip on`)
+  works too since patch 0094, at the same frame rate, but has had less testing.
 - macOS on an AMD host runs as an Intel CPU model; Intel-only CPU registers are emulated by the
   Windows patches (0085, 0086).
 - Only the tools needed to build and run are ported; the Linux tracing and benchmark scripts are

@@ -20,14 +20,15 @@
 #   -TraceEvents file              QEMU trace events (log in logs/)
 #   -SerialLog file                guest serial port to a file (macOS kernel log with serial=3)
 #   -NoShare                       no clipboard / file sharing (scripts/vm-share/kvm-share.py)
-#   -IrqChip off|on                APIC in QEMU (off, default) or in Hyper-V (on: macOS fails to
-#                                  start its other CPUs; with x2APIC hidden, -QemuExtra "-cpu
-#                                  ...,-x2apic", it boots but extremely slowly: experimental)
+#   -IrqChip off|on                APIC in QEMU (off, default) or in Hyper-V (on: works since patch
+#                                  0094, same frame rate; less tested)
 #   -SshPort 2222                  forward 127.0.0.1:PORT to the guest's ssh (Remote Login), e.g. for
 #                                  scripts/vm-share/install-guest.sh -p (user networking has no route in)
 #   -Installer                     attach the macOS installer (BaseSystem.img in the ULTMOS folder),
 #                                  for a fresh install (with -NoPvg; scripts\setup-windows.ps1)
 #   -ExtraDisk file.img            a raw disk on the next AHCI port (scripts/collect-rom.ps1)
+#   -OpenCore file.qcow2           another OpenCore image, e.g. a copy with boot-args -v serial=3
+#                                  (scripts/whpx-oc-patch.py in the repository root) for kernel logs
 #   -QemuExtra "..."               extra QEMU arguments
 #   -Qemu path                     QEMU binary (default src/qemu/build/qemu-system-x86_64.exe)
 #   -Msys2 dir                     MSYS2 root, for the build's DLLs (C:\msys64)
@@ -49,6 +50,7 @@ param(
     [int]$SshPort = 0,
     [switch]$Installer,
     [string]$ExtraDisk = "",
+    [string]$OpenCore = "",
     [string]$QemuExtra = "",
     [string]$Qemu = "",
     [string]$Msys2 = "C:\msys64"
@@ -89,6 +91,7 @@ if ($Overlay) {
 } else {
     $Hdd = "$Ultmos\HDD.qcow2"; $Oc = "$Ultmos\boot\OpenCore.qcow2"; $Vars = "$Ultmos\ovmf\OVMF_VARS.fd"
 }
+if ($OpenCore) { $Oc = $OpenCore }     # e.g. a copy with debug boot-args (whpx-oc-patch.py)
 
 # QEMU's option parser splits on commas; forward slashes avoid backslash surprises
 function QPath([string]$p) { return ($p -replace '\\', '/') }

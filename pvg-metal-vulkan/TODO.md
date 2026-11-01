@@ -173,9 +173,13 @@
 - [x] GPU clocks locked (nvidia-smi -lgc 1500,2100 / -lmc 7001): previous-frame GPU waits
       11-19 -> 2-3 ms, 20.0 headless / 19.5 gtk (+5-10 %). Documented: NVIDIA "Prefer maximum
       performance" for qemu-system-x86_64.exe.
-- [ ] The remaining gap to Linux (28/s) is guest speed under WHPX (exits for timer/APIC with
-      kernel-irqchip=off). Hyper-V's APIC (kernel-irqchip=on, -x2apic) boots but crawls (progress
-      bar 30 -> 40 % in 8 min): find why (timer/IPI delivery) - the most promising lead
+- [x] Hyper-V's APIC (kernel-irqchip=on): APs never started (stayed in OVMF's wait loop; macOS's
+      INIT/SIPI had no effect) -> patch 0094: INIT/SIPI exit trap, QEMU delivers them (do_cpu_init
+      + StartupSuspend, apic_sipi + clear), whpx-apic keeps wait_for_sipi. Boots with 8 CPUs, x2APIC
+      on; frame rate unchanged (18.0/s) -> not the bottleneck. Launcher default stays off (less tested)
+- [ ] Remaining gap to Linux (28/s): not display, interrupts (both APIC modes), halt polling, vCPU
+      count, GPU clocks (+5-10 %), HAGS (already on). Next candidates: per-frame Vulkan
+      submit/fence latency on the Windows driver, WHPX exit costs for the guest's other exits
 - [ ] Worker queue wait 5-7 ms per job (same on Linux: 7-9 ms) - frame pipelining, not Windows
 
 ## Guest app issues (both hosts)
