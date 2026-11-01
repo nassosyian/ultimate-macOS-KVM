@@ -66,3 +66,7 @@ docs/.screenshots
 docs/.bundle
 docs/_sass
 docs/_layouts
+
+# Local PVG working notes (not tracked)
+pvg-metal-vulkan/HW-ACCELERATION.md
+pvg-metal-vulkan/PROGRESS_LOG.md

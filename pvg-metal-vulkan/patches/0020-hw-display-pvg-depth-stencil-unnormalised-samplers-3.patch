@@ -1,0 +1,747 @@
+From 7a2525677fe9e46c4c44daf6a9b7e1437dfe8103 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 13:51:39 +0200
+Subject: [PATCH 20/54] hw/display/pvg: depth/stencil, unnormalised samplers,
+ 32-bit stage IO
+
+- DescribeRenderPass depth (bytes 0..39) and stencil (40..75) attachments
+  backed by host-only D32_SFLOAT_S8_UINT images; SetDepthStencilState
+  (PGSerializedDepthStencilDescriptor) and SetStencilRef applied as
+  Vulkan 1.3 dynamic state; pipelines keyed by depth/stencil format.
+- Unnormalised-coordinate samplers: host samplers stay normalised, air2spv
+  divides coordinates by the texture size under spec constant 0 (mask of
+  unnormalised sampler slots); pipelines keyed by the masks.
+- 8/16-bit vertex inputs, varyings and fragment outputs are declared
+  32-bit and converted (storageInputOutput16 is unavailable on NVIDIA).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/air2spv.c  |  95 +++++++++++-
+ hw/display/pvg/air2spv.h  |   3 +
+ hw/display/pvg/pvg-exec.c | 315 ++++++++++++++++++++++++++++++++++++--
+ hw/display/pvg/spv.h      |   4 +-
+ 4 files changed, 398 insertions(+), 19 deletions(-)
+
+diff --git a/hw/display/pvg/air2spv.c b/hw/display/pvg/air2spv.c
+index af0bacf..9c3d270 100644
+--- a/hw/display/pvg/air2spv.c
++++ b/hw/display/pvg/air2spv.c
+@@ -38,6 +38,7 @@ typedef struct Arg {
+     enum Interp interp;
+     char tex_type[64];          /* e.g. "texture2d<float, sample>" */
+     uint32_t var;               /* SPIR-V variable */
++    uint32_t io_type;           /* variable's type when widened from 8/16 bits, else 0 */
+ } Arg;
+ 
+ typedef struct Resource {       /* texture/sampler handle reached through an LLVM value */
+@@ -46,6 +47,7 @@ typedef struct Resource {       /* texture/sampler handle reached through an LLV
+     uint32_t var, type;         /* variable and its pointee type */
+     uint32_t dim;
+     bool arrayed;
++    int slot;                   /* sampler argument index, -1 for constant samplers */
+ } Resource;
+ 
+ typedef struct Ctx {
+@@ -71,7 +73,9 @@ typedef struct Ctx {
+ 
+     uint32_t t_void, t_bool, t_u32, t_u64, t_f32;
+     uint32_t pc_var, pc_elem_ptr;
++    uint32_t unnorm_spec;       /* OpSpecConstant A2S_SPEC_UNNORMALIZED, 0 = not yet */
+     uint32_t out_vars[16];      /* fragment render targets / vertex outputs */
++    uint32_t out_io_type[16];   /* widened type of an output, 0 = as declared */
+     int nout;
+     LLVMTypeRef ret_ty;
+     /* private memory (alloca): Function-storage uint[] arrays, pointers tracked as byte offsets */
+@@ -555,6 +559,41 @@ static Resource *resource_for(Ctx *c, LLVMValueRef v)
+     return NULL;
+ }
+ 
++static bool is_bool(LLVMTypeRef t);
++static uint32_t emit(Ctx *c, uint16_t op, uint32_t type, uint32_t result, const uint32_t *ops,
++                     size_t n);
++
++/*
++ * 8/16-bit stage inputs/outputs need storageInputOutput16, which NVIDIA lacks: such
++ * interface variables are declared 32-bit and converted at the load/store. Returns the
++ * widened type, or 0 when t is used as is.
++ */
++static uint32_t io_widen(Ctx *c, LLVMTypeRef t)
++{
++    LLVMTypeRef et = LLVMGetTypeKind(t) == LLVMVectorTypeKind ? LLVMGetElementType(t) : t;
++    unsigned n = LLVMGetTypeKind(t) == LLVMVectorTypeKind ? LLVMGetVectorSize(t) : 1;
++    uint32_t w;
++
++    if (LLVMGetTypeKind(et) == LLVMHalfTypeKind) {
++        w = c->t_f32;
++    } else if (LLVMGetTypeKind(et) == LLVMIntegerTypeKind && LLVMGetIntTypeWidth(et) < 32 &&
++               !is_bool(et)) {
++        w = c->t_u32;
++    } else {
++        return 0;
++    }
++    return n > 1 ? spv_type_vec(&c->m, w, n) : w;
++}
++
++/* convert between an interface value of type 'from' and LLVM type t (either direction) */
++static uint32_t io_convert(Ctx *c, uint32_t v, LLVMTypeRef t, uint32_t to)
++{
++    LLVMTypeRef et = LLVMGetTypeKind(t) == LLVMVectorTypeKind ? LLVMGetElementType(t) : t;
++
++    return emit(c, LLVMGetTypeKind(et) == LLVMHalfTypeKind ? SpvOpFConvert : SpvOpUConvert,
++                to, 0, &v, 1);
++}
++
+ static int setup_interface(Ctx *c)
+ {
+     int max_buf = -1, nconst = 0;
+@@ -610,6 +649,7 @@ static int setup_interface(Ctx *c)
+ 
+             r->key = LLVMGetParam(c->fn, i);
+             r->is_sampler = true;
++            r->slot = a->index;
+             r->type = spv_type(&c->m, SpvOpTypeSampler, NULL, 0);
+             r->var = global_var(c, SpvStorageUniformConstant, r->type);
+             decorate1(c, r->var, SpvDecorationDescriptorSet, 0);
+@@ -630,6 +670,8 @@ static int setup_interface(Ctx *c)
+             if (loc < 0) {
+                 return -1;
+             }
++            a->io_type = io_widen(c, LLVMTypeOf(LLVMGetParam(c->fn, i)));
++            t = a->io_type ? a->io_type : t;
+             a->var = global_var(c, SpvStorageInput, t);
+             decorate1(c, a->var, SpvDecorationLocation, loc);
+             if (a->interp == INTERP_FLAT ||
+@@ -641,7 +683,9 @@ static int setup_interface(Ctx *c)
+             break;
+         }
+         case ARG_VERTEX_INPUT:
+-            a->var = global_var(c, SpvStorageInput, ty(c, LLVMTypeOf(LLVMGetParam(c->fn, i))));
++            a->io_type = io_widen(c, LLVMTypeOf(LLVMGetParam(c->fn, i)));
++            a->var = global_var(c, SpvStorageInput, a->io_type ? a->io_type :
++                                ty(c, LLVMTypeOf(LLVMGetParam(c->fn, i))));
+             decorate1(c, a->var, SpvDecorationLocation, a->index);
+             break;
+         case ARG_POINT_COORD:
+@@ -683,6 +727,7 @@ static int setup_interface(Ctx *c)
+             r = &c->rsrc[c->nrsrc++];
+             r->key = g;
+             r->is_sampler = true;
++            r->slot = -1;
+             r->type = spv_type(&c->m, SpvOpTypeSampler, NULL, 0);
+             r->var = global_var(c, SpvStorageUniformConstant, r->type);
+             decorate1(c, r->var, SpvDecorationDescriptorSet, 0);
+@@ -735,12 +780,16 @@ static int setup_interface(Ctx *c)
+                 if (loc < 0) {
+                     return -1;
+                 }
+-                c->out_vars[i] = global_var(c, SpvStorageOutput, t);
++                c->out_io_type[i] = io_widen(c, mt);
++                c->out_vars[i] = global_var(c, SpvStorageOutput,
++                                            c->out_io_type[i] ? c->out_io_type[i] : t);
+                 decorate1(c, c->out_vars[i], SpvDecorationLocation, loc);
+             } else if (!strcmp(kind, "air.point_size")) {
+                 c->out_vars[i] = builtin_var(c, SpvStorageOutput, t, SpvBuiltInPointSize);
+             } else if (!strcmp(kind, "air.render_target")) {
+-                c->out_vars[i] = global_var(c, SpvStorageOutput, t);
++                c->out_io_type[i] = io_widen(c, mt);
++                c->out_vars[i] = global_var(c, SpvStorageOutput,
++                                            c->out_io_type[i] ? c->out_io_type[i] : t);
+                 decorate1(c, c->out_vars[i], SpvDecorationLocation, no > 1 ? md_int(o[1]) : 0);
+                 if (no > 2 && md_int(o[2]) > 0) {
+                     decorate1(c, c->out_vars[i], SpvDecorationIndex, md_int(o[2]));
+@@ -1247,6 +1296,36 @@ static int texture_call(Ctx *c, LLVMValueRef call, const char *name, uint32_t re
+         if (!smp || !smp->is_sampler) {
+             return fail(c, "sample with unknown sampler");
+         }
++        if (smp->slot >= 0 && smp->slot < 32 && !arrayed &&
++            (tex->dim == SpvDim1D || tex->dim == SpvDim2D)) {
++            /* unnormalised sampler bound to this slot (spec constant): coord /= size */
++            unsigned cn = tex->dim == SpvDim2D ? 2 : 1;
++            uint32_t i32 = spv_type_int(&c->m, 32, true);
++            uint32_t ity = cn == 2 ? spv_type_vec(&c->m, i32, 2) : i32;
++            uint32_t fty = cn == 2 ? spv_type_vec(&c->m, c->t_f32, 2) : c->t_f32;
++            uint32_t q[2] = { image, spv_const_u32(&c->m, 0) }, size, sel[3], bit[2];
++
++            if (!c->unnorm_spec) {
++                uint32_t sc[3] = { c->t_u32, spv_id(&c->m), 0 };
++
++                spv_emit(&c->m, SPV_SEC_TYPES, SpvOpSpecConstant, sc, 3);
++                c->unnorm_spec = sc[1];
++                decorate1(c, c->unnorm_spec, SpvDecorationSpecId, A2S_SPEC_UNNORMALIZED);
++            }
++            spv_capability(&c->m, SpvCapabilityImageQuery);
++            size = emit(c, SpvOpImageQuerySizeLod, ity, 0, q, 2);
++            size = emit(c, SpvOpConvertSToF, fty, 0, &size, 1);
++            bit[0] = c->unnorm_spec;
++            bit[1] = spv_const_u32(&c->m, 1u << smp->slot);
++            bit[0] = emit(c, SpvOpBitwiseAnd, c->t_u32, 0, bit, 2);
++            bit[1] = spv_const_u32(&c->m, 0);
++            sel[0] = emit(c, SpvOpINotEqual, c->t_bool, 0, bit, 2);
++            q[0] = coord;
++            q[1] = size;
++            sel[1] = emit(c, SpvOpFDiv, fty, 0, q, 2);
++            sel[2] = coord;
++            coord = emit(c, SpvOpSelect, fty, 0, sel, 3);
++        }
+         if (arrayed) {
+             /* coord ++ float(array index) */
+             LLVMValueRef ai = LLVMGetOperand(call, a++);
+@@ -1518,6 +1597,10 @@ static int emit_return(Ctx *c, LLVMValueRef inst)
+ 
+                 m = emit(c, SpvOpCompositeExtract, ty(c, mt), 0, eops, 2);
+             }
++            if (c->out_io_type[i]) {
++                m = io_convert(c, m, c->ret_is_struct ? LLVMStructGetTypeAtIndex(c->ret_ty, i) :
++                               c->ret_ty, c->out_io_type[i]);
++            }
+             ops[0] = c->out_vars[i];
+             ops[1] = m;
+             spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpStore, ops, 2);
+@@ -2266,6 +2349,12 @@ static int translate_function(Ctx *c)
+                         vset(c, p, v);
+                         continue;
+                     }
++                    if (arg->io_type) {
++                        uint32_t v = emit(c, SpvOpLoad, arg->io_type, 0, &arg->var, 1);
++
++                        vset(c, p, io_convert(c, v, LLVMTypeOf(p), t));
++                        continue;
++                    }
+                     vset(c, p, emit(c, SpvOpLoad, t, 0, &arg->var, 1));
+                 }
+             }
+diff --git a/hw/display/pvg/air2spv.h b/hw/display/pvg/air2spv.h
+index 4e19d11..0ff3502 100644
+--- a/hw/display/pvg/air2spv.h
++++ b/hw/display/pvg/air2spv.h
+@@ -21,6 +21,9 @@ enum { A2S_STAGE_VERTEX = 0, A2S_STAGE_FRAGMENT = 4 };
+ /* image view kinds expected by a texture binding (values = VkImageViewType) */
+ enum { A2S_VIEW_1D = 0, A2S_VIEW_2D = 1, A2S_VIEW_3D = 2, A2S_VIEW_CUBE = 3,
+        A2S_VIEW_1D_ARRAY = 4, A2S_VIEW_2D_ARRAY = 5, A2S_VIEW_CUBE_ARRAY = 6 };
++/* specialisation constant: u32 mask of sampler slots bound to unnormalised-coordinate samplers
++ * (their coordinates are divided by the texture size; the host samplers are normalised) */
++#define A2S_SPEC_UNNORMALIZED   0
+ 
+ typedef struct A2SResult {
+     uint32_t *spirv;            /* malloc'ed, free with free() */
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index 51aad9f..4a3807c 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -70,6 +70,7 @@ typedef struct HostImage {
+     VkFormat format;
+     uint32_t width, height, depth, layers;
+     VkImageViewType view_type;
++    bool initialized;           /* depth/stencil: contents defined (host-only images) */
+ } HostImage;
+ 
+ /* A texture's linear copy in guest memory */
+@@ -84,6 +85,10 @@ typedef struct GuestImage {
+     VkComponentMapping swizzle;
+ } GuestImage;
+ 
++typedef struct DSAttachmentSave {
++    uint32_t depth_ref, stencil_ref;
++} DSAttachmentSave;
++
+ typedef struct Pipeline {
+     bool ok;
+     VkPipeline pipe;
+@@ -131,9 +136,11 @@ struct PVGExec {
+     GHashTable *pipelines;      /* key: task << 32 | id → Pipeline* */
+     GHashTable *uploaded;       /* per command buffer: task << 32 | id → arena offset + 1 */
+     GHashTable *samplers;       /* task << 32 | id → VkSampler (as pointer) */
+-    uint32_t upload_failures;
++    uint32_t upload_failures, ds_kind_logged;
++    DSAttachmentSave last_ds;
+     HostImage dummy[7];         /* 1x1 placeholders per VkImageViewType */
+-    GHashTable *written;    /* diagnostics: guest-physical page -> writer kind */
++    GHashTable *written;
++    GHashTable *unnorm;     /* (task, sampler ref) with unnormalised coordinates */    /* diagnostics: guest-physical page -> writer kind */
+     bool creating_dummies;
+ };
+ 
+@@ -681,11 +688,15 @@ static VkSampler sampler_get(PVGExec *e, uint32_t task, uint32_t ref)
+         sci.anisotropyEnable = sci.maxAnisotropy > 1;
+         sci.compareEnable = (w0 >> 5 & 7) != 0;
+         sci.compareOp = (VkCompareOp)(w0 >> 5 & 7);
+-        sci.unnormalizedCoordinates = !(w0 >> 31);
+         sci.minLod = lmin;
+         sci.maxLod = (w0 >> 24 & 3) == 0 ? 0.25f : lmax;   /* NotMipmapped: base level only */
+-        if (sci.unnormalizedCoordinates) {
+-            /* Vulkan restrictions for unnormalised samplers */
++        if (!(w0 >> 31)) {
++            /*
++             * Unnormalised coordinates: Vulkan forbids them with implicit-LOD sampling, so the
++             * host sampler stays normalised and the shader divides by the texture size
++             * (A2S_SPEC_UNNORMALIZED). Metal's own restrictions for such samplers still apply.
++             */
++            g_hash_table_add(e->unnorm, key_new(task, ref));
+             sci.minFilter = sci.magFilter;
+             sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+             sci.minLod = sci.maxLod = 0;
+@@ -810,10 +821,12 @@ static VkShaderModule shader_module(PVGExec *e, const A2SResult *r)
+ 
+ /* pipelines are specialised per render pass attachment formats (dynamic rendering needs a match) */
+ static Pipeline *pipeline_get(PVGExec *e, uint32_t task, uint32_t ref, const VkFormat *pass_formats,
+-                              uint32_t npass)
++                              uint32_t npass, VkFormat dfmt, VkFormat sfmt,
++                              const uint32_t unnorm[2])
+ {
+     PVGGpu *g = e->gpu;
+-    g_autofree char *key = g_strdup_printf("%u:%u:%d,%d,%d,%d,%d,%d,%d,%d", task, ref,
++    g_autofree char *key = g_strdup_printf("%u:%u:%d,%d:%x,%x:%d,%d,%d,%d,%d,%d,%d,%d", task,
++        ref, dfmt, sfmt, unnorm[0], unnorm[1],
+         pass_formats[0], npass > 1 ? pass_formats[1] : 0, npass > 2 ? pass_formats[2] : 0,
+         npass > 3 ? pass_formats[3] : 0, npass > 4 ? pass_formats[4] : 0,
+         npass > 5 ? pass_formats[5] : 0, npass > 6 ? pass_formats[6] : 0,
+@@ -1043,11 +1056,17 @@ static Pipeline *pipeline_get(PVGExec *e, uint32_t task, uint32_t ref, const VkF
+         }
+     }
+     {
++        VkSpecializationMapEntry sme = { A2S_SPEC_UNNORMALIZED, 0, 4 };
++        VkSpecializationInfo spec[2] = {
++            { 1, &sme, 4, &unnorm[0] }, { 1, &sme, 4, &unnorm[1] },
++        };
+         VkPipelineShaderStageCreateInfo stages[2] = {
+             { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+-              .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vsm, .pName = "main" },
++              .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vsm, .pName = "main",
++              .pSpecializationInfo = &spec[0] },
+             { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+-              .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fsm, .pName = "main" },
++              .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fsm, .pName = "main",
++              .pSpecializationInfo = &spec[1] },
+         };
+         VkPipelineVertexInputStateCreateInfo vi = {
+             .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+@@ -1073,13 +1092,22 @@ static Pipeline *pipeline_get(PVGExec *e, uint32_t task, uint32_t ref, const VkF
+             .attachmentCount = npass, .pAttachments = blends };
+         VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                                  VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
+-                                 VK_DYNAMIC_STATE_BLEND_CONSTANTS };
++                                 VK_DYNAMIC_STATE_BLEND_CONSTANTS,
++                                 VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
++                                 VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
++                                 VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
++                                 VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
++                                 VK_DYNAMIC_STATE_STENCIL_OP,
++                                 VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
++                                 VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
++                                 VK_DYNAMIC_STATE_STENCIL_REFERENCE };
+         VkPipelineDynamicStateCreateInfo dy = {
+             .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+             .dynamicStateCount = G_N_ELEMENTS(dyn), .pDynamicStates = dyn };
+         VkPipelineRenderingCreateInfo ri = {
+             .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+-            .colorAttachmentCount = npass, .pColorAttachmentFormats = pass_formats };
++            .colorAttachmentCount = npass, .pColorAttachmentFormats = pass_formats,
++            .depthAttachmentFormat = dfmt, .stencilAttachmentFormat = sfmt };
+         VkGraphicsPipelineCreateInfo gci = {
+             .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri,
+             .stageCount = 2, .pStages = stages, .pVertexInputState = &vi,
+@@ -1123,6 +1151,10 @@ typedef struct RenderState {
+     VkViewport viewport;
+     VkRect2D scissor;
+     bool have_viewport, have_scissor;
++    /* PGSerializedDepthStencilDescriptor: w0 = depth compare | write << 3 | front << 4 |
++     * back << 5; per face {u32 compare | sfail << 3 | dfail << 6 | pass << 9, read, write} */
++    uint32_t ds_w0, ds_face[2][3];
++    uint32_t stencil_ref[2];
+ } RenderState;
+ 
+ static void set_bindings(Binding *b, const uint8_t *a, uint32_t alen)
+@@ -1266,6 +1298,177 @@ typedef struct Attachment {
+     uint64_t wb_off;
+ } Attachment;
+ 
++/* DescribeRenderPass depth (bytes 0..39) and stencil (40..75) attachments */
++typedef struct DSAttachment {
++    uint32_t depth_ref, stencil_ref, depth_load, stencil_load;
++    double clear_depth;
++    uint32_t clear_stencil;
++} DSAttachment;
++
++#define DS_FORMAT   VK_FORMAT_D32_SFLOAT_S8_UINT
++
++/* dimensions of a depth/stencil texture object (its format is not a colour format) */
++static bool ds_texture_dims(PVGExec *e, uint32_t task, uint32_t ref, uint32_t *w, uint32_t *h)
++{
++    uint8_t obj[MAX_OBJ];
++    uint32_t len, mips, tail;
++    uint8_t type = object(e, task, ref, obj, &len);
++    uint16_t fmt;
++
++    if ((type != OBJ_TEXTURE_2 && type != OBJ_TEXTURE_3) || len < 0x74) {
++        return false;
++    }
++    mips = (len - 0x50) / 0x24;
++    tail = 0x18 + mips * 0x24;
++    if (tail + 0x38 > len || tail + 0x38 > MAX_OBJ) {
++        return false;
++    }
++    /* MTLPixelFormat Depth16 250, Depth32Float 252, Stencil8 253, Depth24_Stencil8 255,
++     * Depth32Float_Stencil8 260, X32_Stencil8 261, X24_Stencil8 262 */
++    fmt = lduw(obj + tail + 0x18 + 2);
++    if (fmt != 250 && fmt != 252 && fmt != 253 && fmt != 255 && fmt != 260 && fmt != 261 &&
++        fmt != 262) {
++        return false;
++    }
++    *w = ldl(obj + tail);
++    *h = ldl(obj + tail + 4);
++    return *w && *h && *w <= 16384 && *h <= 16384;
++}
++
++static void ds_barrier(PVGExec *e, VkImage img, VkImageLayout from, VkImageLayout to)
++{
++    VkImageMemoryBarrier b = {
++        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
++        .oldLayout = from, .newLayout = to,
++        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .image = img, .subresourceRange = {
++            VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1 },
++    };
++
++    vkCmdPipelineBarrier(e->cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b);
++}
++
++/* host-only depth/stencil image of a texture object (Metal keeps these on the GPU too) */
++static HostImage *ds_image(PVGExec *e, uint32_t task, uint32_t ref, uint32_t w, uint32_t h)
++{
++    PVGGpu *g = e->gpu;
++    gint64 key = key_of(task, ref | 0x40000000u);
++    HostImage *hi = g_hash_table_lookup(e->images, &key);
++    VkImageCreateInfo ici = {
++        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
++        .format = DS_FORMAT, .extent = { w, h, 1 }, .mipLevels = 1, .arrayLayers = 1,
++        .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
++        .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
++        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++    };
++    VkImageViewCreateInfo vci = {
++        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .viewType = VK_IMAGE_VIEW_TYPE_2D,
++        .format = DS_FORMAT,
++        .subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
++                              0, 1, 0, 1 },
++    };
++    VkMemoryRequirements req;
++    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
++
++    if (hi && hi->width == w && hi->height == h) {
++        return hi;
++    }
++    if (hi) {
++        vkQueueWaitIdle(g->queue);
++        g_hash_table_remove(e->images, &key);
++    }
++    hi = g_new0(HostImage, 1);
++    if (vkCreateImage(g->device, &ici, NULL, &hi->image) != VK_SUCCESS) {
++        g_free(hi);
++        return NULL;
++    }
++    vkGetImageMemoryRequirements(g->device, hi->image, &req);
++    mai.allocationSize = req.size;
++    mai.memoryTypeIndex = pvg_gpu_memory_type(g, req.memoryTypeBits,
++                                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++    if (vkAllocateMemory(g->device, &mai, NULL, &hi->mem) != VK_SUCCESS) {
++        vkDestroyImage(g->device, hi->image, NULL);
++        g_free(hi);
++        return NULL;
++    }
++    vkBindImageMemory(g->device, hi->image, hi->mem, 0);
++    vci.image = hi->image;
++    vkCreateImageView(g->device, &vci, NULL, &hi->view);
++    hi->format = DS_FORMAT;
++    hi->width = w;
++    hi->height = h;
++    hi->depth = hi->layers = 1;
++    hi->view_type = VK_IMAGE_VIEW_TYPE_2D;
++    g_hash_table_insert(e->images, key_new(task, ref | 0x40000000u), hi);
++    return hi;
++}
++
++/* per stage (vertex, fragment): sampler slots currently bound to unnormalised samplers */
++static const uint32_t *unnorm_masks(PVGExec *e, uint32_t task, const RenderState *st,
++                                    uint32_t out[2])
++{
++    out[0] = out[1] = 0;
++    for (int i = 0; i < MAX_SLOTS; i++) {
++        gint64 kv = key_of(task, st->vsmp[i]), kf = key_of(task, st->fsmp[i]);
++
++        sampler_get(e, task, st->vsmp[i]);      /* decodes (and records) unseen samplers */
++        sampler_get(e, task, st->fsmp[i]);
++        out[0] |= st->vsmp[i] && g_hash_table_contains(e->unnorm, &kv) ? 1u << i : 0;
++        out[1] |= st->fsmp[i] && g_hash_table_contains(e->unnorm, &kf) ? 1u << i : 0;
++    }
++    return out;
++}
++
++/* SetDepthStencilState: object type 7 kind 4, descriptor at body + 12 */
++static void ds_state_decode(PVGExec *e, uint32_t task, uint32_t ref, RenderState *st)
++{
++    uint8_t obj[MAX_OBJ];
++    uint32_t len;
++
++    st->ds_w0 = 7;      /* no state: compare Always, no write, no stencil */
++    memset(st->ds_face, 0, sizeof(st->ds_face));
++    if (!ref || object(e, task, ref, obj, &len) != OBJ_SERIALIZED || len < 12 + 28) {
++        return;
++    }
++    if (ldl(obj) != 4 && e->ds_kind_logged++ < 5) {
++        elog(e, "task %u depth/stencil state %u: unexpected kind %u", task, ref, ldl(obj));
++    }
++    st->ds_w0 = ldl(obj + 12);
++    for (int f = 0; f < 2; f++) {
++        for (int k = 0; k < 3; k++) {
++            st->ds_face[f][k] = ldl(obj + 16 + 12 * f + 4 * k);
++        }
++    }
++}
++
++/* Metal compare functions and stencil operations number like VkCompareOp / VkStencilOp */
++static void ds_apply(PVGExec *e, const RenderState *st, bool has_depth, bool has_stencil)
++{
++    VkCommandBuffer cb = e->cmd;
++    uint32_t cmp = st->ds_w0 & 7;
++    bool write = st->ds_w0 >> 3 & 1;
++
++    vkCmdSetDepthTestEnable(cb, has_depth && (cmp != 7 || write));
++    vkCmdSetDepthWriteEnable(cb, has_depth && write);
++    vkCmdSetDepthCompareOp(cb, (VkCompareOp)cmp);
++    vkCmdSetStencilTestEnable(cb, has_stencil && (st->ds_w0 & 0x30));
++    for (int f = 0; f < 2; f++) {
++        VkStencilFaceFlags face = f ? VK_STENCIL_FACE_BACK_BIT : VK_STENCIL_FACE_FRONT_BIT;
++        bool set = st->ds_w0 >> (4 + f) & 1;
++        uint32_t ops = set ? st->ds_face[f][0] : 7;     /* default: Always, Keep */
++
++        vkCmdSetStencilOp(cb, face, (VkStencilOp)(ops >> 3 & 7), (VkStencilOp)(ops >> 9 & 7),
++                          (VkStencilOp)(ops >> 6 & 7), (VkCompareOp)(ops & 7));
++        vkCmdSetStencilCompareMask(cb, face, set ? st->ds_face[f][1] : 0xff);
++        vkCmdSetStencilWriteMask(cb, face, set ? st->ds_face[f][2] : 0xff);
++        vkCmdSetStencilReference(cb, face, st->stencil_ref[f]);
++    }
++}
++
+ static bool is_attachment(const Attachment *att, uint32_t natt, uint32_t ref)
+ {
+     for (uint32_t i = 0; i < natt; i++) {
+@@ -1309,6 +1512,13 @@ static HostImage *feedback_snapshot(PVGExec *e, uint32_t task, Attachment *a,
+         ca[i].loadOp = ca[i].imageView ? VK_ATTACHMENT_LOAD_OP_LOAD :
+                        VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+     }
++    if (ri->pDepthAttachment) {
++        ((VkRenderingAttachmentInfo *)ri->pDepthAttachment)->loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
++    }
++    if (ri->pStencilAttachment) {
++        ((VkRenderingAttachmentInfo *)ri->pStencilAttachment)->loadOp =
++            VK_ATTACHMENT_LOAD_OP_LOAD;
++    }
+     vkCmdBeginRendering(e->cmd, ri);
+     e->stats.feedback_copies++;
+     return snap;
+@@ -1320,8 +1530,12 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+     RenderState st = { 0 };
+     Attachment att[MAX_COLOR] = { 0 };
+     VkFormat formats[MAX_COLOR];
+-    VkRenderingAttachmentInfo ca[MAX_COLOR];
++    VkRenderingAttachmentInfo ca[MAX_COLOR], da, sa;
+     VkRenderingInfo ri;
++    DSAttachment ds = { 0 };
++    HostImage *dsimg = NULL;
++    bool has_depth = false, has_stencil = false;
++    VkFormat dfmt = VK_FORMAT_UNDEFINED, sfmt = VK_FORMAT_UNDEFINED;
+     uint32_t off = 0, natt = 0, rw = 0, rh = 0;
+     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                     .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+@@ -1340,6 +1554,9 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+         }
+         memcpy(att, e->last_att, sizeof(att));
+         memcpy(&st, e->last_st, sizeof(st));
++        ds.depth_ref = e->last_ds.depth_ref;
++        ds.stencil_ref = e->last_ds.stencil_ref;
++        ds.depth_load = ds.stencil_load = 1;
+         for (int i = 0; i < MAX_COLOR; i++) {
+             att[i].load = att[i].ref ? 1 : 0;
+             att[i].img = NULL;
+@@ -1357,6 +1574,15 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+         if (id == 0x1a) {
+             const uint8_t *a = p + off - clen + 8;
+ 
++            if (clen - 8 >= 76) {
++                ds.depth_ref = ldl(a);
++                ds.depth_load = lduw(a + 20);
++                ds.clear_depth = ldd(a + 32);
++                ds.stencil_ref = ldl(a + 40);
++                ds.stencil_load = lduw(a + 60);
++                ds.clear_stencil = ldl(a + 68);
++            }
++
+             for (int i = 0; i < MAX_COLOR && (19 + 15 * (i + 1)) * 4 <= (int)(clen - 8); i++) {
+                 const uint8_t *c = a + (19 + 15 * i) * 4;
+ 
+@@ -1412,6 +1638,25 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+         }
+         return;
+     }
++    {
++        uint32_t dref = ds.depth_ref ? ds.depth_ref : ds.stencil_ref, w, h;
++
++        if (dref && ds_texture_dims(e, task, dref, &w, &h) && w >= rw && h >= rh) {
++            has_depth = ds.depth_ref != 0;
++            has_stencil = ds.stencil_ref != 0;
++            dfmt = has_depth ? DS_FORMAT : VK_FORMAT_UNDEFINED;
++            sfmt = has_stencil ? DS_FORMAT : VK_FORMAT_UNDEFINED;
++        } else if (dref && e->ds_kind_logged++ < 10) {
++            elog(e, "task %u: depth/stencil attachment %u not usable", task, dref);
++        }
++        if (has_depth || has_stencil) {
++            dsimg = ds_image(e, task, dref, w, h);
++            if (!dsimg) {
++                has_depth = has_stencil = false;
++                dfmt = sfmt = VK_FORMAT_UNDEFINED;
++            }
++        }
++    }
+     e->stats.render_passes++;
+ 
+     vkResetCommandBuffer(e->cmd, 0);
+@@ -1512,8 +1757,34 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+         .sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = { { 0, 0 }, { rw, rh } },
+         .layerCount = 1, .colorAttachmentCount = natt, .pColorAttachments = ca,
+     };
++    if (dsimg) {
++        /* Metal load actions: 0 don't care, 1 load, 2 clear; undefined contents are cleared */
++        bool keep = dsimg->initialized;
++        VkAttachmentLoadOp dl = ds.depth_load == 1 && keep ? VK_ATTACHMENT_LOAD_OP_LOAD :
++                                ds.depth_load == 0 && keep ? VK_ATTACHMENT_LOAD_OP_DONT_CARE :
++                                VK_ATTACHMENT_LOAD_OP_CLEAR;
++        VkAttachmentLoadOp sl = ds.stencil_load == 1 && keep ? VK_ATTACHMENT_LOAD_OP_LOAD :
++                                ds.stencil_load == 0 && keep ? VK_ATTACHMENT_LOAD_OP_DONT_CARE :
++                                VK_ATTACHMENT_LOAD_OP_CLEAR;
++        VkClearValue cv = { .depthStencil = {
++            ds.depth_load == 2 ? (float)ds.clear_depth : 1.0f,
++            ds.stencil_load == 2 ? ds.clear_stencil : 0 } };
++
++        ds_barrier(e, dsimg->image, keep ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL :
++                   VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
++        da = (VkRenderingAttachmentInfo){ .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
++            .imageView = dsimg->view,
++            .imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
++            .loadOp = dl, .storeOp = VK_ATTACHMENT_STORE_OP_STORE, .clearValue = cv };
++        sa = da;
++        sa.loadOp = sl;
++        ri.pDepthAttachment = has_depth ? &da : NULL;
++        ri.pStencilAttachment = has_stencil ? &sa : NULL;
++        dsimg->initialized = true;
++    }
+     vkCmdBeginRendering(e->cmd, &ri);
+     if (!cont) {
++        st.ds_w0 = 7;   /* Metal default depth/stencil state */
+         st.viewport = (VkViewport){ 0, (float)rh, (float)rw, -(float)rh, 0, 1 };
+         st.scissor = (VkRect2D){ { 0, 0 }, { rw, rh } };
+     }
+@@ -1528,6 +1799,15 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+         }
+         off += clen;
+         switch (id) {
++        case 0x68:      /* SetDepthStencilState {u32 ref} */
++            ds_state_decode(e, task, alen >= 4 ? ldl(a) : 0, &st);
++            break;
++        case 0x77:      /* SetStencilRef {u32 front, u32 back} */
++            if (alen >= 8) {
++                st.stencil_ref[0] = ldl(a);
++                st.stencil_ref[1] = ldl(a + 4);
++            }
++            break;
+         case 0x74:
+             st.pipeline = alen >= 4 ? ldl(a) : 0;
+             bound = NULL;
+@@ -1572,7 +1852,7 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+             uint32_t prim, count, first = 0, instances = 1, idx_size = 2;
+             Pipeline *pp;
+             HostImage *draw_tex[32] = { NULL };
+-            uint32_t ib = 0;
++            uint32_t ib = 0, unnorm[2];
+             uint64_t ib_off = 0;
+ 
+             if (alen < (id == 0x06 ? 24u : id == 0x09 ? 14u : id == 0x07 ? 12u : 8u)) {
+@@ -1609,7 +1889,8 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                 e->stats.skipped_draws++;
+                 break;
+             }
+-            pp = st.pipeline ? pipeline_get(e, task, st.pipeline, formats, natt) : NULL;
++            pp = st.pipeline ? pipeline_get(e, task, st.pipeline, formats, natt, dfmt, sfmt,
++                                                   unnorm_masks(e, task, &st, unnorm)) : NULL;
+             if (pp && pp->draws_logged < 3) {
+                 pp->draws_logged++;
+                 elog(e, "task %u pipeline %u draw 0x%x prim %u count %u first %u inst %u "
+@@ -1669,6 +1950,7 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+             vkCmdSetViewport(e->cmd, 0, 1, &st.viewport);
+             vkCmdSetScissor(e->cmd, 0, 1, &st.scissor);
+             vkCmdSetPrimitiveTopology(e->cmd, mtl_topology(prim));
++            ds_apply(e, &st, has_depth, has_stencil);
+             if (indexed) {
+                 uint64_t size, io = buffer_upload(e, task, ib, &size);
+ 
+@@ -1757,6 +2039,8 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+     }
+     memcpy(e->last_att, att, sizeof(att));
+     memcpy(e->last_st, &st, sizeof(st));
++    e->last_ds.depth_ref = has_depth ? ds.depth_ref : 0;
++    e->last_ds.stencil_ref = has_stencil ? ds.stencil_ref : 0;
+     e->last_task = task;
+     e->have_last = true;
+ }
+@@ -1937,6 +2221,7 @@ void pvg_exec_task_reset(PVGExec *e, uint32_t task)
+             g_hash_table_iter_remove(&it);
+         }
+     }
++    g_hash_table_foreach_remove(e->unnorm, match_task, GUINT_TO_POINTER(task));
+     g_hash_table_foreach_remove(e->images, match_task, GUINT_TO_POINTER(task));
+     g_hash_table_foreach_remove(e->pipelines, match_task_str, GUINT_TO_POINTER(task));
+ }
+@@ -2009,6 +2294,7 @@ PVGExec *pvg_exec_new(PVGGpu *gpu, const PVGExecHost *host)
+     e->pipelines = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, pipeline_free);
+     e->uploaded = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
+     e->samplers = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
++    e->unnorm = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
+     e->written = g_hash_table_new(g_direct_hash, g_direct_equal);
+     e->push_descriptor = (PFN_vkCmdPushDescriptorSetKHR)
+         vkGetDeviceProcAddr(gpu->device, "vkCmdPushDescriptorSetKHR");
+@@ -2058,6 +2344,7 @@ void pvg_exec_free(PVGExec *e)
+             }
+         }
+         g_hash_table_destroy(e->samplers);
++        g_hash_table_destroy(e->unnorm);
+         g_hash_table_destroy(e->written);
+     }
+     for (int i = 0; i < 7; i++) {
+diff --git a/hw/display/pvg/spv.h b/hw/display/pvg/spv.h
+index 8039175..e832b6d 100644
+--- a/hw/display/pvg/spv.h
++++ b/hw/display/pvg/spv.h
+@@ -39,7 +39,7 @@ enum {
+ enum { SpvDim1D = 0, SpvDim2D = 1, SpvDim3D = 2, SpvDimCube = 3, SpvDimBuffer = 5 };
+ 
+ enum {
+-    SpvDecorationBlock = 2, SpvDecorationArrayStride = 6, SpvDecorationBuiltIn = 11,
++    SpvDecorationSpecId = 1, SpvDecorationBlock = 2, SpvDecorationArrayStride = 6, SpvDecorationBuiltIn = 11,
+     SpvDecorationNoPerspective = 13, SpvDecorationFlat = 14, SpvDecorationCentroid = 16,
+     SpvDecorationSample = 17, SpvDecorationNonWritable = 24, SpvDecorationLocation = 30,
+     SpvDecorationIndex = 32, SpvDecorationBinding = 33, SpvDecorationDescriptorSet = 34,
+@@ -63,7 +63,7 @@ enum {
+     SpvOpTypeFloat = 22, SpvOpTypeVector = 23, SpvOpTypeMatrix = 24, SpvOpTypeImage = 25,
+     SpvOpTypeSampler = 26, SpvOpTypeSampledImage = 27, SpvOpTypeArray = 28,
+     SpvOpTypeRuntimeArray = 29, SpvOpTypeStruct = 30, SpvOpTypePointer = 32,
+-    SpvOpTypeFunction = 33, SpvOpConstantTrue = 41, SpvOpConstantFalse = 42, SpvOpConstant = 43,
++    SpvOpTypeFunction = 33, SpvOpConstantTrue = 41, SpvOpConstantFalse = 42, SpvOpConstant = 43, SpvOpSpecConstant = 50,
+     SpvOpConstantComposite = 44, SpvOpConstantNull = 46, SpvOpFunction = 54,
+     SpvOpFunctionEnd = 56, SpvOpVariable = 59, SpvOpLoad = 61, SpvOpStore = 62,
+     SpvOpAccessChain = 65, SpvOpDecorate = 71, SpvOpMemberDecorate = 72,
+-- 
+2.43.0
+

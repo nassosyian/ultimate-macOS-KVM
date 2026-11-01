@@ -53,6 +53,11 @@ Scripts? Configs? QEMU arguments? A *"qcow"* file? *Moo?* If you need a little h
 <li><b>Modern macOS Support <a href="https://github.com/Coopydood/ultimate-macOS-KVM/wiki/Supported-Guest-OSes">⎋</a></b></li> 
 Experience the latest macOS has to offer with built-in support from macOS High Sierra to the latest macOS Tahoe!
 
+<li><b>Metal-to-Vulkan HW Acceleration<a href="#metal-gpu-acceleration-without-passthrough">⎋</a></b></li> 
+Hardware acceleration for any GPU that supports Vulkan 1.3
+<li><b>OSX-Host file drag-n-drop & clipboard sharing<a href="#metal-gpu-acceleration-without-passthrough">⎋</a></b></li> 
+The `pvg-metal-vulkan` branch implements host<->OSX file drag and drop and clipboard sharing (text, images, files)
+
 <li><b>AutoPilot <a href="https://github.com/Coopydood/ultimate-macOS-KVM/wiki/AutoPilot">⎋</a></b></li> 
 Automatically generates a valid, customised, and ready-to-use QEMU config script in seconds.
 
@@ -221,6 +226,33 @@ $ ./main.py
 > If you're looking for single GPU passthrough, DarknessRafix has an *excellent* guide that walks you through the process of setting this up using ULTMOS. You can read it [here](https://gitlab.com/DarknessRafix/macosvmgpupass).
 
 Oh, and speaking of...
+
+***
+
+## 🎨》Metal GPU acceleration without passthrough
+
+The `pvg-metal-vulkan` branch adds a paravirtual GPU for QEMU, `pvg-linux-pci`. It implements the host side of Apple's ParavirtualizedGraphics, the device macOS's own `AppleParavirtGPU` driver uses. The guest's Metal command buffers run on your host GPU through Vulkan, and its shaders are translated to SPIR-V. No GPU passthrough, no second GPU and no extra kexts are needed. The desktop, Liquid Glass, Safari, Maps, Photos and SceneKit 3D render. Currently it gives ~25-30fps on an NVIDIA RTX 3060 Ti.
+
+> [!WARNING]
+> This is experimental. It has only been tested on one host (NVIDIA RTX 3060 Ti) and one macOS Tahoe build.
+> **USE AT YOUR OWN RISK**
+
+**Requirements**
+
+- A Linux host with KVM and a Vulkan 1.3 GPU. Only NVIDIA with the proprietary driver has been tested.
+- LLVM 19 or newer and Vulkan development files (`llvm-config`, the Vulkan headers and loader), plus QEMU's usual build dependencies.
+- A macOS Tahoe (26) x86_64 VM created with ULTMOS (AutoPilot).
+- dosfstools and mtools, for the one-time copy of the option ROM out of the guest.
+
+**Usage**: run `./main.py`, open **Extras**, then **6. Metal GPU acceleration**. Build QEMU (once), collect the option ROM from macOS (once), then boot. The same steps as scripts:
+
+```sh
+pvg-metal-vulkan/scripts/build-qemu.sh     # clone QEMU 11.1.3, apply the patches, build
+pvg-metal-vulkan/scripts/collect-rom.sh    # boot the VM with a transfer disk; in macOS run: sh /Volumes/PVGXFER/collect.sh rom
+pvg-metal-vulkan/scripts/run-pvg-vm.sh     # boot the VM with Metal acceleration
+```
+
+See [pvg-metal-vulkan/README.md](pvg-metal-vulkan/README.md) for display modes, device options and known limitations.
 
 ***
 

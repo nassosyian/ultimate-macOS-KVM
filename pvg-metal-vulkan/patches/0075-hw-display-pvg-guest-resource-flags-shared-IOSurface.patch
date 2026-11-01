@@ -1,0 +1,2772 @@
+From 321a5cc47353dfe3bfb135015497d33421aa3ce4 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Sat, 31 Oct 2026 16:18:55 +0200
+Subject: [PATCH 75/75] hw/display/pvg: guest resource flags, shared
+ IOSurfaces, async completion
+
+Upload skipping driven by the guest (resource-flags, default on): Apple's
+host keeps every resource on the GPU and re-uploads only what the guest
+reports as CPU-modified (ExecIndirect2 resource entries bit 0,
+InvalidateResources 0x34, which was ignored). An image equal to the
+guest's copy is reused until then; executor writes and mapping changes
+invalidate it by range and, through any mapping, by guest RAM page
+(per-page write sequence). 59% of uploaded bytes were repeats.
+
+share-surfaces (default on): one host image per IOSurface backing,
+plane and view shape for the texture objects of every task.
+
+async-cmds (default on): task-state commands (Map/Unmap, Delete*,
+DefineTask, SetObjectList, Invalidate/SynchronizeResources,
+ReplacePhysical) and the command-buffer reads of ExecIndirect2 run on
+the worker in FIFO order instead of draining it on the vCPU with the BQL
+held (~100 drains, 70-80 ms per 500 command buffers; doorbells now 2 us).
+
+async-visible (default on): command buffers whose guest-visible writes
+are GPU scatters signal a timeline semaphore and return; a completion
+thread publishes their stamps in order once reached. CPU readers wait
+per guest page. irqfd (default on): completion interrupts through a KVM
+irqfd on the MSI route, published from the worker or completion thread.
+
+Presents read a GPU-only frame from its image; dmabuf scanout for GL
+displays (dmabuf, default on; 3 exportable images, driver-chosen DRM
+modifier). Pipelines and samplers of deleted objects are destroyed with
+the frame being recorded instead of after a queue idle. PVG_FRAMES=2..4.
+
+defer-writeback (default off, experimental): render targets the guest
+flags GPU-written stay on the GPU until SynchronizeResources, a present
+or a reader of their pages; still loses some cross-process content.
+
+Diagnostics: pvg_linux_exec_latency / _waits, pvg_linux_present_shown,
+stale-read detector, PVG_DIAG_REDUNDANT.
+
+Mission Control test: 17.0-17.6 -> 26.4-28.5 presents/s.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-pci.c |  583 +++++++++++++++++--
+ hw/display/pvg/pvg-exec.c  | 1090 ++++++++++++++++++++++++++++++++++--
+ hw/display/pvg/pvg-exec.h  |   46 ++
+ hw/display/pvg/pvg-gpu.c   |   29 +-
+ hw/display/pvg/pvg-gpu.h   |    1 +
+ hw/display/trace-events    |    8 +-
+ 6 files changed, 1644 insertions(+), 113 deletions(-)
+
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index 2e29e96..578e49b 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -23,6 +23,10 @@
+ #include "hw/core/qdev-properties.h"
+ #include "ui/console.h"
+ #include "ui/surface.h"
++#include "standard-headers/drm/drm_fourcc.h"
++#include "system/system.h"
++#include "system/accel-irq.h"
++#include "qemu/event_notifier.h"
+ #include "system/address-spaces.h"
+ #include "system/dma.h"
+ #include "system/memory.h"
+@@ -274,7 +278,26 @@ struct PVGLinuxPCIState {
+     uint32_t present_y0, present_y1;    /* changed rows not yet on the console; y1 == 0: none */
+     uint32_t presents_done, presents_shown;
+     bool present_full;              /* gamma or size changed: copy every row */
++    /*
++     * dmabuf scanout (GL displays): the worker copies a frame into one of the executor's
++     * exportable images (scan_next, under present_lock); the bottom half shows it
++     */
++    bool dmabuf;                    /* property */
++    bool dmabuf_ok;                 /* GL display + exportable images */
++    bool scan_new, scan_shown;
++    int scan_next;
++    PVGScanout scan_info;
++    QemuDmaBuf *scan_buf[PVG_SCANOUT_BUFS];
++    uint32_t scan_gen;
+     int64_t present_queued_us;
++    /*
++     * Latency diagnostics (sums since the last pvg_linux_exec_latency trace): doorbell handling
++     * on the vCPU, queued -> started, job done -> stamp published, stamp published -> the
++     * guest's next doorbell
++     */
++    int64_t lat_doorbell, lat_queue, lat_bh, lat_guest, done_us, publish_us, doorbell_us;
++    int64_t lat_drain, lat_cbread;      /* of the doorbell time: drains, reading command buffers */
++    uint32_t n_doorbell, n_queue, n_bh, n_guest, n_drain;
+     int64_t exec_us, exec_max_us, exec_window_start;   /* executor time per 500 cmdbufs */
+     int64_t exec_read_us, exec_write_us;            /* ... of it copying guest memory */
+     uint64_t exec_read_bytes, exec_write_bytes;
+@@ -288,6 +311,10 @@ struct PVGLinuxPCIState {
+     bool damage_limit;
+     bool msaa;
+     bool upload_cache;
++    bool resource_flags;            /* upload cache driven by the guest's CPU-write reports */
++    bool async_cmds;                /* task commands on the worker (no drains on the vCPU) */
++    bool share_surfaces;            /* one host image per IOSurface for all tasks */
++    bool defer_writeback;           /* render targets written back when the guest asks */
+     bool zero_copy;
+     bool rebar;
+     bool early_complete;
+@@ -306,6 +333,25 @@ struct PVGLinuxPCIState {
+     uint32_t deferred_stamp[PVG_MAX_STAMPS];    /* FIFO stamp waiting for its jobs */
+     bool deferred_valid[PVG_MAX_STAMPS];
+     uint32_t published[PVG_MAX_STAMPS];
++    QemuMutex stamp_lock;           /* stamps are published from the vCPU, BH or worker */
++    /*
++     * Jobs whose guest-visible GPU writes still run (async_visible): their stamps wait here,
++     * in order, until the completion thread sees the executor's timeline reach them
++     */
++    bool async_visible;             /* property */
++    GQueue done_jobs;               /* PVGDoneJob */
++    QemuThread done_thread;
++    QemuCond done_cond;
++    bool done_thread_started;
++    /*
++     * Completion interrupts straight from the worker: a KVM irqfd on the MSI route (set up
++     * from the main loop once the guest enabled MSI). Until then stamps go through the BH.
++     */
++    bool irqfd;                     /* property */
++    bool irqfd_ready;
++    EventNotifier irq_notifier;
++    int irq_virq;
++    MSIMessage irq_msg;
+     int cur_stamp_index;                        /* FIFO being processed, -1 none */
+     uint32_t cur_stamp_value;
+     bool guest_fixups_enable;
+@@ -401,19 +447,75 @@ static void pvg_signal_stamp(PVGLinuxPCIState *s, uint32_t index,
+ {
+     uint32_t le = cpu_to_le32(value);
+ 
++    qemu_mutex_lock(&s->stamp_lock);
+     if (index < PVG_MAX_STAMPS) {
+         /* stamps only move forward (a job completion can be older than a FIFO's last stamp) */
+         if (s->published[index] && (int32_t)(value - s->published[index]) < 0) {
++            qemu_mutex_unlock(&s->stamp_lock);
+             return;
+         }
+         s->published[index] = value;
+     }
+ 
+     pci_dma_write(PCI_DEVICE(s), pvg_fifo_base(s) + index * 4, &le, 4);
+-    s->stamp_status |= 1u << index;
++    qatomic_or(&s->stamp_status, 1u << index);
++    qemu_mutex_unlock(&s->stamp_lock);
+     trace_pvg_linux_signal_stamp(index, value);
+-    if (msi_enabled(PCI_DEVICE(s))) {
+-        msi_notify(PCI_DEVICE(s), 0);
++    if (qatomic_read(&s->irqfd_ready)) {
++        event_notifier_set(&s->irq_notifier);   /* any thread */
++    } else if (msi_enabled(PCI_DEVICE(s))) {
++        msi_notify(PCI_DEVICE(s), 0);           /* BQL */
++    }
++}
++
++static void pvg_irqfd_teardown(PVGLinuxPCIState *s)
++{
++    if (s->irqfd_ready) {
++        qatomic_set(&s->irqfd_ready, false);
++        accel_irqchip_remove_irqfd_notifier_gsi(&s->irq_notifier, s->irq_virq);
++        accel_irqchip_release_virq(s->irq_virq);
++        event_notifier_cleanup(&s->irq_notifier);
++    }
++}
++
++/* main loop: the irqfd for completion interrupts follows the guest's MSI setup */
++static void pvg_irqfd_update(PVGLinuxPCIState *s)
++{
++    PCIDevice *d = PCI_DEVICE(s);
++    MSIMessage msg;
++
++    if (!s->irqfd || !accel_msi_via_irqfd_enabled() || !msi_enabled(d)) {
++        pvg_irqfd_teardown(s);
++        return;
++    }
++    msg = msi_get_message(d, 0);
++    if (!s->irqfd_ready) {
++        AccelRouteChange c = accel_irqchip_begin_route_changes();
++        int virq = accel_irqchip_add_msi_route(&c, 0, d);
++
++        if (virq < 0) {
++            s->irqfd = false;
++            return;
++        }
++        accel_irqchip_commit_route_changes(&c);
++        if (event_notifier_init(&s->irq_notifier, 0) < 0) {
++            accel_irqchip_release_virq(virq);
++            s->irqfd = false;
++            return;
++        }
++        if (accel_irqchip_add_irqfd_notifier_gsi(&s->irq_notifier, NULL, virq) < 0) {
++            event_notifier_cleanup(&s->irq_notifier);
++            accel_irqchip_release_virq(virq);
++            s->irqfd = false;
++            return;
++        }
++        s->irq_virq = virq;
++        s->irq_msg = msg;
++        qatomic_set(&s->irqfd_ready, true);
++    } else if (msg.address != s->irq_msg.address || msg.data != s->irq_msg.data) {
++        accel_irqchip_update_msi_route(s->irq_virq, msg, d);
++        accel_irqchip_commit_routes();
++        s->irq_msg = msg;
+     }
+ }
+ 
+@@ -1040,6 +1142,17 @@ static const GraphicHwOps pvg_display_ops = {
+     .gfx_update = pvg_display_gfx_update,
+ };
+ 
++static int pvg_display_get_flags(void *opaque)
++{
++    return GRAPHIC_FLAGS_GL | GRAPHIC_FLAGS_DMABUF;
++}
++
++/* with a GL display: presents as dmabufs (frames stay on the host GPU) */
++static const GraphicHwOps pvg_display_gl_ops = {
++    .gfx_update = pvg_display_gfx_update,
++    .get_flags = pvg_display_get_flags,
++};
++
+ static void pvg_display_cursor_changed(PVGLinuxPCIState *s)
+ {
+     if (s->con) {
+@@ -1174,10 +1287,12 @@ static void pvg_display_set_gamma(PVGLinuxPCIState *s, uint64_t va, uint64_t len
+ {
+     g_autofree float *t = NULL;
+     bool identity = true;
++    uint8_t lut[3][256];
+ 
+     if (entries < 2 || entries > 4096 || len < (uint64_t)entries * 12) {
+         return;
+     }
++
+     t = g_new(float, entries * 3);
+     if (!pvg_task_read(s, 0, va, t, entries * 12)) {
+         return;
+@@ -1187,12 +1302,20 @@ static void pvg_display_set_gamma(PVGLinuxPCIState *s, uint64_t va, uint64_t len
+             float f = t[c * entries + v * (entries - 1) / 255];
+             int o = (int)(f * 255.0f + 0.5f);
+ 
+-            s->gamma_lut[c][v] = o < 0 ? 0 : o > 255 ? 255 : o;
+-            identity &= s->gamma_lut[c][v] == v;
++            lut[c][v] = o < 0 ? 0 : o > 255 ? 255 : o;
++            identity &= lut[c][v] == v;
+         }
+     }
++    /* the bottom half applies it (from the worker with async presents) */
++    if (s->exec_thread_started) {
++        qemu_mutex_lock(&s->present_lock);
++    }
++    memcpy(s->gamma_lut, lut, sizeof(lut));
+     s->gamma_active = !identity;
+     s->present_full = true;
++    if (s->exec_thread_started) {
++        qemu_mutex_unlock(&s->present_lock);
++    }
+ }
+ 
+ /* Copy a presented BGRA backing (kernel task) into the console */
+@@ -1212,6 +1335,9 @@ static void pvg_display_scanout(PVGLinuxPCIState *s, uint32_t surface_id)
+         trace_pvg_linux_scanout_skip(surface_id, "not a backing");
+         return;
+     }
++    if (s->exec) {
++        pvg_exec_synchronize(s->exec, 0, surface_id);   /* the worker is drained */
++    }
+     fourcc = ldl_le_p(obj + 0x0c);
+     base = (uint64_t)ldl_le_p(obj + 0x08) << 12;
+     offset = ldl_le_p(obj + 0x14);
+@@ -1292,12 +1418,31 @@ static void pvg_present_run(PVGLinuxPCIState *s, uint32_t surface_id)
+         s->present_y1 = height;
+         qemu_mutex_unlock(&s->present_lock);
+     }
+-    for (uint32_t y = 0; y < height; y++) {
+-        uint32_t *row = s->present_tmp + (size_t)y * width;
+-
+-        if (!pvg_task_read(s, 0, base + offset + (uint64_t)y * row_bytes, row, width * 4)) {
+-            memset(row, 0, width * 4);
+-            missing++;
++    if (s->dmabuf_ok && !s->gamma_active && row_bytes >= width * 4) {
++        PVGScanout info;
++        int idx = pvg_exec_scanout(s->exec, 0, base + offset, width, height, row_bytes, &info);
++
++        if (idx >= 0) {
++            qemu_mutex_lock(&s->present_lock);
++            s->scan_info = info;
++            s->scan_next = idx;
++            s->scan_new = true;
++            qemu_mutex_unlock(&s->present_lock);
++            trace_pvg_linux_scanout(surface_id, width, height, base, 0, 0);
++            goto done;
++        }
++    }
++    /* a frame rendered on the GPU only: from the image (else written back, then read) */
++    if (row_bytes != width * 4 ||
++        !pvg_exec_read_surface(s->exec, 0, base + offset, width, height, s->present_tmp)) {
++        pvg_exec_synchronize(s->exec, 0, surface_id);   /* also waits for GPU writes */
++        for (uint32_t y = 0; y < height; y++) {
++            uint32_t *row = s->present_tmp + (size_t)y * width;
++
++            if (!pvg_task_read(s, 0, base + offset + (uint64_t)y * row_bytes, row, width * 4)) {
++                memset(row, 0, width * 4);
++                missing++;
++            }
+         }
+     }
+     qemu_mutex_lock(&s->present_lock);
+@@ -1321,6 +1466,58 @@ done:
+     qatomic_inc(&s->presents_done);
+ }
+ 
++static void pvg_scan_release(PVGLinuxPCIState *s)
++{
++    for (int i = 0; i < PVG_SCANOUT_BUFS; i++) {
++        if (s->scan_buf[i]) {
++            qemu_console_gl_release_dmabuf(s->con, s->scan_buf[i]);
++            qemu_dmabuf_close(s->scan_buf[i]);
++            g_clear_pointer(&s->scan_buf[i], qemu_dmabuf_free);
++        }
++    }
++}
++
++/* main loop: a frame the worker copied into a scanout image; false: none (CPU frame) */
++static bool pvg_present_show_dmabuf(PVGLinuxPCIState *s)
++{
++    PVGScanout info;
++    int idx;
++
++    qemu_mutex_lock(&s->present_lock);
++    if (!s->scan_new) {
++        qemu_mutex_unlock(&s->present_lock);
++        if (s->scan_shown) {
++            /* back to frames in the console surface (a gamma table, a failed copy) */
++            qemu_console_gl_scanout_disable(s->con);
++            s->scan_shown = false;
++            s->present_full = true;
++        }
++        return false;
++    }
++    s->scan_new = false;
++    info = s->scan_info;
++    idx = s->scan_next;
++    qemu_mutex_unlock(&s->present_lock);
++    if (info.generation != s->scan_gen || !s->scan_buf[idx]) {
++        pvg_scan_release(s);
++        for (int i = 0; i < PVG_SCANOUT_BUFS; i++) {
++            int32_t fd = dup(info.fd[i]);
++
++            s->scan_buf[i] = qemu_dmabuf_new(info.width, info.height, &info.offset,
++                                             &info.stride, 0, 0, info.width, info.height,
++                                             DRM_FORMAT_XRGB8888, info.modifier, &fd, 1,
++                                             false, false);
++        }
++        s->scan_gen = info.generation;
++        qemu_console_resize(s->con, info.width, info.height);
++    }
++    qemu_console_gl_scanout_dmabuf(s->con, s->scan_buf[idx]);
++    qemu_console_gl_update(s->con, 0, 0, info.width, info.height);
++    s->scan_shown = true;
++    s->scanout_valid = true;
++    return true;
++}
++
+ /* main loop: put the rows the worker found changed on the console and complete the present */
+ static void pvg_present_show(PVGLinuxPCIState *s)
+ {
+@@ -1332,6 +1529,12 @@ static void pvg_present_show(PVGLinuxPCIState *s)
+         return;
+     }
+     s->presents_shown = done;
++    if (pvg_present_show_dmabuf(s)) {
++        pvg_display_event(s, DS_EVENT_PRESENTED);
++        trace_pvg_linux_present_shown(0, s->scan_info.height,
++                                      g_get_monotonic_time() - s->present_queued_us);
++        return;
++    }
+     qemu_mutex_lock(&s->present_lock);
+     w = s->present_w;
+     h = s->present_h;
+@@ -1658,13 +1861,46 @@ typedef struct PVGExecJob {
+     int stamp_index;            /* FIFO stamp to publish when done, -1 none */
+     uint32_t stamp;
+     uint32_t present;           /* Transaction3 surface to scan out (bufs NULL), 0 none */
++    uint64_t gamma[3];          /* ... and its gamma table {va, len, entries}, va 0 none */
++    /*
++     * A FIFO command run on the worker in order with the command buffers (async_cmds):
++     * those reading or changing task state (mappings, objects), ExecIndirect2 included
++     */
++    PVGCmdHeader cmd_hdr;
++    GBytes *cmd;
++    int64_t queued_us;
++    GBytes *res;                /* the ExecIndirect2 resource list (24 B entries) */
+ } PVGExecJob;
+ 
++static void pvg_exec_job_run(PVGLinuxPCIState *s, PVGExecJob *job);
++
++typedef struct PVGDoneJob {
++    int stamp_index;
++    uint32_t stamp;
++    uint64_t seq;               /* executor timeline value to reach first, 0 none */
++} PVGDoneJob;
++
++/* exec_lock held: a job's stamp may be published (by the next BH / irqfd publish) */
++static void pvg_exec_job_done(PVGLinuxPCIState *s, int index, uint32_t stamp)
++{
++    if (index >= 0) {
++        s->exec_pending[index]--;
++        s->exec_done[index] = stamp;
++        s->exec_done_new[index] = true;
++    }
++}
++
+ static void pvg_exec_job_free(PVGExecJob *job)
+ {
+     if (job->bufs) {
+         g_ptr_array_unref(job->bufs);
+     }
++    if (job->res) {
++        g_bytes_unref(job->res);
++    }
++    if (job->cmd) {
++        g_bytes_unref(job->cmd);
++    }
+     g_free(job);
+ }
+ 
+@@ -1687,13 +1923,26 @@ static void pvg_exec_run_buf(PVGLinuxPCIState *s, uint32_t task, const uint8_t *
+                                   s->exec_max_us, s->exec_read_us / 1000,
+                                   s->exec_read_bytes >> 20, s->exec_write_us / 1000,
+                                   s->exec_write_bytes >> 20, st->gpu_wait_us / 1000);
+-        trace_pvg_linux_exec_private(st->priv_skipped >> 20, st->priv_flushes, st->gpu_mipmaps);
++        trace_pvg_linux_exec_private(st->priv_skipped >> 20, st->priv_flushes, st->gpu_mipmaps,
++                                     st->surface_reads);
++        trace_pvg_linux_exec_latency(s->n_doorbell, s->lat_doorbell / MAX(s->n_doorbell, 1),
++                                     s->n_drain, s->lat_drain / 1000, s->lat_cbread / 1000,
++                                     s->lat_queue / MAX(s->n_queue, 1),
++                                     s->lat_bh / MAX(s->n_bh, 1),
++                                     s->lat_guest / MAX(s->n_guest, 1), s->lat_guest / 1000);
++        trace_pvg_linux_exec_waits(st->wait_full_us / 1000, st->wait_gather_us / 1000,
++                                   st->wait_prev_us / 1000);
++        s->lat_doorbell = s->lat_queue = s->lat_bh = s->lat_guest = 0;
++        s->lat_drain = s->lat_cbread = 0;
++        s->n_doorbell = s->n_queue = s->n_bh = s->n_guest = s->n_drain = 0;
+         trace_pvg_linux_exec_zc(st->zc_gathered >> 20, st->zc_scattered >> 20, st->zc_fallbacks,
+                                 st->bar_written >> 20);
+-        trace_pvg_linux_exec_alloc(st->image_creates, st->pool_hits, st->queue_waits,
+-                                   st->early_completions, st->early_gathers);
++        trace_pvg_linux_exec_alloc(st->image_creates, st->pool_hits, st->backing_shares,
++                                   st->queue_waits, st->early_completions, st->early_gathers);
+         trace_pvg_linux_exec_cache(st->cache_hits, st->cache_saved >> 20, st->cache_invalidated,
+-                                   st->cache_sync_us / 1000, s->dirty_sync_us / 1000);
++                                   st->cache_aliased, s->dirty_sync_us / 1000,
++                                   st->res_entries, st->res_modified, st->res_written,
++                                   st->res_unknown);
+         s->dirty_sync_us = 0;
+         trace_pvg_linux_exec_pipelines(st->pipeline_us / 1000, st->spv_cache_hits,
+                                        st->spv_disk_hits, st->damage_saved >> 20);
+@@ -1708,9 +1957,43 @@ static void pvg_exec_run_buf(PVGLinuxPCIState *s, uint32_t task, const uint8_t *
+     }
+ }
+ 
++static void pvg_dispatch_now(PVGLinuxPCIState *s, const PVGCmdHeader *h,
++                             const uint8_t *payload, uint32_t len, bool worker);
++
++static void pvg_exec_job_run(PVGLinuxPCIState *s, PVGExecJob *job)
++{
++    if (job->cmd) {
++        gsize n;
++        const uint8_t *p = g_bytes_get_data(job->cmd, &n);
++
++        pvg_dispatch_now(s, &job->cmd_hdr, p, n, true);
++    }
++    if (job->gamma[0]) {
++        pvg_display_set_gamma(s, job->gamma[0], job->gamma[1], (uint32_t)job->gamma[2]);
++    }
++    if (job->present) {
++        pvg_present_run(s, job->present);
++    }
++    if (job->res) {
++        gsize n;
++        const uint8_t *r = g_bytes_get_data(job->res, &n);
++
++        pvg_exec_resources(s->exec, job->task, r, n / 24);
++    }
++    for (guint i = 0; job->bufs && i < job->bufs->len; i++) {
++        gsize n;
++        const uint8_t *b = g_bytes_get_data(g_ptr_array_index(job->bufs, i), &n);
++
++        pvg_exec_run_buf(s, job->task, b, n);
++    }
++}
++
++static void pvg_exec_publish(PVGLinuxPCIState *s);
++
+ static void *pvg_exec_thread(void *opaque)
+ {
+     PVGLinuxPCIState *s = opaque;
++    uint64_t seq;
+ 
+     rcu_register_thread();
+     qemu_mutex_lock(&s->exec_lock);
+@@ -1725,27 +2008,37 @@ static void *pvg_exec_thread(void *opaque)
+         }
+         job = g_queue_pop_head(&s->exec_jobs);
+         s->exec_busy = true;
++        s->lat_queue += g_get_monotonic_time() - job->queued_us;
++        s->n_queue++;
+         qemu_mutex_unlock(&s->exec_lock);
+-        if (job->present) {
+-            pvg_present_run(s, job->present);
+-        }
+-        for (guint i = 0; job->bufs && i < job->bufs->len; i++) {
+-            gsize n;
+-            const uint8_t *b = g_bytes_get_data(g_ptr_array_index(job->bufs, i), &n);
+-
+-            pvg_exec_run_buf(s, job->task, b, n);
+-        }
++        pvg_exec_job_run(s, job);
++        seq = s->done_thread_started ? pvg_exec_take_visible(s->exec) : 0;
+         qemu_mutex_lock(&s->exec_lock);
+-        if (job->stamp_index >= 0) {
+-            s->exec_pending[job->stamp_index]--;
+-            s->exec_done[job->stamp_index] = job->stamp;
+-            s->exec_done_new[job->stamp_index] = true;
++        if (job->stamp_index >= 0 && (seq || !g_queue_is_empty(&s->done_jobs))) {
++            /* its writes are still on the GPU (or an earlier job's are): after them */
++            PVGDoneJob *d = g_new(PVGDoneJob, 1);
++
++            d->stamp_index = job->stamp_index;
++            d->stamp = job->stamp;
++            d->seq = seq;
++            g_queue_push_tail(&s->done_jobs, d);
++            qemu_cond_signal(&s->done_cond);
++        } else {
++            pvg_exec_job_done(s, job->stamp_index, job->stamp);
+         }
++        s->done_us = g_get_monotonic_time();
+         s->exec_busy = false;
+         qemu_cond_broadcast(&s->exec_cond);
+         qemu_mutex_unlock(&s->exec_lock);
++        if (qatomic_read(&s->irqfd_ready)) {
++            pvg_exec_publish(s);            /* interrupt through the irqfd */
++            if (job->present) {
++                qemu_bh_schedule(s->exec_bh);
++            }
++        } else {
++            qemu_bh_schedule(s->exec_bh);   /* stamps and interrupts from the main loop */
++        }
+         pvg_exec_job_free(job);
+-        qemu_bh_schedule(s->exec_bh);       /* stamps and interrupts from the main loop */
+         qemu_mutex_lock(&s->exec_lock);
+     }
+     qemu_mutex_unlock(&s->exec_lock);
+@@ -1754,11 +2047,8 @@ static void *pvg_exec_thread(void *opaque)
+ }
+ 
+ /* main loop: publish the stamps of finished jobs (or the FIFO stamp they held back) */
+-static void pvg_exec_bh(void *opaque)
++static void pvg_exec_publish(PVGLinuxPCIState *s)
+ {
+-    PVGLinuxPCIState *s = opaque;
+-
+-    pvg_present_show(s);
+     for (int i = 0; i < PVG_MAX_STAMPS; i++) {
+         uint32_t value;
+         bool fire = false;
+@@ -1775,26 +2065,88 @@ static void pvg_exec_bh(void *opaque)
+         }
+         qemu_mutex_unlock(&s->exec_lock);
+         if (fire) {
++            int64_t now = g_get_monotonic_time();
++
+             pvg_signal_stamp(s, i, value);
++            s->lat_bh += now - qatomic_read(&s->done_us);
++            s->n_bh++;
++            s->publish_us = now;
++        }
++    }
++}
++
++/* completion thread: stamps of jobs whose GPU writes finished, in order */
++static void *pvg_done_thread(void *opaque)
++{
++    PVGLinuxPCIState *s = opaque;
++
++    rcu_register_thread();
++    qemu_mutex_lock(&s->exec_lock);
++    for (;;) {
++        PVGDoneJob *d;
++        uint64_t seq;
++        bool any = false;
++
++        while (!s->exec_stop && g_queue_is_empty(&s->done_jobs)) {
++            qemu_cond_wait(&s->done_cond, &s->exec_lock);
++        }
++        if (s->exec_stop) {
++            break;
++        }
++        seq = ((PVGDoneJob *)g_queue_peek_head(&s->done_jobs))->seq;
++        qemu_mutex_unlock(&s->exec_lock);
++        if (seq) {
++            pvg_exec_wait_seq(s->exec, seq);
++        }
++        qemu_mutex_lock(&s->exec_lock);
++        while ((d = g_queue_peek_head(&s->done_jobs)) && d->seq <= seq) {
++            g_queue_pop_head(&s->done_jobs);
++            pvg_exec_job_done(s, d->stamp_index, d->stamp);
++            g_free(d);
++            any = true;
++        }
++        s->done_us = g_get_monotonic_time();
++        qemu_cond_broadcast(&s->exec_cond);
++        qemu_mutex_unlock(&s->exec_lock);
++        if (any) {
++            if (qatomic_read(&s->irqfd_ready)) {
++                pvg_exec_publish(s);
++            } else {
++                qemu_bh_schedule(s->exec_bh);
++            }
+         }
++        qemu_mutex_lock(&s->exec_lock);
+     }
++    qemu_mutex_unlock(&s->exec_lock);
++    rcu_unregister_thread();
++    return NULL;
++}
++
++static void pvg_exec_bh(void *opaque)
++{
++    PVGLinuxPCIState *s = opaque;
++
++    pvg_irqfd_update(s);
++    pvg_present_show(s);
++    pvg_exec_publish(s);
+ }
+ 
+ static void pvg_exec_submit(PVGLinuxPCIState *s, PVGExecJob *job)
+ {
++    if (s->exec_thread_started && qemu_thread_is_self(&s->exec_thread)) {
++        pvg_exec_job_run(s, job);       /* from a command the worker runs: in its place */
++        pvg_exec_job_free(job);
++        return;
++    }
+     job->stamp_index = s->cur_stamp_index;
+     job->stamp = s->cur_stamp_value;
+     if (!s->async_exec || !s->exec_thread_started) {
+-        for (guint i = 0; job->bufs && i < job->bufs->len; i++) {
+-            gsize n;
+-            const uint8_t *b = g_bytes_get_data(g_ptr_array_index(job->bufs, i), &n);
+-
+-            pvg_exec_run_buf(s, job->task, b, n);
+-        }
++        pvg_exec_job_run(s, job);
+         pvg_exec_job_free(job);
+         return;
+     }
+     qemu_mutex_lock(&s->exec_lock);
++    job->queued_us = g_get_monotonic_time();
+     if (job->stamp_index >= 0) {
+         s->exec_pending[job->stamp_index]++;
+     }
+@@ -1806,14 +2158,18 @@ static void pvg_exec_submit(PVGLinuxPCIState *s, PVGExecJob *job)
+ /* wait until the worker has executed everything queued */
+ static void pvg_exec_drain(PVGLinuxPCIState *s)
+ {
++    int64_t t0 = g_get_monotonic_time();
++
+     if (!s->exec_thread_started) {
+         return;
+     }
+     qemu_mutex_lock(&s->exec_lock);
+-    while (!g_queue_is_empty(&s->exec_jobs) || s->exec_busy) {
++    while (!g_queue_is_empty(&s->exec_jobs) || s->exec_busy || !g_queue_is_empty(&s->done_jobs)) {
+         qemu_cond_wait(&s->exec_cond, &s->exec_lock);
+     }
+     qemu_mutex_unlock(&s->exec_lock);
++    s->lat_drain += g_get_monotonic_time() - t0;
++    s->n_drain++;
+ }
+ 
+ /* publish a FIFO's stamp now, or when the jobs it queued are done */
+@@ -1864,9 +2220,15 @@ static void pvg_cmd_exec_indirect2(PVGLinuxPCIState *s, const uint8_t *p,
+             continue;
+         }
+         buf = g_malloc(cblen);
+-        if (!pvg_task_read(s, task, va, buf, cblen)) {
+-            trace_pvg_linux_task_fault(task, va);
+-            continue;
++        {
++            int64_t t0 = g_get_monotonic_time();
++            bool ok = pvg_task_read(s, task, va, buf, cblen);
++
++            s->lat_cbread += g_get_monotonic_time() - t0;
++            if (!ok) {
++                trace_pvg_linux_task_fault(task, va);
++                continue;
++            }
+         }
+         trace_pvg_linux_cmdbuf(task, nres, va, cblen);
+         if (s->dump_dir && s->dumped < s->dump_max) {
+@@ -1881,6 +2243,9 @@ static void pvg_cmd_exec_indirect2(PVGLinuxPCIState *s, const uint8_t *p,
+                 job = g_new0(PVGExecJob, 1);
+                 job->task = task;
+                 job->bufs = g_ptr_array_new_with_free_func((GDestroyNotify)g_bytes_unref);
++                if (nres) {
++                    job->res = g_bytes_new(p + 12, 24 * nres);
++                }
+             }
+             g_ptr_array_add(job->bufs, g_bytes_new_take(g_steal_pointer(&buf), cblen));
+         }
+@@ -1909,10 +2274,47 @@ static void pvg_cmd_define_child_fifo(PVGLinuxPCIState *s, const uint8_t *p,
+     trace_pvg_linux_define_child(index, node);
+ }
+ 
++/* commands that read or change task state (mappings, object lists, executor caches) */
++static bool pvg_cmd_uses_tasks(uint32_t op)
++{
++    switch (op) {
++    case PVG_CMD_UNMAP_MEMORY: case PVG_CMD_MAP_MEMORY2:
++    case PVG_CMD_DELETE_TASK: case PVG_CMD_DELETE_RESOURCE: case PVG_CMD_DELETE_OBJECT:
++    case PVG_CMD_DEFINE_TASK2: case PVG_CMD_SET_OBJECT_LIST: case 0x3c: /* ReplacePhysical */
++    case 0x34:          /* InvalidateResources: the executor's caches change */
++    case 0x35:          /* SynchronizeResources: the executor writes resources back */
++    case PVG_CMD_EXEC_INDIRECT2:
++        return true;
++    }
++    return false;
++}
++
++/*
++ * With the worker, task commands run there in FIFO order (no drain on the vCPU, which held the
++ * BQL while the worker finished everything queued). Their stamps wait for them as for command
++ * buffers. The few other readers of task memory on the vCPU drain first.
++ */
+ static void pvg_dispatch(PVGLinuxPCIState *s, const PVGCmdHeader *h,
+                          const uint8_t *payload, uint32_t len)
+ {
+-    switch (h->opcode) {
++    if (s->exec && s->exec_thread_started && s->async_cmds && pvg_cmd_uses_tasks(h->opcode)) {
++        PVGExecJob *job = g_new0(PVGExecJob, 1);
++
++        job->cmd_hdr = *h;
++        job->cmd = g_bytes_new(payload, len);
++        if (h->opcode == PVG_CMD_EXEC_INDIRECT2 && len >= 4) {
++            job->task = ldl_le_p(payload);
++        }
++        pvg_exec_submit(s, job);
++        return;
++    }
++    pvg_dispatch_now(s, h, payload, len, false);
++}
++
++static void pvg_dispatch_now(PVGLinuxPCIState *s, const PVGCmdHeader *h,
++                             const uint8_t *payload, uint32_t len, bool worker)
++{
++    switch (worker ? 0 : h->opcode) {
+     case PVG_CMD_DISPLAY_TRANSACTION3:
+         if (s->exec_thread_started) {
+             break;              /* queued behind the command buffers it shows */
+@@ -1921,7 +2323,10 @@ static void pvg_dispatch(PVGLinuxPCIState *s, const PVGCmdHeader *h,
+     case PVG_CMD_UNMAP_MEMORY: case PVG_CMD_MAP_MEMORY2:
+     case PVG_CMD_DELETE_TASK: case PVG_CMD_DELETE_RESOURCE: case PVG_CMD_DELETE_OBJECT:
+     case PVG_CMD_DEFINE_TASK2: case PVG_CMD_SET_OBJECT_LIST: case 0x3c: /* ReplacePhysical */
++    case 0x34:          /* InvalidateResources: the executor's caches change */
+     case 0x35:          /* SynchronizeResources: the executor writes resources back */
++    case PVG_CMD_DISPLAY_CURSOR_GLYPH:  /* task memory: after queued mapping changes */
++    case PVG_CMD_GET_DEVICE_INFO: case PVG_CMD_GET_COMPUTE_INFO:
+         pvg_exec_drain(s);
+         break;
+     }
+@@ -1955,18 +2360,22 @@ static void pvg_dispatch(PVGLinuxPCIState *s, const PVGCmdHeader *h,
+                     s->fps_start = now;
+                 }
+             }
+-            if (ldq_le_p(payload + 12)) {
+-                pvg_display_set_gamma(s, ldq_le_p(payload + 12), ldq_le_p(payload + 20),
+-                                      ldl_le_p(payload + 28));
+-            }
+             if (s->exec_thread_started) {
+                 PVGExecJob *job = g_new0(PVGExecJob, 1);
+ 
++                /* the gamma table is task memory: read on the worker, in order */
++                job->gamma[0] = ldq_le_p(payload + 12);
++                job->gamma[1] = ldq_le_p(payload + 20);
++                job->gamma[2] = ldl_le_p(payload + 28);
+                 job->present = ldl_le_p(payload + 8);
+                 s->present_queued_us = g_get_monotonic_time();
+                 pvg_exec_submit(s, job);
+                 break;
+             }
++            if (ldq_le_p(payload + 12)) {
++                pvg_display_set_gamma(s, ldq_le_p(payload + 12), ldq_le_p(payload + 20),
++                                      ldl_le_p(payload + 28));
++            }
+             pvg_display_scanout(s, ldl_le_p(payload + 8));
+             /* the host's presentFrame completion: the guest waits for it before the next frame */
+             pvg_display_event(s, DS_EVENT_PRESENTED);
+@@ -2011,6 +2420,21 @@ static void pvg_dispatch(PVGLinuxPCIState *s, const PVGCmdHeader *h,
+             s->tasks[id].root = 0;
+         }
+         break;
++    case 0x34:
++        /*
++         * InvalidateResources {u32 task, u32 count, {u32 id, u8 host_invalid, host_valid,
++         * guest_invalid, guest_valid}[count]}: host_invalid = the guest's CPU wrote it
++         */
++        if (s->exec && len >= 8 && ldl_le_p(payload) < PVG_MAX_TASKS) {
++            uint32_t n = MIN(ldl_le_p(payload + 4), (len - 8) / 8);
++
++            for (uint32_t i = 0; i < n; i++) {
++                if (payload[8 + 8 * i + 4]) {
++                    pvg_exec_modified(s->exec, ldl_le_p(payload), ldl_le_p(payload + 8 + 8 * i));
++                }
++            }
++        }
++        break;
+     case 0x35:          /* SynchronizeResources {u32 task, u32 count, u32 ids[count]} */
+         if (s->exec && len >= 8) {
+             uint32_t n = MIN(ldl_le_p(payload + 4), (len - 8) / 4);
+@@ -2172,8 +2596,7 @@ static uint64_t pvg_linux_mmio_read(void *opaque, hwaddr addr, unsigned size)
+         val = s->irq_status;
+         s->irq_status = 0;
+     } else if (size == 4 && addr == PVG_REG_STAMP_STATUS) {
+-        val = s->stamp_status;
+-        s->stamp_status = 0;
++        val = qatomic_xchg(&s->stamp_status, 0);
+     } else if (size == 4 && addr == PVG_REG_DISPLAY_PORTS) {
+         val = s->display_ports;
+     } else if (size == 4 && addr == PVG_REG_EFI_MODE_COUNT) {
+@@ -2205,12 +2628,24 @@ static void pvg_linux_mmio_write(void *opaque, hwaddr addr, uint64_t val,
+     }
+     switch (addr) {
+     case PVG_REG_FIFO_WRITTEN:
+-        pvg_root_fifo_process(s, val);
+-        break;
+     case PVG_REG_WAKE_FIFO:
+-    case PVG_REG_RESUME_CHILD:
+-        pvg_child_fifo_process(s, val);
++    case PVG_REG_RESUME_CHILD: {
++        int64_t t0 = g_get_monotonic_time();
++
++        if (s->publish_us > s->doorbell_us) {
++            s->lat_guest += t0 - s->publish_us;   /* the guest's time since the last stamp */
++            s->n_guest++;
++        }
++        s->doorbell_us = t0;
++        if (addr == PVG_REG_FIFO_WRITTEN) {
++            pvg_root_fifo_process(s, val);
++        } else {
++            pvg_child_fifo_process(s, val);
++        }
++        s->lat_doorbell += g_get_monotonic_time() - t0;
++        s->n_doorbell++;
+         break;
++    }
+     case PVG_REG_DISPLAY_DOORBELL:
+         pvg_display_doorbell(s, val);
+         break;
+@@ -2343,12 +2778,15 @@ static void pvg_linux_realize(PCIDevice *dev, Error **errp)
+         return;
+     }
+     s->cur_stamp_index = -1;
++    qemu_mutex_init(&s->stamp_lock);
+     if (s->guest_fixups_enable) {
+         s->guest_fixups = pvg_guest_fixups_start(pvg_exec_log, s);
+     }
+     if (s->display_ports) {
+-        s->con = qemu_graphic_console_create(DEVICE(dev), 0, &pvg_display_ops,
+-                                             s);
++        s->con = qemu_graphic_console_create(DEVICE(dev), 0,
++                                             s->dmabuf && display_opengl &&
++                                             s->gpu_enable ? &pvg_display_gl_ops :
++                                             &pvg_display_ops, s);
+         s->efi_timer = timer_new_ms(QEMU_CLOCK_REALTIME, pvg_efi_scanout, s);
+     }
+     if (s->gpu_enable) {
+@@ -2387,6 +2825,9 @@ static void pvg_linux_realize(PCIDevice *dev, Error **errp)
+                     }
+                     /* executor calls from the FIFO (flush, synchronize) drain the worker */
+                     pvg_exec_set_private_resident(s->exec, s->private_resident);
++                    pvg_exec_set_flag_cache(s->exec, s->resource_flags);
++                    pvg_exec_set_share_surfaces(s->exec, s->share_surfaces);
++                    pvg_exec_set_defer_writeback(s->exec, s->defer_writeback);
+                     /*
+                      * Upload cache: KVM dirty logging on guest RAM tells which texture pages
+                      * the guest wrote. Not with the async worker (syncing needs the BQL).
+@@ -2406,9 +2847,19 @@ static void pvg_linux_realize(PCIDevice *dev, Error **errp)
+                     qemu_cond_init(&s->exec_cond);
+                     g_queue_init(&s->exec_jobs);
+                     s->exec_bh = qemu_bh_new(pvg_exec_bh, s);
++                    qemu_cond_init(&s->done_cond);
++                    g_queue_init(&s->done_jobs);
++                    if (s->async_visible) {
++                        pvg_exec_set_async_visible(s->exec, true);
++                        qemu_thread_create(&s->done_thread, "pvg-done", pvg_done_thread, s,
++                                           QEMU_THREAD_JOINABLE);
++                        s->done_thread_started = true;
++                    }
+                     qemu_thread_create(&s->exec_thread, "pvg-exec", pvg_exec_thread, s,
+                                        QEMU_THREAD_JOINABLE);
+                     s->exec_thread_started = true;
++                    /* presents as dmabufs: a GL display and exportable Vulkan memory */
++                    s->dmabuf_ok = s->dmabuf && display_opengl && s->gpu.dmabuf && s->con;
+                 }
+             }
+         }
+@@ -2419,14 +2870,22 @@ static void pvg_linux_exit(PCIDevice *dev)
+ {
+     PVGLinuxPCIState *s = PVG_LINUX_PCI(dev);
+ 
++    if (s->exec_thread_started) {
++        pvg_exec_drain(s);
++    }
++    pvg_irqfd_teardown(s);
+     msi_uninit(dev);
+     if (s->exec_thread_started) {
+         pvg_exec_drain(s);
+         qemu_mutex_lock(&s->exec_lock);
+         s->exec_stop = true;
+         qemu_cond_broadcast(&s->exec_cond);
++        qemu_cond_broadcast(&s->done_cond);
+         qemu_mutex_unlock(&s->exec_lock);
+         qemu_thread_join(&s->exec_thread);
++        if (s->done_thread_started) {
++            qemu_thread_join(&s->done_thread);
++        }
+         qemu_bh_delete(s->exec_bh);
+         s->exec_thread_started = false;
+     }
+@@ -2461,6 +2920,7 @@ static void pvg_linux_reset(DeviceState *dev)
+ 
+     pvg_guest_fixups_reset(s->guest_fixups);
+     pvg_exec_drain(s);
++    pvg_irqfd_teardown(s);
+     if (s->exec_thread_started) {
+         qemu_mutex_lock(&s->exec_lock);
+         memset(s->exec_pending, 0, sizeof(s->exec_pending));
+@@ -2485,6 +2945,10 @@ static void pvg_linux_reset(DeviceState *dev)
+     s->ds_gpa = 0;
+     s->scanout_valid = false;
+     s->present_full = true;
++    if (s->scan_shown) {
++        qemu_console_gl_scanout_disable(s->con);
++        s->scan_shown = false;
++    }
+     s->cursor_show = false;
+ }
+ 
+@@ -2500,6 +2964,13 @@ static const Property pvg_linux_properties[] = {
+     DEFINE_PROP_BOOL("damage-limit", PVGLinuxPCIState, damage_limit, true),
+     DEFINE_PROP_BOOL("msaa", PVGLinuxPCIState, msaa, true),
+     DEFINE_PROP_BOOL("upload-cache", PVGLinuxPCIState, upload_cache, false),
++    DEFINE_PROP_BOOL("resource-flags", PVGLinuxPCIState, resource_flags, true),
++    DEFINE_PROP_BOOL("async-cmds", PVGLinuxPCIState, async_cmds, true),
++    DEFINE_PROP_BOOL("dmabuf", PVGLinuxPCIState, dmabuf, true),
++    DEFINE_PROP_BOOL("irqfd", PVGLinuxPCIState, irqfd, true),
++    DEFINE_PROP_BOOL("async-visible", PVGLinuxPCIState, async_visible, true),
++    DEFINE_PROP_BOOL("share-surfaces", PVGLinuxPCIState, share_surfaces, true),
++    DEFINE_PROP_BOOL("defer-writeback", PVGLinuxPCIState, defer_writeback, false),
+     DEFINE_PROP_BOOL("zero-copy", PVGLinuxPCIState, zero_copy, true),
+     DEFINE_PROP_BOOL("rebar", PVGLinuxPCIState, rebar, true),
+     DEFINE_PROP_BOOL("early-complete", PVGLinuxPCIState, early_complete, true),
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index 217edc3..2325969 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -16,6 +16,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <unistd.h>
+ 
+ #include "air2spv.h"
+ #include "pvg-exec.h"
+@@ -92,6 +93,8 @@ typedef struct GuestImage {
+     uint32_t samples;           /* host image sample count (set only for MSAA render targets) */
+     uint32_t desc_samples;      /* MTLTextureDescriptor sampleCount */
+     uint32_t storage;           /* MTLStorageMode: 0 shared, 1 managed, 2 private, 3 memoryless */
++    bool over_buffer;           /* a buffer's memory: CPU writes to it are not reported */
++    uint32_t backing, plane;    /* IOSurface textures: backing object (kernel task) and plane */
+     uint64_t span;              /* bytes from va that belong to the object (0 = unknown) */
+     uint64_t mip_off[MAX_MIPS], mip_slice[MAX_MIPS];   /* relative to va; bytes per image */
+     uint32_t mip_row[MAX_MIPS];
+@@ -122,12 +125,21 @@ typedef struct HostImage {
+      */
+     bool priv, resident, guest_stale;
+     GuestImage pgi;
++    GArray *stale_pages;        /* guest RAM pages (uint32 page numbers) it owns while stale */
+     VkImageView level_view[MAX_MIPS];   /* render-target views of single levels (mip chains) */
+     VkComponentMapping swizzle;         /* of view (recycled images must match) */
+     uint64_t bytes;                     /* memory size */
+     uint32_t c_task, nruns;
+     uint64_t c_va, c_len;
+     uint64_t (*runs)[2];
++    /*
++     * IOSurface planes: one image per backing, plane and view shape, shared by the texture
++     * objects of every task that use it (refs: table entries pointing here; bkey: its key in
++     * e->backing_imgs, 0 if not shared)
++     */
++    uint32_t refs;
++    gint64 bkey;
++    uint32_t fill_seq;          /* e->write_seq when it last equalled the guest's copy */
+ } HostImage;
+ 
+ typedef struct DSAttachmentSave {
+@@ -164,11 +176,16 @@ typedef struct Binding {
+  * guest-visible writes), the next command buffer is recorded into the other. The current
+  * frame is never in flight.
+  */
++#define MAX_FRAMES 4
++
+ typedef struct ExecFrame {
+     VkCommandBuffer cmd, pre, post;
+     VkFence fence, gfence;      /* the whole submission / its guest-RAM gathers only */
+     bool in_flight;
+     GPtrArray *retired;         /* images retired while this frame was recorded */
++    /* pipelines and samplers of deleted objects: destroyed once this frame completed */
++    GPtrArray *dead_pipes;
++    GArray *dead_samplers;
+ } ExecFrame;
+ 
+ struct PVGExec {
+@@ -211,7 +228,19 @@ struct PVGExec {
+      * reused for the same shape (no vkCreateImage / vkAllocateMemory churn)
+      */
+     GPtrArray *retired, *pool;  /* retired: the current frame's list */
+-    ExecFrame fr[2];
++    ExecFrame fr[MAX_FRAMES];
++    /*
++     * Every submission signals the timeline with ++submit_seq. Submissions whose guest-visible
++     * writes are GPU scatters (no CPU work after them) may complete asynchronously
++     * (async_visible): the caller learns their value (pvg_exec_take_visible) and publishes the
++     * guest's stamp once it is reached. page_sub: per guest RAM page, the value after which
++     * its pending GPU writes are done (CPU readers wait for it).
++     */
++    VkSemaphore timeline;
++    uint64_t submit_seq, visible_seq, completed_seq;
++    bool async_visible;
++    uint64_t *page_sub, *block_sub;
++    uint32_t nframes;           /* recording frames in use (2: one in flight while recording) */
+     uint32_t cur;
+     bool early;                 /* complete command buffers without guest-visible writes early */
+     uint64_t arena_lo, arena_hi;    /* the current frame's part of the arena */
+@@ -230,12 +259,22 @@ struct PVGExec {
+     char *dump_dir;
+     bool dry_run;
+     PFN_vkCmdPushDescriptorSetKHR push_descriptor;
++    /* dmabuf scanout: exportable copies of presented frames for GL displays */
++    struct {
++        VkImage image;
++        VkDeviceMemory mem;
++        int fd;
++    } scan[PVG_SCANOUT_BUFS];
++    PVGScanout scan_info;       /* of the current set (generation changes with the size) */
++    uint32_t scan_next;
+ 
+     GHashTable *images;         /* key: task << 32 | id → HostImage* */
+     GHashTable *pipelines;      /* key: task << 32 | id → Pipeline* */
+     GHashTable *uploaded;       /* per command buffer: task << 32 | id → arena offset + 1 */
+     GHashTable *samplers;       /* task << 32 | id → VkSampler (as pointer) */
+     uint32_t upload_failures, ds_kind_logged, ds_states_logged, ds_dumps, blends_logged;
++    GHashTable *backing_imgs;   /* shared IOSurface images: HostImage.bkey -> HostImage */
++    bool share_backings;
+     GHashTable *spv_cache;      /* SHA-256 of translator inputs -> A2SResult */
+     VkPipelineCache vk_cache;
+     char *cache_dir;            /* on-disk caches ($XDG_CACHE_HOME/pvg); NULL: memory only */
+@@ -243,12 +282,43 @@ struct PVGExec {
+     bool damage_limit;          /* upload / write back only what a pass draws */
+     bool msaa;                  /* render multisample passes multisampled (else into the resolve texture) */
+     bool upload_cache;
++    /*
++     * Upload cache driven by the guest's own reports instead of dirty logging: the guest flags
++     * resources its CPU modified (ExecIndirect2 resource flag bit 0, InvalidateResources), as
++     * Apple's host relies on (it keeps every resource on the GPU and re-uploads only then)
++     */
++    bool flag_cache;
+     GPtrArray *cached;          /* HostImages with cached == true */
+     GArray *pending;            /* RAM runs found dirty while filling, for the next sync */
+     uint64_t cache_syncs;
+     bool cache_stale;          /* guest may have written memory since the last sync */
+     uint64_t wb_storage[4];     /* diagnostics: bytes written back per MTLStorageMode */
+     bool private_resident;      /* keep MTLStorageModePrivate textures on the GPU */
++    /*
++     * Render targets of every storage mode stay on the GPU like private ones: written back
++     * when the guest asks (SynchronizeResources), before a present or before something reads
++     * their memory from the guest side. Apple's host does the same (guestValid).
++     */
++    bool defer_wb;
++    /*
++     * Guest RAM pages whose newest contents are only in a GPU image (guest_stale): one bit per
++     * page of RAM (offsets as in the zero-copy import) and the image owning each. The same
++     * memory is also reached through other mappings (another backing, another task's view),
++     * which task/VA overlap checks miss.
++     */
++    uint64_t *stale_bits;
++    uint64_t stale_npages;
++    /* per guest RAM page: write_seq of the executor's last write to it (any mapping) */
++    uint32_t *page_seq;
++    uint32_t write_seq;
++    /* per 2 MiB of RAM: the newest page_seq and the count of GPU-only pages (quick checks) */
++    uint32_t *block_seq, *block_stale;
++    GHashTable *stale_owner;    /* page -> HostImage */
++    uint32_t stale_images;
++    GHashTable *gpu_written;    /* ids flagged GPU-written in the current resource list */
++    uint32_t gpu_written_task;
++    uint32_t stale_reads;       /* diagnostics: reads that missed a flush */
++    const char *read_why;
+     GPtrArray *priv_imgs;       /* HostImages with priv set */
+     uint64_t cache_epoch;      /* bumped at every dirty-log sync */
+     uint64_t dirty_floor;      /* entries checked before this epoch may have missed writes */
+@@ -284,6 +354,9 @@ static void elog(PVGExec *e, const char *fmt, ...)
+     }
+ }
+ 
++/* the executor whose objects the hash-table free functions release */
++static PVGExec *free_ctx;
++
+ static gint64 *key_new(uint32_t task, uint32_t id)
+ {
+     gint64 *k = g_new(gint64, 1);
+@@ -535,6 +608,8 @@ static uint64_t arena_alloc(PVGExec *e, uint64_t len)
+ static void priv_invalidate_range(PVGExec *e, uint32_t task, uint64_t va, uint64_t len,
+                                   const HostImage *writer);
+ 
++static void pages_written(PVGExec *e, uint32_t task, uint64_t va, uint64_t len);
++
+ static void note_write(PVGExec *e, uint32_t task, uint64_t va, uint64_t len, char kind)
+ {
+     uint64_t gpa;
+@@ -542,6 +617,7 @@ static void note_write(PVGExec *e, uint32_t task, uint64_t va, uint64_t len, cha
+     /* the executor changed guest memory: cached GPU copies of it are stale */
+     pvg_exec_cache_invalidate(e, task, va, len);
+     priv_invalidate_range(e, task, va, len, e->cache_writer);
++    pages_written(e, task, va, len);
+     if (!e->dump_dir || !e->host.translate) {
+         return;
+     }
+@@ -840,6 +916,16 @@ bool pvg_exec_set_zero_copy(PVGExec *e, bool import_ram, bool bar)
+      */
+     e->bar_max = !e->stage_ptr ? 0 : e->early ? ZC_BAR_MAX_EARLY : ZC_BAR_MAX;
+     e->zc_cache = g_hash_table_new_full(zc_key_hash, zc_key_equal, g_free, g_free);
++    for (uint32_t k = 0; k < e->zc_nram; k++) {
++        e->stale_npages = MAX(e->stale_npages, (e->zc_ram[k].ram + e->zc_ram[k].len) >> 12);
++    }
++    e->stale_bits = g_new0(uint64_t, (e->stale_npages + 63) / 64);
++    e->page_seq = g_new0(uint32_t, e->stale_npages);
++    e->page_sub = g_new0(uint64_t, e->stale_npages);
++    e->block_sub = g_new0(uint64_t, (e->stale_npages >> 9) + 1);
++    e->block_seq = g_new0(uint32_t, (e->stale_npages >> 9) + 1);
++    e->block_stale = g_new0(uint32_t, (e->stale_npages >> 9) + 1);
++    e->stale_owner = g_hash_table_new(g_direct_hash, g_direct_equal);
+     elog(e, "zero-copy: guest RAM imported in %u pieces; staging in %s (CPU uploads up to "
+          "%u bytes)", e->zc_nram, e->stage_ptr ? "VRAM through resizable BAR" : "VRAM",
+          e->bar_max);
+@@ -1079,17 +1165,33 @@ static void diag_redundant(PVGExec *e, uint32_t task, uint64_t va, uint64_t len)
+     }
+ }
+ 
++static uint32_t stale_owners(PVGExec *e, uint32_t task, uint64_t va, uint64_t len,
++                             const HostImage *except, HostImage **out, uint32_t max);
++static void wait_pending_writes(PVGExec *e, uint32_t task, uint64_t va, uint64_t len);
++
+ static bool guest_to_arena_in(PVGExec *e, uint32_t task, uint64_t cva, uint64_t clen,
+                               uint64_t va, uint64_t off, uint64_t len)
+ {
+     VkBufferCopy r = { .srcOffset = off, .dstOffset = off, .size = len };
+ 
+     diag_redundant(e, task, va, len);
++    if (e->stale_images) {
++        HostImage *own[2];
++
++        /* diagnostics: a read of memory whose newest contents are GPU-only (missed flush) */
++        if (stale_owners(e, task, va, len, NULL, own, 2) && e->stale_reads++ < 200) {
++            elog(e, "stale read: task %u va 0x%" G_GINT64_MODIFIER "x len %" G_GUINT64_FORMAT
++                 " (%s); GPU-only owner task %u va 0x%" G_GINT64_MODIFIER "x %ux%u fmt %d",
++                 task, va, len, e->read_why ? e->read_why : "?", own[0]->pgi.task,
++                 own[0]->pgi.va, own[0]->pgi.width, own[0]->pgi.height, own[0]->pgi.format);
++        }
++    }
+ 
+     if (e->zc && e->zc_nram && len > e->bar_max &&
+         zc_copy(e, task, cva, clen, va, len, off, false)) {
+-        return true;
++        return true;       /* a GPU gather: queued after any pending GPU write-back */
+     }
++    wait_pending_writes(e, task, va, len);
+     if (e->zc && e->stage_ptr) {
+         /* straight into VRAM */
+         if (!e->host.read(e->host.opaque, task, va, e->stage_ptr + off, len)) {
+@@ -1206,6 +1308,7 @@ static uint64_t buffer_upload(PVGExec *e, uint32_t task, uint32_t ref, uint64_t
+         return UINT64_MAX;
+     }
+     off = arena_alloc(e, blen);
++    e->read_why = "buffer";
+     if (off == UINT64_MAX ||
+         !guest_to_arena(e, task, (uint64_t)ldl(obj + 8) << 12, off, blen)) {
+         return UINT64_MAX;
+@@ -1366,6 +1469,8 @@ static bool guest_image_ex(PVGExec *e, uint32_t task, uint32_t ref, int level, u
+             }
+         }
+         gi->task = 0;
++        gi->backing = bid;
++        gi->plane = (uint32_t)(pl - (bobj + 0x14)) / 16;
+         gi->va = ((uint64_t)ldl(bobj + 0x08) << 12) + ldl(pl);
+         /* a texture may view the surface's pixels in another format: its own size wins */
+         gi->width = ldl(desc + 4) ? ldl(desc + 4) : ldl(pl + 4);
+@@ -1422,6 +1527,7 @@ static bool guest_image_ex(PVGExec *e, uint32_t task, uint32_t ref, int level, u
+             return false;
+         }
+         gi->task = task;
++        gi->over_buffer = true;
+         gi->row_bytes = (uint32_t)row;
+         gi->span = size;
+         gi->view_type = VK_IMAGE_VIEW_TYPE_2D;
+@@ -1495,13 +1601,14 @@ static bool format_storage_ok(PVGExec *e, VkFormat f)
+ #define POOL_MAX_BYTES  (512ull << 20)
+ 
+ static void image_free(gpointer v);
++static void stale_clear(PVGExec *e, HostImage *hi);
+ 
+ /* wait for the GPU only if something may still run (submissions are normally waited for) */
+ static void frame_wait(PVGExec *e, uint32_t i);
+ 
+ static void queue_idle(PVGExec *e)
+ {
+-    for (uint32_t i = 0; i < 2; i++) {
++    for (uint32_t i = 0; i < e->nframes; i++) {
+         if (e->fr[i].in_flight) {
+             frame_wait(e, i);
+             e->stats.queue_waits++;
+@@ -1518,6 +1625,15 @@ static void image_retire(PVGExec *e, gint64 key)
+         HostImage *hi = v;
+ 
+         g_free(k);
++        if (hi->refs > 1) {
++            hi->refs--;         /* still used by other tasks' textures */
++            return;
++        }
++        if (hi->bkey && g_hash_table_lookup(e->backing_imgs, &hi->bkey) == hi) {
++            g_hash_table_remove(e->backing_imgs, &hi->bkey);
++        }
++        hi->bkey = 0;
++        hi->refs = 0;
+         /* no longer a copy of anything: never flushed or checked again */
+         if (hi->cached) {
+             g_ptr_array_remove_fast(e->cached, hi);
+@@ -1530,6 +1646,7 @@ static void image_retire(PVGExec *e, gint64 key)
+             g_ptr_array_remove_fast(e->priv_imgs, hi);
+             hi->priv = false;
+         }
++        stale_clear(e, hi);
+         g_ptr_array_add(e->retired, hi);
+     }
+ }
+@@ -1550,7 +1667,8 @@ static void images_release_list(PVGExec *e, GPtrArray *retired)
+             image_free(hi);
+             continue;
+         }
+-        hi->resident = hi->guest_stale = hi->initialized = false;
++        stale_clear(e, hi);
++        hi->resident = hi->initialized = false;
+         hi->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+         e->pool_bytes += hi->bytes;
+         g_ptr_array_add(e->pool, hi);
+@@ -1560,8 +1678,9 @@ static void images_release_list(PVGExec *e, GPtrArray *retired)
+ 
+ static void images_release(PVGExec *e)
+ {
+-    images_release_list(e, e->fr[0].retired);
+-    images_release_list(e, e->fr[1].retired);
++    for (uint32_t i = 0; i < e->nframes; i++) {
++        images_release_list(e, e->fr[i].retired);
++    }
+ }
+ 
+ static bool swizzle_eq(VkComponentMapping a, VkComponentMapping b)
+@@ -1589,6 +1708,37 @@ static HostImage *pool_take(PVGExec *e, VkFormat fmt, uint32_t w, uint32_t h, ui
+     return NULL;
+ }
+ 
++static bool image_matches(const HostImage *hi, const GuestImage *gi)
++{
++    return hi->format == gi->format && hi->width == gi->width && hi->height == gi->height &&
++           hi->depth == gi->depth && hi->layers == gi->layers && hi->view_type == gi->view_type &&
++           hi->mips == gi->mips && hi->samples == MAX(gi->samples, 1) &&
++           swizzle_eq(hi->swizzle, gi->swizzle);
++}
++
++/* the backing id in the low word; the view's shape hashed into the high word */
++static gint64 backing_key(const GuestImage *gi)
++{
++    uint32_t h = gi->plane;
++    const uint32_t v[] = { gi->format, gi->width, gi->height, gi->row_bytes, gi->swizzle.r,
++                           gi->swizzle.g, gi->swizzle.b, gi->swizzle.a };
++
++    for (size_t i = 0; i < G_N_ELEMENTS(v); i++) {
++        h = h * 0x9e3779b1u + v[i];
++    }
++    return (gint64)(h | 1) << 32 | gi->backing;
++}
++
++/* hi (owned by one texture so far) becomes the shared image of its backing view */
++static void image_share(PVGExec *e, HostImage *hi, gint64 bkey)
++{
++    hi->refs = 1;
++    hi->bkey = bkey;
++    if (bkey) {
++        g_hash_table_insert(e->backing_imgs, g_memdup2(&bkey, sizeof(bkey)), hi);
++    }
++}
++
+ static HostImage *host_image(PVGExec *e, uint32_t task, uint32_t ref, const GuestImage *gi,
+                              bool render_target)
+ {
+@@ -1623,20 +1773,32 @@ static HostImage *host_image(PVGExec *e, uint32_t task, uint32_t ref, const Gues
+     };
+     VkMemoryRequirements req;
+     VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
++    gint64 bkey = 0;
+ 
+     (void)render_target;
+-    if (hi && hi->format == gi->format && hi->width == gi->width && hi->height == gi->height &&
+-        hi->depth == gi->depth && hi->layers == gi->layers && hi->view_type == gi->view_type &&
+-        hi->mips == gi->mips && hi->samples == MAX(gi->samples, 1)) {
++    if (hi && image_matches(hi, gi)) {
+         return hi;
+     }
+     if (hi) {
+         image_retire(e, key);   /* wrong size/format */
+     }
++    if (e->share_backings && gi->backing && !(ref & 0xf0000000u) && task < 256) {
++        HostImage *sh;
++
++        bkey = backing_key(gi);
++        sh = g_hash_table_lookup(e->backing_imgs, &bkey);
++        if (sh && image_matches(sh, gi)) {
++            sh->refs++;
++            g_hash_table_insert(e->images, key_new(task, ref), sh);
++            e->stats.backing_shares++;
++            return sh;
++        }
++    }
+     hi = pool_take(e, gi->format, gi->width, gi->height, gi->depth, gi->layers, gi->mips,
+                    MAX(gi->samples, 1), gi->view_type, gi->swizzle);
+     if (hi) {
+         g_hash_table_insert(e->images, key_new(task, ref), hi);
++        image_share(e, hi, bkey);
+         return hi;
+     }
+     hi = g_new0(HostImage, 1);
+@@ -1668,6 +1830,7 @@ static HostImage *host_image(PVGExec *e, uint32_t task, uint32_t ref, const Gues
+     hi->swizzle = gi->swizzle;
+     hi->bytes = req.size;
+     g_hash_table_insert(e->images, key_new(task, ref), hi);
++    image_share(e, hi, bkey);
+     return hi;
+ }
+ 
+@@ -1754,6 +1917,7 @@ static bool image_upload(PVGExec *e, const GuestImage *gi, HostImage *hi, VkImag
+     uint64_t size = guest_image_size(gi), off = arena_alloc(e, size);
+     VkBufferImageCopy r[MAX_MIPS];
+ 
++    e->read_why = "texture";
+     if (off == UINT64_MAX ||
+         !guest_to_arena(e, gi->task, gi->va, off, size)) {
+         if (e->upload_failures++ < 20) {
+@@ -1806,6 +1970,62 @@ static bool image_upload(PVGExec *e, const GuestImage *gi, HostImage *hi, VkImag
+ 
+ #define CACHE_MAX_RUNS 4096
+ 
++/* the executor wrote task va..va+len of guest memory (by GPU or CPU, through any mapping) */
++static void pages_written(PVGExec *e, uint32_t task, uint64_t va, uint64_t len)
++{
++    const ZCRuns *rr;
++    uint32_t seq;
++
++    if (!e->page_seq || !len || !(rr = zc_runs(e, task, va, len))) {
++        return;
++    }
++    seq = ++e->write_seq;
++    for (uint32_t i = 0; i < rr->n; i++) {
++        for (uint64_t page = rr->runs[i][0] >> 12;
++             page <= (rr->runs[i][0] + rr->runs[i][1] - 1) >> 12 && page < e->stale_npages;
++             page++) {
++            e->page_seq[page] = seq;
++            e->block_seq[page >> 9] = seq;
++            e->page_sub[page] = e->submit_seq;
++            e->block_sub[page >> 9] = MAX(e->block_sub[page >> 9], e->submit_seq);
++        }
++    }
++}
++
++/*
++ * No write by the executor to these pages since seq and no newer GPU-only contents in another
++ * image: a copy made then is still the guest's (the guest reports its own CPU writes)
++ */
++static bool pages_unchanged(PVGExec *e, uint32_t task, uint64_t va, uint64_t len,
++                            const HostImage *self, uint32_t seq)
++{
++    const ZCRuns *rr;
++
++    if (!e->page_seq || !len) {
++        return true;
++    }
++    if (!(rr = zc_runs(e, task, va, len))) {
++        return false;
++    }
++    for (uint32_t i = 0; i < rr->n; i++) {
++        for (uint64_t page = rr->runs[i][0] >> 12;
++             page <= (rr->runs[i][0] + rr->runs[i][1] - 1) >> 12 && page < e->stale_npages;
++             page++) {
++            if ((int32_t)(e->block_seq[page >> 9] - seq) <= 0 && !e->block_stale[page >> 9]) {
++                continue;       /* nothing in this 2 MiB block since */
++            }
++            if ((int32_t)(e->page_seq[page] - seq) > 0) {
++                return false;
++            }
++            if ((e->stale_bits[page / 64] >> (page % 64) & 1) &&
++                g_hash_table_lookup(e->stale_owner, GSIZE_TO_POINTER(page)) != self) {
++                return false;
++            }
++        }
++    }
++    return true;
++}
++
+ static void cache_drop(PVGExec *e, HostImage *hi)
+ {
+     if (!hi->cached) {
+@@ -1829,6 +2049,21 @@ static void cache_fill(PVGExec *e, HostImage *hi, const GuestImage *gi)
+     uint64_t len = guest_image_size(gi);
+     uint32_t n;
+ 
++    if (e->flag_cache) {
++        if (!len || gi->over_buffer) {
++            cache_drop(e, hi);
++            return;
++        }
++        if (!hi->cached) {
++            g_ptr_array_add(e->cached, hi);
++        }
++        hi->c_task = gi->task;
++        hi->c_va = gi->va;
++        hi->c_len = len;
++        hi->cached = true;
++        hi->fill_seq = e->write_seq;
++        return;
++    }
+     if (!e->upload_cache || !e->host.ram_runs || !len) {
+         return;
+     }
+@@ -1934,6 +2169,14 @@ static bool cache_check(PVGExec *e, HostImage *hi)
+     g_autofree bool *dirty = NULL;
+     bool ok = true;
+ 
++    if (e->flag_cache) {
++        if (!pages_unchanged(e, hi->c_task, hi->c_va, hi->c_len, hi, hi->fill_seq)) {
++            cache_drop(e, hi);
++            e->stats.cache_aliased++;
++            return false;
++        }
++        return true;
++    }
+     if (hi->checked == e->cache_epoch) {
+         return true;
+     }
+@@ -1998,6 +2241,231 @@ void pvg_exec_cache_invalidate(PVGExec *e, uint32_t task, uint64_t va, uint64_t
+     }
+ }
+ 
++static bool gi_overlap(const GuestImage *a, uint32_t task, uint64_t va, uint64_t len);
++
++/* guest memory range of an object (task:va..va+len; backings are in the kernel task) */
++static bool object_range(PVGExec *e, uint32_t task, uint32_t id, uint32_t *rtask, uint64_t *va,
++                         uint64_t *len)
++{
++    uint8_t obj[MAX_OBJ];
++    uint32_t olen;
++    GuestImage gi;
++
++    switch (object(e, task, id, obj, &olen)) {
++    case OBJ_BUFFER:
++    case OBJ_BACKING:
++        if (olen < 0x10) {
++            return false;
++        }
++        *rtask = task;
++        *va = (uint64_t)ldl(obj + 8) << 12;
++        *len = ldq(obj);
++        return *len != 0;
++    case OBJ_BACKING_REF_TEX:
++        return olen >= 4 && object_range(e, 0, ldl(obj), rtask, va, len);
++    case OBJ_TEXTURE_2: case OBJ_TEXTURE_3: case OBJ_DERIVED_TEX:
++        if (!guest_image(e, task, id, &gi)) {
++            return false;
++        }
++        *rtask = gi.task;
++        *va = gi.va;
++        *len = guest_image_size(&gi);
++        return true;
++    }
++    return false;
++}
++
++/*
++ * The guest's CPU modified these objects (flagged in a command buffer's resource list or by
++ * InvalidateResources): GPU copies of their memory are stale.
++ */
++void pvg_exec_modified(PVGExec *e, uint32_t task, uint32_t id)
++{
++    uint32_t rtask;
++    uint64_t va, len;
++
++    e->stats.res_modified++;
++    if (object_range(e, task, id, &rtask, &va, &len)) {
++        HostImage *own[16];
++        uint32_t n = stale_owners(e, rtask, va, len, NULL, own, 16);
++
++        pvg_exec_cache_invalidate(e, rtask, va, len);
++        /* the guest's copy is the newest now (as for Apple's host) */
++        for (uint32_t i = 0; i < n; i++) {
++            own[i]->resident = false;
++            stale_clear(e, own[i]);
++        }
++        for (guint i = 0; i < e->priv_imgs->len; i++) {
++            HostImage *hi = g_ptr_array_index(e->priv_imgs, i);
++
++            if (gi_overlap(&hi->pgi, rtask, va, len)) {
++                hi->resident = false;
++                stale_clear(e, hi);
++            }
++        }
++    } else {
++        /* unknown object: anything of the task may be stale */
++        pvg_exec_cache_invalidate(e, task, 0, 0);
++        e->stats.res_unknown++;
++    }
++}
++
++/* ExecIndirect2 resource list {u32 id, u8 flags[3], ...} x n (24 B each), before its buffers */
++void pvg_exec_resources(PVGExec *e, uint32_t task, const uint8_t *res, uint32_t n)
++{
++    g_hash_table_remove_all(e->gpu_written);
++    e->gpu_written_task = task;
++    for (uint32_t i = 0; i < n; i++) {
++        const uint8_t *r = res + 24 * i;
++
++        e->stats.res_entries++;
++        if (r[5] & 1) {
++            e->stats.res_written++;
++            g_hash_table_add(e->gpu_written, GUINT_TO_POINTER(ldl(r)));
++        }
++        if (r[4] & 1) {
++            pvg_exec_modified(e, task, ldl(r));
++        }
++    }
++}
++
++/*
++ * The guest marked the object written by the GPU in this command buffer's resource list: it
++ * keeps it guest-invalid and asks for it (SynchronizeResources) before its CPU reads it
++ */
++static bool guest_knows_written(PVGExec *e, uint32_t task, uint32_t ref)
++{
++    return task == e->gpu_written_task &&
++           g_hash_table_contains(e->gpu_written, GUINT_TO_POINTER(ref));
++}
++
++/* ---- GPU-only contents of guest RAM pages (any mapping) ---- */
++
++static void priv_flush(PVGExec *e, HostImage *hi);
++
++static bool stale_test(PVGExec *e, uint64_t page)
++{
++    return page < e->stale_npages &&
++           (e->stale_bits[page / 64] >> (page % 64) & 1);
++}
++
++static void stale_pages_remove(PVGExec *e, HostImage *hi)
++{
++    if (!hi->stale_pages || !hi->stale_pages->len) {
++        return;
++    }
++    for (guint i = 0; i < hi->stale_pages->len; i++) {
++        uint64_t page = g_array_index(hi->stale_pages, uint32_t, i);
++
++        if (g_hash_table_lookup(e->stale_owner, GSIZE_TO_POINTER(page)) == hi) {
++            g_hash_table_remove(e->stale_owner, GSIZE_TO_POINTER(page));
++            e->stale_bits[page / 64] &= ~(1ull << (page % 64));
++            e->block_stale[page >> 9]--;
++        }
++    }
++    g_array_set_size(hi->stale_pages, 0);
++    e->stale_images--;
++}
++
++/* the images owning GPU-only contents of task va..va+len's pages (at most max, no duplicates) */
++static uint32_t stale_owners(PVGExec *e, uint32_t task, uint64_t va, uint64_t len,
++                             const HostImage *except, HostImage **out, uint32_t max)
++{
++    const ZCRuns *rr;
++    uint32_t n = 0;
++
++    if (!e->stale_images || !len || !(rr = zc_runs(e, task, va, len))) {
++        return 0;
++    }
++    for (uint32_t i = 0; i < rr->n; i++) {
++        for (uint64_t page = rr->runs[i][0] >> 12;
++             page <= (rr->runs[i][0] + rr->runs[i][1] - 1) >> 12; page++) {
++            HostImage *o;
++            uint32_t k;
++
++            if (!stale_test(e, page) ||
++                !(o = g_hash_table_lookup(e->stale_owner, GSIZE_TO_POINTER(page))) ||
++                o == except) {
++                continue;
++            }
++            for (k = 0; k < n && out[k] != o; k++) {
++            }
++            if (k == n && n < max) {
++                out[n++] = o;
++            }
++        }
++    }
++    return n;
++}
++
++/* the guest side is about to read task va..va+len: GPU-only contents there first */
++static void stale_flush_phys(PVGExec *e, uint32_t task, uint64_t va, uint64_t len,
++                             const HostImage *except)
++{
++    HostImage *own[16];
++    uint32_t n = stale_owners(e, task, va, len, except, own, 16);
++
++    for (uint32_t i = 0; i < n; i++) {
++        e->flush_why = "alias";
++        priv_flush(e, own[i]);
++    }
++}
++
++/* hi now holds the only copy of its memory's newest contents */
++static void stale_set(PVGExec *e, HostImage *hi)
++{
++    const ZCRuns *rr;
++    HostImage *prev[16];
++    uint32_t n;
++
++    if (hi->guest_stale) {
++        return;
++    }
++    hi->guest_stale = true;
++    if (!e->stale_bits ||
++        !(rr = zc_runs(e, hi->pgi.task, hi->pgi.va, guest_image_size(&hi->pgi)))) {
++        return;
++    }
++    /* another image's GPU-only contents of the same pages: in guest memory first */
++    n = stale_owners(e, hi->pgi.task, hi->pgi.va, guest_image_size(&hi->pgi), hi, prev, 16);
++    for (uint32_t i = 0; i < n; i++) {
++        e->flush_why = "alias-writer";
++        priv_flush(e, prev[i]);
++    }
++    rr = zc_runs(e, hi->pgi.task, hi->pgi.va, guest_image_size(&hi->pgi));
++    if (!rr) {
++        return;
++    }
++    if (!hi->stale_pages) {
++        hi->stale_pages = g_array_new(false, false, sizeof(uint32_t));
++    }
++    for (uint32_t i = 0; i < rr->n; i++) {
++        for (uint64_t page = rr->runs[i][0] >> 12;
++             page <= (rr->runs[i][0] + rr->runs[i][1] - 1) >> 12; page++) {
++            uint32_t p32 = (uint32_t)page;
++
++            if (page >= e->stale_npages) {
++                continue;
++            }
++            if (!(e->stale_bits[page / 64] >> (page % 64) & 1)) {
++                e->block_stale[page >> 9]++;
++            }
++            e->stale_bits[page / 64] |= 1ull << (page % 64);
++            g_hash_table_insert(e->stale_owner, GSIZE_TO_POINTER(page), hi);
++            g_array_append_val(hi->stale_pages, p32);
++        }
++    }
++    e->stale_images++;
++}
++
++static void stale_clear(PVGExec *e, HostImage *hi)
++{
++    if (hi->guest_stale) {
++        hi->guest_stale = false;
++        stale_pages_remove(e, hi);
++    }
++}
++
+ /* ---- private textures: resident on the GPU, written back only when the guest needs it ---- */
+ 
+ static bool gi_overlap(const GuestImage *a, uint32_t task, uint64_t va, uint64_t len)
+@@ -2140,7 +2608,7 @@ static void priv_flush(PVGExec *e, HostImage *hi)
+     if (!hi->guest_stale) {
+         return;
+     }
+-    hi->guest_stale = false;
++    stale_clear(e, hi);
+     if (hi->layout == VK_IMAGE_LAYOUT_UNDEFINED) {
+         return;
+     }
+@@ -2160,6 +2628,10 @@ static void priv_flush(PVGExec *e, HostImage *hi)
+         return;
+     }
+     write_levels(e, gi, off, cpu);
++    pages_written(e, gi->task, gi->va, guest_image_size(gi));
++    if (hi->cached) {
++        hi->fill_seq = e->write_seq;    /* the guest's copy equals it again */
++    }
+     e->stats.priv_flushes++;
+ }
+ 
+@@ -2193,10 +2665,19 @@ void pvg_exec_synchronize(PVGExec *e, uint32_t task, uint32_t id)
+ {
+     GHashTableIter it;
+     gpointer k, v;
++    uint32_t rtask;
++    uint64_t va, len;
+ 
++    pvg_exec_wait_writes(e);    /* the guest reads it next */
+     if (!e->priv_imgs->len) {
+         return;
+     }
++    if (object_range(e, task, id, &rtask, &va, &len)) {
++        /* any image holding newer contents of the object's memory, whichever task drew it */
++        e->flush_why = "synchronize";
++        priv_flush_range(e, rtask, va, len, NULL);
++        stale_flush_phys(e, rtask, va, len, NULL);
++    }
+     g_hash_table_iter_init(&it, e->images);
+     while (g_hash_table_iter_next(&it, &k, &v)) {
+         gint64 key = *(gint64 *)k;
+@@ -2209,6 +2690,282 @@ void pvg_exec_synchronize(PVGExec *e, uint32_t task, uint32_t id)
+     }
+ }
+ 
++static void scanout_free(PVGExec *e)
++{
++    VkDevice d = e->gpu->device;
++
++    for (uint32_t i = 0; i < PVG_SCANOUT_BUFS; i++) {
++        if (e->scan[i].fd >= 0 && e->scan[i].image) {
++            close(e->scan[i].fd);
++        }
++        if (e->scan[i].image) {
++            vkDestroyImage(d, e->scan[i].image, NULL);
++            vkFreeMemory(d, e->scan[i].mem, NULL);
++        }
++        e->scan[i].image = VK_NULL_HANDLE;
++        e->scan[i].mem = VK_NULL_HANDLE;
++        e->scan[i].fd = -1;
++    }
++}
++
++/* exportable BGRA images of the frame size; the driver picks a modifier it can share */
++static bool scanout_init(PVGExec *e, uint32_t w, uint32_t h)
++{
++    PVGGpu *g = e->gpu;
++    PFN_vkGetMemoryFdKHR get_fd = (PFN_vkGetMemoryFdKHR)
++        vkGetDeviceProcAddr(g->device, "vkGetMemoryFdKHR");
++    PFN_vkGetImageDrmFormatModifierPropertiesEXT get_mod =
++        (PFN_vkGetImageDrmFormatModifierPropertiesEXT)
++        vkGetDeviceProcAddr(g->device, "vkGetImageDrmFormatModifierPropertiesEXT");
++    VkDrmFormatModifierPropertiesEXT mp[32];
++    VkDrmFormatModifierPropertiesListEXT ml = {
++        .sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
++        .drmFormatModifierCount = 32, .pDrmFormatModifierProperties = mp,
++    };
++    VkFormatProperties2 fp = { .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, .pNext = &ml };
++    uint64_t mods[32];
++    uint32_t nmods = 0;
++
++    scanout_free(e);
++    if (!g->dmabuf || !get_fd || !get_mod) {
++        return false;
++    }
++    vkGetPhysicalDeviceFormatProperties2(g->phys, VK_FORMAT_B8G8R8A8_UNORM, &fp);
++    for (uint32_t i = 0; i < ml.drmFormatModifierCount && i < 32; i++) {
++        if (mp[i].drmFormatModifierPlaneCount == 1 &&
++            (mp[i].drmFormatModifierTilingFeatures & VK_FORMAT_FEATURE_TRANSFER_DST_BIT)) {
++            mods[nmods++] = mp[i].drmFormatModifier;
++        }
++    }
++    if (!nmods) {
++        return false;
++    }
++    for (uint32_t i = 0; i < PVG_SCANOUT_BUFS; i++) {
++        VkImageDrmFormatModifierListCreateInfoEXT mlci = {
++            .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
++            .drmFormatModifierCount = nmods, .pDrmFormatModifiers = mods,
++        };
++        VkExternalMemoryImageCreateInfo emi = {
++            .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, .pNext = &mlci,
++            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++        };
++        VkImageCreateInfo ici = {
++            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .pNext = &emi,
++            .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_B8G8R8A8_UNORM,
++            .extent = { w, h, 1 }, .mipLevels = 1, .arrayLayers = 1,
++            .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
++            .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++        };
++        VkMemoryDedicatedAllocateInfo dai = {
++            .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
++        };
++        VkExportMemoryAllocateInfo exp = {
++            .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO, .pNext = &dai,
++            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++        };
++        VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++                                     .pNext = &exp };
++        VkImageDrmFormatModifierPropertiesEXT imp = {
++            .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT,
++        };
++        VkImageSubresource sub = { VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT, 0, 0 };
++        VkMemoryGetFdInfoKHR gfi = { .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
++                                     .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT };
++        VkSubresourceLayout sl;
++        VkMemoryRequirements req;
++
++        if (vkCreateImage(g->device, &ici, NULL, &e->scan[i].image) != VK_SUCCESS) {
++            e->scan[i].image = VK_NULL_HANDLE;
++            goto fail;
++        }
++        vkGetImageMemoryRequirements(g->device, e->scan[i].image, &req);
++        dai.image = e->scan[i].image;
++        mai.allocationSize = req.size;
++        mai.memoryTypeIndex = pvg_gpu_memory_type(g, req.memoryTypeBits,
++                                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++        if (vkAllocateMemory(g->device, &mai, NULL, &e->scan[i].mem) != VK_SUCCESS) {
++            vkDestroyImage(g->device, e->scan[i].image, NULL);
++            e->scan[i].image = VK_NULL_HANDLE;
++            goto fail;
++        }
++        vkBindImageMemory(g->device, e->scan[i].image, e->scan[i].mem, 0);
++        gfi.memory = e->scan[i].mem;
++        if (get_fd(g->device, &gfi, &e->scan[i].fd) != VK_SUCCESS ||
++            get_mod(g->device, e->scan[i].image, &imp) != VK_SUCCESS) {
++            e->scan[i].fd = -1;
++            goto fail;
++        }
++        vkGetImageSubresourceLayout(g->device, e->scan[i].image, &sub, &sl);
++        e->scan_info.fd[i] = e->scan[i].fd;
++        e->scan_info.stride = (uint32_t)sl.rowPitch;
++        e->scan_info.offset = (uint32_t)sl.offset;
++        e->scan_info.modifier = imp.drmFormatModifier;
++    }
++    e->scan_info.width = w;
++    e->scan_info.height = h;
++    e->scan_info.generation++;
++    elog(e, "dmabuf scanout %ux%u: modifier 0x%" G_GINT64_MODIFIER "x stride %u", w, h,
++         e->scan_info.modifier, e->scan_info.stride);
++    return true;
++fail:
++    elog(e, "dmabuf scanout %ux%u: export failed", w, h);
++    scanout_free(e);
++    e->scan_info.width = 0;
++    return false;
++}
++
++/*
++ * Present for a GL display: copy a BGRA surface (task va, width x height, row_bytes) into the
++ * next exportable scanout image, from its GPU image when that holds the newest contents, else
++ * from guest memory. Returns the buffer index (info describes the set), -1 on failure.
++ */
++int pvg_exec_scanout(PVGExec *e, uint32_t task, uint64_t va, uint32_t width, uint32_t height,
++                     uint32_t row_bytes, PVGScanout *info)
++{
++    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
++    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
++                        .pCommandBuffers = &e->cmd };
++    HostImage *hi = NULL;
++    uint64_t mark = e->arena_used, off = UINT64_MAX;
++    uint32_t idx;
++
++    if (e->disabled || e->dry_run) {
++        return -1;
++    }
++    if ((e->scan_info.width != width || e->scan_info.height != height) &&
++        !scanout_init(e, width, height)) {
++        return -1;
++    }
++    for (guint i = 0; e->priv_imgs && i < e->priv_imgs->len; i++) {
++        HostImage *c = g_ptr_array_index(e->priv_imgs, i);
++
++        if (c->guest_stale && c->resident && c->pgi.task == task && c->pgi.va == va &&
++            c->pgi.width == width && c->pgi.height == height && c->pgi.mips == 1 &&
++            (c->format == VK_FORMAT_B8G8R8A8_UNORM || c->format == VK_FORMAT_B8G8R8A8_SRGB) &&
++            c->layout != VK_IMAGE_LAYOUT_UNDEFINED) {
++            hi = c;
++            break;
++        }
++    }
++    idx = e->scan_next;
++    e->scan_next = (e->scan_next + 1) % PVG_SCANOUT_BUFS;
++    vkResetCommandBuffer(e->cmd, 0);
++    vkBeginCommandBuffer(e->cmd, &bi);
++    barrier(e, e->scan[idx].image, VK_IMAGE_LAYOUT_UNDEFINED,
++            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++    if (hi) {
++        VkImageCopy c = {
++            .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++            .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++            .extent = { width, height, 1 },
++        };
++
++        barrier(e, hi->image, hi->layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++        hi->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++        vkCmdCopyImage(e->cmd, hi->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                       e->scan[idx].image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
++    } else {
++        VkBufferImageCopy r = {
++            .bufferRowLength = row_bytes / 4,
++            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++            .imageExtent = { width, height, 1 },
++        };
++        uint64_t size = (uint64_t)row_bytes * (height - 1) + width * 4;
++
++        off = arena_alloc(e, size);
++        if (off == UINT64_MAX || !guest_to_arena(e, task, va, off, size)) {
++            vkEndCommandBuffer(e->cmd);
++            e->arena_used = mark;
++            return -1;
++        }
++        r.bufferOffset = off;
++        vkCmdCopyBufferToImage(e->cmd, e->gbuf, e->scan[idx].image,
++                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
++    }
++    /* hand the image to the display's GL context (another queue family: foreign) */
++    {
++        VkImageMemoryBarrier b = {
++            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
++            .srcQueueFamilyIndex = e->gpu->queue_family,
++            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT,
++            .image = e->scan[idx].image,
++            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
++        };
++
++        vkCmdPipelineBarrier(e->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                             VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 1, &b);
++    }
++    vkEndCommandBuffer(e->cmd);
++    if (!submit_wait(e, &si)) {
++        e->arena_used = mark;
++        return -1;
++    }
++    e->arena_used = mark;
++    e->stats.surface_reads += hi != NULL;
++    *info = e->scan_info;
++    return (int)idx;
++}
++
++/*
++ * A present reads a BGRA surface whose newest contents may exist only on the GPU: copy them
++ * from the image into dst (width * 4 bytes per row) instead of writing them back to guest
++ * memory first. false: no such image (the guest's copy is current; read that).
++ */
++bool pvg_exec_read_surface(PVGExec *e, uint32_t task, uint64_t va, uint32_t width,
++                           uint32_t height, void *dst)
++{
++    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
++    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
++                        .pCommandBuffers = &e->cmd };
++    VkBufferImageCopy r = {
++        .bufferRowLength = width, .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++        .imageExtent = { width, height, 1 },
++    };
++    HostImage *hi = NULL;
++    uint64_t mark = e->arena_used, off;
++
++    for (guint i = 0; e->priv_imgs && i < e->priv_imgs->len; i++) {
++        HostImage *c = g_ptr_array_index(e->priv_imgs, i);
++
++        if (c->guest_stale && c->resident && c->pgi.task == task && c->pgi.va == va &&
++            c->pgi.width == width && c->pgi.height == height && c->pgi.mips == 1 &&
++            (c->format == VK_FORMAT_B8G8R8A8_UNORM || c->format == VK_FORMAT_B8G8R8A8_SRGB) &&
++            c->layout != VK_IMAGE_LAYOUT_UNDEFINED) {
++            hi = c;
++            break;
++        }
++    }
++    if (!hi || e->disabled || e->dry_run) {
++        return false;
++    }
++    off = arena_alloc(e, (uint64_t)width * height * 4);
++    if (off == UINT64_MAX) {
++        return false;
++    }
++    r.bufferOffset = off;
++    vkResetCommandBuffer(e->cmd, 0);
++    vkBeginCommandBuffer(e->cmd, &bi);
++    barrier(e, hi->image, hi->layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++    hi->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    vkCmdCopyImageToBuffer(e->cmd, hi->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, e->arena, 1,
++                           &r);
++    vkEndCommandBuffer(e->cmd);
++    if (!submit_wait(e, &si)) {
++        e->arena_used = mark;
++        return false;
++    }
++    memcpy(dst, e->arena_ptr + off, (size_t)width * height * 4);
++    e->arena_used = mark;
++    e->stats.surface_reads++;
++    return true;
++}
++
+ void pvg_exec_flush_range(PVGExec *e, uint32_t task, uint64_t va, uint64_t len)
+ {
+     for (guint i = 0; e->priv_imgs && i < e->priv_imgs->len; i++) {
+@@ -2242,6 +2999,11 @@ static void priv_prepare_refs(PVGExec *e, uint32_t task, const uint32_t *refs, u
+             e->flush_why = "texture-overlap";
+             priv_flush_range(e, gi.task, gi.va, guest_image_size(&gi),
+                              priv_same(own, &gi) ? own : NULL);
++            /* the same pages through other mappings, unless the image needs no upload */
++            if (!(own && ((own->resident && priv_same(own, &gi)) ||
++                          (cache_valid(own, &gi) && cache_check(e, own))))) {
++                stale_flush_phys(e, gi.task, gi.va, guest_image_size(&gi), NULL);
++            }
+         }
+     }
+ }
+@@ -2262,8 +3024,17 @@ static void texture_prepare(PVGExec *e, const GuestImage *gi, HostImage *hi,
+         if (image_upload(e, gi, hi, final)) {
+             priv_track(e, hi, gi);
+             hi->resident = true;
+-            hi->guest_stale = false;
++            stale_clear(e, hi);
++        }
++        return;
++    }
++    if (hi->priv && hi->resident && priv_same(hi, gi)) {
++        /* a render target kept on the GPU (defer_wb): newer than the guest's copy */
++        if (hi->layout != final) {
++            barrier(e, hi->image, hi->layout, final);
++            hi->layout = final;
+         }
++        e->stats.priv_skipped += guest_image_size(gi);
+         return;
+     }
+     if (cache_valid(hi, gi) && cache_check(e, hi)) {
+@@ -2298,6 +3069,7 @@ static bool image_upload_rect(PVGExec *e, const GuestImage *gi, HostImage *hi, V
+         .imageExtent = { rc.extent.width, rc.extent.height, 1 },
+     };
+ 
++    e->read_why = "rect";
+     if (off == UINT64_MAX) {
+         return false;
+     }
+@@ -3307,8 +4079,8 @@ static void frame_select(PVGExec *e, uint32_t i)
+     e->zc_post = e->fr[i].post;
+     e->fence = e->fr[i].fence;
+     e->retired = e->fr[i].retired;
+-    e->arena_lo = e->early ? i * (ARENA_SIZE / 2) : 0;
+-    e->arena_hi = e->early ? e->arena_lo + ARENA_SIZE / 2 : ARENA_SIZE;
++    e->arena_lo = e->early ? i * (ARENA_SIZE / e->nframes) : 0;
++    e->arena_hi = e->early ? e->arena_lo + ARENA_SIZE / e->nframes : ARENA_SIZE;
+     e->arena_used = e->arena_lo;
+ }
+ 
+@@ -3338,6 +4110,16 @@ static void frame_wait(PVGExec *e, uint32_t i)
+         vkResetFences(e->gpu->device, 1, &f->fence);
+     }
+     images_release_list(e, f->retired);
++    if (f->dead_pipes && f->dead_pipes->len) {
++        free_ctx = e;
++        g_ptr_array_set_size(f->dead_pipes, 0);     /* pipeline_free */
++    }
++    for (guint k = 0; f->dead_samplers && k < f->dead_samplers->len; k++) {
++        vkDestroySampler(e->gpu->device, g_array_index(f->dead_samplers, VkSampler, k), NULL);
++    }
++    if (f->dead_samplers) {
++        g_array_set_size(f->dead_samplers, 0);
++    }
+ }
+ 
+ /*
+@@ -3345,14 +4127,19 @@ static void frame_wait(PVGExec *e, uint32_t i)
+  * caller reads results, or the guest may). Otherwise return as soon as its guest-RAM gathers
+  * are done (the guest may reuse its memory) and record the next work into the other frame.
+  */
+-static bool submit_frame(PVGExec *e, const VkSubmitInfo *si, bool wait)
++static bool submit_frame(PVGExec *e, const VkSubmitInfo *si, bool wait, bool async_writes)
+ {
+     VkDevice d = e->gpu->device;
+     ExecFrame *f = &e->fr[e->cur];
+     VkCommandBuffer cbs[3];
+     VkSubmitInfo zsi = *si;
++    uint64_t signal;
++    VkTimelineSemaphoreSubmitInfo tsi = {
++        .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
++        .signalSemaphoreValueCount = 1, .pSignalSemaphoreValues = &signal,
++    };
+     uint32_t ncb = 0;
+-    bool split;
++    bool split, scatters;
+     int64_t t0;
+     VkResult r;
+ 
+@@ -3365,7 +4152,10 @@ static bool submit_frame(PVGExec *e, const VkSubmitInfo *si, bool wait)
+         zc_emit(e, false);
+         zc_emit(e, true);
+     }
+-    wait |= e->zc_post_open;    /* scatters write guest memory */
++    scatters = e->zc_post_open;
++    if (!async_writes) {
++        wait |= scatters;       /* scatters write guest memory */
++    }
+     split = !wait && e->zc_pre_open;
+     if (e->zc_pre_open) {
+         zc_full_barrier(e->zc_pre);
+@@ -3390,14 +4180,28 @@ static bool submit_frame(PVGExec *e, const VkSubmitInfo *si, bool wait)
+     e->zc_pre_open = e->zc_post_open = false;
+     zsi.commandBufferCount = ncb;
+     zsi.pCommandBuffers = cbs;
++    if (e->timeline) {
++        signal = ++e->submit_seq;
++        zsi.pNext = &tsi;
++        zsi.signalSemaphoreCount = 1;
++        zsi.pSignalSemaphores = &e->timeline;
++    }
+     r = vkQueueSubmit(e->gpu->queue, 1, &zsi, f->fence);
+     if (r != VK_SUCCESS) {
+         return submit_failed(e, r);
+     }
+     f->in_flight = true;
++    if (!wait && scatters) {
++        /* guest-visible results complete later: the caller holds the guest's stamp until then */
++        e->visible_seq = e->submit_seq;
++        e->stats.async_visible++;
++    }
+     if (wait) {
+         frame_wait(e, e->cur);
+-        frame_wait(e, e->cur ^ 1);      /* earlier: done as well; recycle its fence */
++        for (uint32_t i = 0; i < e->nframes; i++) {
++            frame_wait(e, i);           /* earlier: done as well; recycle their fences */
++        }
++        e->stats.wait_full_us += g_get_monotonic_time() - t0;
+         return !e->disabled;
+     }
+     if (split) {
+@@ -3408,23 +4212,100 @@ static bool submit_frame(PVGExec *e, const VkSubmitInfo *si, bool wait)
+             return submit_failed(e, r);
+         }
+         vkResetFences(d, 1, &f->gfence);
++        e->stats.wait_gather_us += g_get_monotonic_time() - t0;
+     }
+     e->stats.gpu_wait_us += g_get_monotonic_time() - t0;
+     e->stats.early_completions++;
+-    frame_select(e, e->cur ^ 1);
+-    frame_wait(e, e->cur);      /* the submission before: usually long done */
++    frame_select(e, (e->cur + 1) % e->nframes);
++    t0 = g_get_monotonic_time();
++    frame_wait(e, e->cur);      /* the submission nframes - 1 before: usually long done */
++    e->stats.wait_prev_us += g_get_monotonic_time() - t0;
+     return !e->disabled;
+ }
+ 
+ static bool submit_wait(PVGExec *e, const VkSubmitInfo *si)
+ {
+-    return submit_frame(e, si, true);
++    return submit_frame(e, si, true, false);
++}
++
++/*
++ * A submission whose results the guest cannot see directly (no write-backs) returns early. So
++ * does one whose write-backs are all GPU scatters (cpu_after false) with async_visible.
++ */
++static bool submit_maybe_early(PVGExec *e, const VkSubmitInfo *si, bool guest_visible,
++                               bool cpu_after)
++{
++    bool async = guest_visible && !cpu_after && e->async_visible && e->timeline;
++
++    return submit_frame(e, si, (guest_visible && !async) || !e->early || e->dump_dir ||
++                        e->capture_left, async);
++}
++
++static uint64_t completed_seq(PVGExec *e)
++{
++    uint64_t v = 0;
++
++    if (e->timeline && vkGetSemaphoreCounterValue(e->gpu->device, e->timeline, &v) == VK_SUCCESS) {
++        e->completed_seq = v;
++    }
++    return e->completed_seq;
+ }
+ 
+-/* a submission whose results the guest cannot see directly (no write-backs) */
+-static bool submit_maybe_early(PVGExec *e, const VkSubmitInfo *si, bool guest_visible)
++/* wait (any thread) until submissions up to seq completed */
++bool pvg_exec_wait_seq(PVGExec *e, uint64_t seq)
+ {
+-    return submit_frame(e, si, guest_visible || !e->early || e->dump_dir || e->capture_left);
++    VkSemaphoreWaitInfo wi = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
++                               .semaphoreCount = 1, .pSemaphores = &e->timeline,
++                               .pValues = &seq };
++
++    return !e->timeline ||
++           vkWaitSemaphores(e->gpu->device, &wi, 2000000000ull) == VK_SUCCESS;
++}
++
++uint64_t pvg_exec_take_visible(PVGExec *e)
++{
++    uint64_t v = e->visible_seq;
++
++    e->visible_seq = 0;
++    return v;
++}
++
++/* the CPU is about to read task va..va+len: GPU writes still running there must be done */
++static void wait_pending_writes(PVGExec *e, uint32_t task, uint64_t va, uint64_t len)
++{
++    const ZCRuns *rr;
++    uint64_t need = 0;
++
++    if (!e->page_sub || !len || e->submit_seq <= e->completed_seq ||
++        completed_seq(e) >= e->submit_seq || !(rr = zc_runs(e, task, va, len))) {
++        return;
++    }
++    for (uint32_t i = 0; i < rr->n; i++) {
++        for (uint64_t page = rr->runs[i][0] >> 12;
++             page <= (rr->runs[i][0] + rr->runs[i][1] - 1) >> 12 && page < e->stale_npages;
++             page++) {
++            if (e->block_sub[page >> 9] > e->completed_seq) {
++                need = MAX(need, e->page_sub[page]);
++            }
++        }
++    }
++    if (need > e->completed_seq) {
++        int64_t t0 = g_get_monotonic_time();
++
++        pvg_exec_wait_seq(e, need);
++        e->stats.gpu_wait_us += g_get_monotonic_time() - t0;
++        e->stats.pending_waits++;
++        completed_seq(e);
++    }
++}
++
++/* every GPU write to guest memory done (before the guest side reads it directly) */
++void pvg_exec_wait_writes(PVGExec *e)
++{
++    if (e->submit_seq > e->completed_seq && completed_seq(e) < e->submit_seq) {
++        pvg_exec_wait_seq(e, e->submit_seq);
++        completed_seq(e);
++    }
+ }
+ 
+ typedef struct Attachment {
+@@ -4010,6 +4891,12 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                 priv_flush_range(e, att[i].gi.task, att[i].gi.va,
+                                  guest_image_size(&att[i].gi),
+                                  priv_same(own, &att[i].gi) ? own : NULL);
++                if (att[i].load == 1 && !(own && ((own->resident && priv_same(own, &att[i].gi)) ||
++                                                  (cache_valid(own, &att[i].gi) &&
++                                                   cache_check(e, own))))) {
++                    stale_flush_phys(e, att[i].gi.task, att[i].gi.va,
++                                     guest_image_size(&att[i].gi), NULL);
++                }
+             }
+         }
+         priv_prepare_refs(e, task, refs, n);
+@@ -4142,7 +5029,11 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+             att[i].gi.width == rw && att[i].gi.height == rh) {
+             att[i].damage = damage;
+         }
+-        att[i].priv = e->private_resident && att[i].gi.storage == 2 && att[i].samples <= 1;
++        att[i].priv = e->private_resident && att[i].samples <= 1 &&
++                      (att[i].gi.storage == 2 ||
++                       (e->defer_wb && e->stale_bits && att[i].gi.mips == 1 &&
++                        !att[i].gi.over_buffer && guest_knows_written(e, task, att[i].ref) &&
++                        att[i].gi.layers * att[i].gi.depth == 1));
+         if (att[i].chain) {
+             HostImage *hi = att[i].img;
+             VkImageView v = level_view(e, hi, att[i].level);
+@@ -4172,7 +5063,8 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+         if (att[i].priv) {
+             HostImage *hi = att[i].img;
+ 
+-            if (att[i].load == 1 && !(hi->resident && priv_same(hi, &att[i].gi))) {
++            if (att[i].load == 1 && !(hi->resident && priv_same(hi, &att[i].gi)) &&
++                !(cache_valid(hi, &att[i].gi) && cache_check(e, hi))) {
+                 /* not on the GPU yet: load all of it (it stays resident afterwards) */
+                 image_upload(e, &att[i].gi, hi, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+             } else if (att[i].load == 1) {
+@@ -4665,12 +5557,13 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+     vkEndCommandBuffer(e->cmd);
+     {
+         /* nothing written back to the guest: it may continue while the GPU renders */
+-        bool visible = false;
++        bool visible = false, cpu = false;
+ 
+         for (uint32_t i = 0; i < natt; i++) {
+             visible |= att[i].wb_off != UINT64_MAX;
++            cpu |= att[i].wb_off != UINT64_MAX && !att[i].wb_gpu;
+         }
+-        if (!submit_maybe_early(e, &si, visible)) {
++        if (!submit_maybe_early(e, &si, visible, cpu || e->capture_left || e->dump_dir)) {
+             return;
+         }
+     }
+@@ -4759,7 +5652,7 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+             priv_track(e, hi, &att[i].cgi);
+             hi->resident = true;
+             if (att[i].store == 1) {
+-                hi->guest_stale = true;
++                stale_set(e, hi);
+                 priv_invalidate_range(e, att[i].cgi.task, att[i].cgi.va,
+                                       guest_image_size(&att[i].cgi), hi);
+                 pvg_exec_cache_invalidate(e, att[i].cgi.task, att[i].cgi.va,
+@@ -4771,7 +5664,7 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+ 
+             priv_track(e, hi, &att[i].gi);
+             hi->resident = true;
+-            hi->guest_stale = true;
++            stale_set(e, hi);
+             priv_invalidate_range(e, att[i].gi.task, att[i].gi.va, guest_image_size(&att[i].gi),
+                                   hi);
+             pvg_exec_cache_invalidate(e, att[i].gi.task, att[i].gi.va,
+@@ -4854,6 +5747,9 @@ static bool copy_rows(PVGExec *e, uint32_t stask, uint64_t sva, uint64_t sstride
+ {
+     g_autofree uint8_t *tmp = g_malloc(row);
+ 
++    /* GPU write-backs still running into either range finish first */
++    wait_pending_writes(e, stask, sva, sstride * (rows ? rows - 1 : 0) + row);
++    wait_pending_writes(e, dtask, dva, dstride * (rows ? rows - 1 : 0) + row);
+     for (uint64_t y = 0; y < rows; y++) {
+         if (!e->host.read(e->host.opaque, stask, sva + y * sstride, tmp, row) ||
+             !e->host.write(e->host.opaque, dtask, dva + y * dstride, tmp, row)) {
+@@ -5404,8 +6300,15 @@ static void exec_compute_segment(PVGExec *e, uint32_t task, const uint8_t *p, ui
+         }
+     }
+     vkEndCommandBuffer(e->cmd);
+-    if (!submit_maybe_early(e, &si, nout > 0)) {
+-        return;
++    {
++        bool cpu = false;
++
++        for (uint32_t i = 0; i < nout; i++) {
++            cpu |= out[i].arena_off != UINT64_MAX && out[i].size && !out[i].wb_gpu;
++        }
++        if (!submit_maybe_early(e, &si, nout > 0, cpu || e->dump_dir)) {
++            return;
++        }
+     }
+     for (uint32_t i = 0; i < nout; i++) {
+         if (out[i].arena_off == UINT64_MAX || !out[i].size) {
+@@ -5609,7 +6512,7 @@ static bool generate_mipmaps_gpu(PVGExec *e, uint32_t task, uint32_t ref, const
+         /* the levels exist only on the GPU until the guest needs the memory */
+         priv_track(e, hi, all);
+         hi->resident = true;
+-        hi->guest_stale = true;
++        stale_set(e, hi);
+     } else {
+         write_levels(e, all, off, cpu);
+         cache_drop(e, hi);
+@@ -5638,7 +6541,9 @@ static void generate_mipmaps(PVGExec *e, uint32_t task, uint32_t ref)
+         /* the CPU path works on the guest copy: GPU-only contents first */
+         e->flush_why = "mip-cpu";
+         priv_flush_range(e, all.task, all.va, guest_image_size(&all), NULL);
++        stale_flush_phys(e, all.task, all.va, guest_image_size(&all), NULL);
+     }
++    wait_pending_writes(e, all.task, all.va, guest_image_size(&all));
+     nc = mip_channels(all.format, &kind);
+     if (!nc) {
+         elog(e, "task %u texture %u: generateMipmaps for format %d not supported", task, ref,
+@@ -5710,6 +6615,7 @@ static void blit_flush(PVGExec *e, uint32_t task, uint64_t va, uint64_t len)
+     if (e->private_resident && e->priv_imgs->len) {
+         e->flush_why = "blit";
+         priv_flush_range(e, task, va, len, NULL);
++        stale_flush_phys(e, task, va, len, NULL);
+     }
+ }
+ 
+@@ -6008,6 +6914,7 @@ static gboolean match_task_str(gpointer key, gpointer value, gpointer task)
+ void pvg_exec_reset_wait(PVGExec *e)
+ {
+     e->stats.gpu_wait_us = e->stats.pipeline_us = e->stats.damage_saved = 0;
++    e->stats.wait_full_us = e->stats.wait_gather_us = e->stats.wait_prev_us = 0;
+     e->stats.cache_hits = e->stats.cache_saved = e->stats.cache_invalidated = 0;
+     e->stats.cache_sync_us = 0;
+     e->stats.priv_skipped = e->stats.priv_flushes = 0;
+@@ -6020,28 +6927,28 @@ void pvg_exec_object_deleted(PVGExec *e, uint32_t task, uint32_t id)
+     gpointer k, v;
+     gint64 key = key_of(task, id);
+ 
+-    bool waited = false;
++    ExecFrame *f = &e->fr[e->cur];
+ 
+     if (!id) {
+         return;
+     }
+-    /* a submission still running may use the pipelines and samplers: wait only for those */
++    /*
++     * Submissions still running may use its pipelines and samplers: they go with the frame
++     * being recorded, which completes after all of those (no wait for the GPU here)
++     */
+     g_hash_table_iter_init(&it, e->pipelines);
+     while (g_hash_table_iter_next(&it, &k, &v)) {
+         if (g_str_has_prefix(k, prefix)) {
+-            if (!waited) {
+-                queue_idle(e);
+-                waited = true;
+-            }
+-            g_hash_table_iter_remove(&it);
++            g_ptr_array_add(f->dead_pipes, v);
++            g_hash_table_iter_steal(&it);
++            g_free(k);
+         }
+     }
+     if (g_hash_table_lookup_extended(e->samplers, &key, NULL, &v)) {
+-        if (!waited) {
+-            queue_idle(e);
+-        }
+         if (v) {
+-            vkDestroySampler(e->gpu->device, (VkSampler)v, NULL);
++            VkSampler smp = (VkSampler)v;
++
++            g_array_append_val(f->dead_samplers, smp);
+         }
+         g_hash_table_remove(e->samplers, &key);
+     }
+@@ -6051,6 +6958,19 @@ void pvg_exec_object_deleted(PVGExec *e, uint32_t task, uint32_t id)
+ 
+         images_retire_matching(e, match_object, ti);
+     }
++    if (task == 0 && g_hash_table_size(e->backing_imgs)) {
++        /* a deleted backing's id comes back for another surface: never share these again */
++        g_hash_table_iter_init(&it, e->backing_imgs);
++        while (g_hash_table_iter_next(&it, &k, &v)) {
++            HostImage *hi = v;
++
++            if ((uint32_t)*(gint64 *)k == id) {
++                cache_drop(e, hi);
++                hi->bkey = 0;
++                g_hash_table_iter_remove(&it);
++            }
++        }
++    }
+ }
+ 
+ void pvg_exec_task_reset(PVGExec *e, uint32_t task)
+@@ -6094,6 +7014,26 @@ void pvg_exec_set_private_resident(PVGExec *e, bool on)
+     e->private_resident = on;
+ }
+ 
++void pvg_exec_set_defer_writeback(PVGExec *e, bool on)
++{
++    e->defer_wb = on;
++}
++
++void pvg_exec_set_async_visible(PVGExec *e, bool on)
++{
++    e->async_visible = on && e->timeline;
++}
++
++void pvg_exec_set_flag_cache(PVGExec *e, bool on)
++{
++    e->flag_cache = on;
++}
++
++void pvg_exec_set_share_surfaces(PVGExec *e, bool on)
++{
++    e->share_backings = on;
++}
++
+ void pvg_exec_set_upload_cache(PVGExec *e, bool on)
+ {
+     e->upload_cache = on && e->host.ram_runs && e->host.dirty_sync && e->host.dirty_test_clear &&
+@@ -6112,13 +7052,22 @@ const PVGExecStats *pvg_exec_stats(PVGExec *e)
+     return &e->stats;
+ }
+ 
+-static PVGExec *free_ctx;
+-
+ static void image_free(gpointer v)
+ {
+     HostImage *hi = v;
+     VkDevice d = free_ctx->gpu->device;
+ 
++    if (hi->refs > 1) {
++        hi->refs--;             /* the last table entry frees it */
++        return;
++    }
++    if (free_ctx->stale_owner) {
++        stale_clear(free_ctx, hi);
++    }
++    if (hi->stale_pages) {
++        g_array_free(hi->stale_pages, true);
++    }
++
+     if (hi->cached) {
+         g_ptr_array_remove_fast(free_ctx->cached, hi);
+         g_free(hi->runs);
+@@ -6159,7 +7108,7 @@ static bool frames_init(PVGExec *e, const VkCommandBufferAllocateInfo *cai)
+     VkDevice d = e->gpu->device;
+     VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+ 
+-    for (uint32_t i = 0; i < 2; i++) {
++    for (uint32_t i = 0; i < e->nframes; i++) {
+         ExecFrame *f = &e->fr[i];
+ 
+         if (vkAllocateCommandBuffers(d, cai, &f->cmd) != VK_SUCCESS ||
+@@ -6202,11 +7151,32 @@ PVGExec *pvg_exec_new(PVGGpu *gpu, const PVGExecHost *host)
+     e->priv_imgs = g_ptr_array_new();
+     e->pending = g_array_new(false, false, sizeof(uint64_t) * 4);
+     e->images = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, image_free);
+-    e->fr[0].retired = g_ptr_array_new();
+-    e->fr[1].retired = g_ptr_array_new();
++    e->backing_imgs = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
++    e->gpu_written = g_hash_table_new(g_direct_hash, g_direct_equal);
++    for (uint32_t i = 0; i < PVG_SCANOUT_BUFS; i++) {
++        e->scan[i].fd = -1;
++    }
++    e->nframes = g_getenv("PVG_FRAMES") ? CLAMP(atoi(g_getenv("PVG_FRAMES")), 2, MAX_FRAMES) : 2;
++    for (uint32_t i = 0; i < e->nframes; i++) {
++        e->fr[i].retired = g_ptr_array_new();
++        e->fr[i].dead_pipes = g_ptr_array_new_with_free_func(pipeline_free);
++        e->fr[i].dead_samplers = g_array_new(false, false, sizeof(VkSampler));
++    }
+     e->pool = g_ptr_array_new();
+     e->pipelines = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, pipeline_free);
+     e->spv_cache = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, spv_cache_free);
++    {
++        VkSemaphoreTypeCreateInfo stci = {
++            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
++            .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
++        };
++        VkSemaphoreCreateInfo sci2 = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
++                                       .pNext = &stci };
++
++        if (vkCreateSemaphore(gpu->device, &sci2, NULL, &e->timeline) != VK_SUCCESS) {
++            e->timeline = VK_NULL_HANDLE;
++        }
++    }
+     if (!g_getenv("PVG_NO_DISK_CACHE")) {
+         e->cache_dir = g_build_filename(g_get_user_cache_dir(), "pvg", NULL);
+         cache_prune(e->cache_dir);
+@@ -6277,8 +7247,14 @@ void pvg_exec_free(PVGExec *e)
+         image_free(g_ptr_array_index(e->pool, i));
+     }
+     g_ptr_array_free(e->pool, true);
+-    for (uint32_t i = 0; i < 2; i++) {
++    for (uint32_t i = 0; i < e->nframes; i++) {
+         g_ptr_array_free(e->fr[i].retired, true);
++        free_ctx = e;
++        g_ptr_array_free(e->fr[i].dead_pipes, true);
++        for (guint k = 0; k < e->fr[i].dead_samplers->len; k++) {
++            vkDestroySampler(d, g_array_index(e->fr[i].dead_samplers, VkSampler, k), NULL);
++        }
++        g_array_free(e->fr[i].dead_samplers, true);
+         if (e->fr[i].fence) {
+             vkDestroyFence(d, e->fr[i].fence, NULL);
+         }
+@@ -6286,8 +7262,22 @@ void pvg_exec_free(PVGExec *e)
+             vkDestroyFence(d, e->fr[i].gfence, NULL);
+         }
+     }
++    scanout_free(e);
++    if (e->timeline) {
++        vkDestroySemaphore(d, e->timeline, NULL);
++    }
+     zc_fini(e);
++    if (e->stale_owner) {
++        g_hash_table_destroy(e->stale_owner);
++        e->stale_owner = NULL;
++    }
+     g_free(e->zc_runs);
++    g_free(e->stale_bits);
++    g_free(e->page_seq);
++    g_free(e->page_sub);
++    g_free(e->block_sub);
++    g_free(e->block_seq);
++    g_free(e->block_stale);
+     for (int dir = 0; dir < 2; dir++) {
+         for (uint32_t k = 0; k < ZC_MAX_CHUNKS; k++) {
+             if (e->zc_acc[dir][k]) {
+@@ -6296,6 +7286,8 @@ void pvg_exec_free(PVGExec *e)
+         }
+     }
+     free_ctx = e;
++    g_hash_table_destroy(e->backing_imgs);
++    g_hash_table_destroy(e->gpu_written);
+     g_hash_table_destroy(e->images);
+     g_ptr_array_free(e->cached, true);
+     g_ptr_array_free(e->priv_imgs, true);
+diff --git a/hw/display/pvg/pvg-exec.h b/hw/display/pvg/pvg-exec.h
+index fc6fe2c..d6c4073 100644
+--- a/hw/display/pvg/pvg-exec.h
++++ b/hw/display/pvg/pvg-exec.h
+@@ -51,7 +51,15 @@ typedef struct PVGExecStats {
+     uint64_t uploads, writebacks, blits, skipped_passes, continuations, feedback_copies;
+     uint64_t compute_segments, dispatches;
+     uint64_t gpu_wait_us;       /* since pvg_exec_reset_wait() */
++    /* of it (and of submitting): full waits, waits for gathers, for the frame before */
++    uint64_t wait_full_us, wait_gather_us, wait_prev_us;
+     uint64_t spv_cache_hits, pipeline_us;   /* translations reused; time building pipelines */
++    uint64_t res_entries, res_modified, res_written, res_unknown;  /* resource-list flags */
++    uint64_t backing_shares;    /* IOSurface textures that found their backing's image */
++    uint64_t surface_reads;     /* presents read from the GPU image (not guest memory) */
++    uint64_t cache_aliased;     /* cached copies outdated through another mapping */
++    uint64_t async_visible;     /* guest-visible submissions completed asynchronously */
++    uint64_t pending_waits;     /* CPU accesses that waited for such a submission */
+     uint64_t spv_disk_hits;     /* translations read from the on-disk cache */
+     uint64_t vk_cache_loaded;   /* bytes of VkPipelineCache data loaded at start */
+     uint64_t damage_saved;      /* bytes not copied thanks to damage rectangles */
+@@ -80,6 +88,20 @@ void pvg_exec_set_damage_limit(PVGExec *e, bool on);
+ void pvg_exec_set_msaa(PVGExec *e, bool on);
+ /* keep textures on the GPU while their guest pages stay clean (needs the dirty callbacks) */
+ void pvg_exec_set_upload_cache(PVGExec *e, bool on);
++/*
++ * Keep uploaded textures while the guest does not report CPU writes to them (default on):
++ * pvg_exec_resources() with each command buffer's resource list, pvg_exec_modified() for
++ * InvalidateResources.
++ */
++void pvg_exec_set_flag_cache(PVGExec *e, bool on);
++void pvg_exec_resources(PVGExec *e, uint32_t task, const uint8_t *res, uint32_t n);
++/*
++ * One host image per IOSurface plane (and view shape) for the textures of every task, as
++ * Apple's host keeps one resource per backing: what one task renders, another samples
++ * without a trip through guest memory.
++ */
++void pvg_exec_set_share_surfaces(PVGExec *e, bool on);
++void pvg_exec_modified(PVGExec *e, uint32_t task, uint32_t id);
+ /* guest mappings of va..va+len in task changed (len 0: the whole task): drop cached textures */
+ void pvg_exec_cache_invalidate(PVGExec *e, uint32_t task, uint64_t va, uint64_t len);
+ /*
+@@ -94,6 +116,18 @@ void pvg_exec_cache_mark_stale(PVGExec *e);
+  * the memory is unmapped (pvg_exec_flush_range; len 0 = the whole task).
+  */
+ void pvg_exec_set_private_resident(PVGExec *e, bool on);
++/* the same for single-level render targets of every storage mode (needs private_resident) */
++void pvg_exec_set_defer_writeback(PVGExec *e, bool on);
++/*
++ * Command buffers whose guest-visible writes are GPU copies return without waiting for them:
++ * pvg_exec_take_visible() after a command buffer gives the timeline value to reach
++ * (pvg_exec_wait_seq, any thread) before the guest may see its completion. 0: complete.
++ */
++void pvg_exec_set_async_visible(PVGExec *e, bool on);
++uint64_t pvg_exec_take_visible(PVGExec *e);
++bool pvg_exec_wait_seq(PVGExec *e, uint64_t seq);
++/* every GPU write to guest memory submitted so far done */
++void pvg_exec_wait_writes(PVGExec *e);
+ /*
+  * Return from command buffers without guest-visible writes once they are submitted (and their
+  * guest-RAM gathers are done), recording the next one while the GPU still runs them.
+@@ -111,6 +145,18 @@ bool pvg_exec_set_zero_copy(PVGExec *e, bool import_ram, bool bar);
+ void pvg_exec_mapping_changed(PVGExec *e, uint32_t task, uint64_t va, uint64_t len);
+ void pvg_exec_synchronize(PVGExec *e, uint32_t task, uint32_t id);
+ void pvg_exec_flush_range(PVGExec *e, uint32_t task, uint64_t va, uint64_t len);
++/* dmabuf scanout buffers (for GL displays); a new generation replaces all of them */
++#define PVG_SCANOUT_BUFS 3
++typedef struct PVGScanout {
++    uint32_t width, height, stride, offset, generation;
++    uint64_t modifier;
++    int fd[PVG_SCANOUT_BUFS];   /* owned by the executor: dup() to keep */
++} PVGScanout;
++int pvg_exec_scanout(PVGExec *e, uint32_t task, uint64_t va, uint32_t width, uint32_t height,
++                     uint32_t row_bytes, PVGScanout *info);
++/* a present: the GPU-only contents of a BGRA surface into dst (false: read guest memory) */
++bool pvg_exec_read_surface(PVGExec *e, uint32_t task, uint64_t va, uint32_t width,
++                           uint32_t height, void *dst);
+ void pvg_exec_free(PVGExec *e);
+ void pvg_exec_reset_wait(PVGExec *e);
+ /* Execute one serialized Metal command buffer of a user task */
+diff --git a/hw/display/pvg/pvg-gpu.c b/hw/display/pvg/pvg-gpu.c
+index c7848de..5d25f11 100644
+--- a/hw/display/pvg/pvg-gpu.c
++++ b/hw/display/pvg/pvg-gpu.c
+@@ -30,9 +30,16 @@ int pvg_gpu_init(PVGGpu *g, bool validation, char *err, size_t errlen)
+ {
+     const char *layers[] = { "VK_LAYER_KHRONOS_validation" };
+     const char *inst_exts[] = { VK_EXT_DEBUG_UTILS_EXTENSION_NAME };
+-    /* host-pointer import last: optional (zero-copy access to guest RAM) */
+-    const char *dev_exts[] = { VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
+-                               VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME };
++    /*
++     * Optional after the first: host-pointer import (zero-copy access to guest RAM) and dmabuf
++     * export (scanout to GL displays), enabled when present
++     */
++    const char *dev_exts[6] = { VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME };
++    static const char *const dmabuf_exts[] = {
++        VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
++        VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
++    };
++    uint32_t ndev = 1;
+     VkApplicationInfo app = {
+         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "qemu-pvg-linux",
+         .apiVersion = VK_API_VERSION_1_3,
+@@ -140,7 +147,7 @@ int pvg_gpu_init(PVGGpu *g, bool validation, char *err, size_t errlen)
+     qci.queueFamilyIndex = g->queue_family;
+     {
+         VkExtensionProperties *ext;
+-        uint32_t next = 0;
++        uint32_t next = 0, ndmabuf = 0;
+ 
+         vkEnumerateDeviceExtensionProperties(g->phys, NULL, &next, NULL);
+         ext = calloc(next ? next : 1, sizeof(*ext));
+@@ -148,9 +155,21 @@ int pvg_gpu_init(PVGGpu *g, bool validation, char *err, size_t errlen)
+         for (uint32_t i = 0; i < next; i++) {
+             g->host_import |= !strcmp(ext[i].extensionName,
+                                       VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
++            for (size_t k = 0; k < (sizeof(dmabuf_exts) / sizeof(dmabuf_exts[0])); k++) {
++                ndmabuf += !strcmp(ext[i].extensionName, dmabuf_exts[k]);
++            }
+         }
+         free(ext);
+-        dci.enabledExtensionCount = g->host_import ? 2 : 1;
++        if (g->host_import) {
++            dev_exts[ndev++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
++        }
++        g->dmabuf = ndmabuf == (sizeof(dmabuf_exts) / sizeof(dmabuf_exts[0]));
++        if (g->dmabuf) {
++            for (size_t k = 0; k < (sizeof(dmabuf_exts) / sizeof(dmabuf_exts[0])); k++) {
++                dev_exts[ndev++] = dmabuf_exts[k];
++            }
++        }
++        dci.enabledExtensionCount = ndev;
+     }
+     r = vkCreateDevice(g->phys, &dci, NULL, &g->device);
+     if (r != VK_SUCCESS) {
+diff --git a/hw/display/pvg/pvg-gpu.h b/hw/display/pvg/pvg-gpu.h
+index 0c37e50..8120e01 100644
+--- a/hw/display/pvg/pvg-gpu.h
++++ b/hw/display/pvg/pvg-gpu.h
+@@ -22,6 +22,7 @@ typedef struct PVGGpu {
+     char name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
+     bool validation;
+     bool host_import;           /* VK_EXT_external_memory_host enabled */
++    bool dmabuf;                /* dmabuf export (external_memory_fd/dma_buf, drm modifiers) */
+     uint32_t validation_errors;
+ } PVGGpu;
+ 
+diff --git a/hw/display/trace-events b/hw/display/trace-events
+index 9ee3f19..c211333 100644
+--- a/hw/display/trace-events
++++ b/hw/display/trace-events
+@@ -257,10 +257,12 @@ pvg_linux_exec(const char *msg) "%s"
+ pvg_linux_exec_stats(uint64_t cmdbufs, uint64_t passes, uint64_t draws, uint64_t skipped, uint64_t pipelines, uint64_t pipe_fail, uint64_t writebacks, uint64_t blits, uint64_t feedback, uint64_t dispatches) "cmdbufs=%"PRIu64" passes=%"PRIu64" draws=%"PRIu64" skipped=%"PRIu64" pipelines=%"PRIu64" failed=%"PRIu64" writebacks=%"PRIu64" blits=%"PRIu64" feedback=%"PRIu64" dispatches=%"PRIu64
+ pvg_linux_exec_time(uint64_t cmdbufs, int64_t exec_ms, int64_t wall_ms, int64_t max_us, int64_t read_ms, uint64_t read_mb, int64_t write_ms, uint64_t write_mb, uint64_t wait_ms) "cmdbufs=%"PRIu64" exec %"PRId64" ms of %"PRId64" ms wall, slowest %"PRId64" us; guest read %"PRId64" ms %"PRIu64" MiB, write %"PRId64" ms %"PRIu64" MiB, gpu wait %"PRIu64" ms"
+ pvg_linux_exec_pipelines(uint64_t pipe_ms, uint64_t spv_hits, uint64_t spv_disk, uint64_t damage_mb) "building pipelines %"PRIu64" ms, translations reused %"PRIu64" (from disk %"PRIu64"), damage rectangles saved %"PRIu64" MiB"
+-pvg_linux_exec_cache(uint64_t hits, uint64_t saved_mb, uint64_t dropped, uint64_t sync_ms, int64_t kvm_ms) "upload cache: %"PRIu64" hits, %"PRIu64" MiB not uploaded, %"PRIu64" dropped, sync %"PRIu64" ms (KVM log %"PRId64" ms)"
+-pvg_linux_exec_private(uint64_t skipped_mb, uint64_t flushes, uint64_t gpu_mipmaps) "private textures: %"PRIu64" MiB not copied, %"PRIu64" flushes; %"PRIu64" GPU mipmaps"
++pvg_linux_exec_cache(uint64_t hits, uint64_t saved_mb, uint64_t dropped, uint64_t aliased, int64_t kvm_ms, uint64_t entries, uint64_t modified, uint64_t written, uint64_t unknown) "upload cache: %"PRIu64" hits, %"PRIu64" MiB not uploaded, %"PRIu64" dropped (%"PRIu64" written through other mappings, KVM log %"PRId64" ms); resources %"PRIu64", CPU-modified %"PRIu64", GPU-written %"PRIu64", unresolved %"PRIu64
++pvg_linux_exec_private(uint64_t skipped_mb, uint64_t flushes, uint64_t gpu_mipmaps, uint64_t surface_reads) "private textures: %"PRIu64" MiB not copied, %"PRIu64" flushes; %"PRIu64" GPU mipmaps; %"PRIu64" presents read from the GPU"
++pvg_linux_exec_latency(uint32_t doorbells, int64_t doorbell_us, uint32_t drains, int64_t drain_ms, int64_t cbread_ms, int64_t queue_us, int64_t bh_us, int64_t guest_us, int64_t guest_ms) "%u doorbells, %"PRId64" us each on the vCPU (%u drains %"PRId64" ms, reading command buffers %"PRId64" ms); queued %"PRId64" us; done->stamp %"PRId64" us; stamp->next doorbell %"PRId64" us (%"PRId64" ms total)"
++pvg_linux_exec_waits(uint64_t full_ms, uint64_t gather_ms, uint64_t prev_ms) "GPU waits: full %"PRIu64" ms, gathers %"PRIu64" ms, previous frame %"PRIu64" ms"
+ pvg_linux_exec_zc(uint64_t gathered_mb, uint64_t scattered_mb, uint64_t fallbacks, uint64_t bar_mb) "zero-copy: %"PRIu64" MiB gathered, %"PRIu64" MiB scattered by the GPU, %"PRIu64" CPU fallbacks, %"PRIu64" MiB CPU-written to VRAM"
+-pvg_linux_exec_alloc(uint64_t creates, uint64_t pool_hits, uint64_t queue_waits, uint64_t early, uint64_t early_gathers) "host images: %"PRIu64" created, %"PRIu64" reused; %"PRIu64" queue waits; %"PRIu64" early completions (%"PRIu64" after gathers)"
++pvg_linux_exec_alloc(uint64_t creates, uint64_t pool_hits, uint64_t shares, uint64_t queue_waits, uint64_t early, uint64_t early_gathers) "host images: %"PRIu64" created, %"PRIu64" reused, %"PRIu64" shared IOSurface views; %"PRIu64" queue waits; %"PRIu64" early completions (%"PRIu64" after gathers)"
+ pvg_linux_child_poke(uint32_t index, uint32_t written, uint32_t read, uint32_t length) "child FIFO %u written=0x%x read=0x%x length=0x%x"
+ pvg_linux_cmd_stub(uint32_t op) "op=0x%02x not implemented, completed"
+ pvg_linux_signal_stamp(uint32_t index, uint32_t value) "stamps[%u]=%u"
+-- 
+2.43.0
+

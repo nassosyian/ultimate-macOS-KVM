@@ -1,0 +1,73 @@
+From 5df97f1fc4f2da61d26f12213483cda7f33982bc Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Sat, 31 Oct 2026 13:54:18 +0200
+Subject: [PATCH] hw/display/pvg: match chroma planes of odd-sized YCbCr
+ surfaces
+
+IOSurface views carry plane index 0 even for the chroma plane, and the
+plane is found by size. A 4:2:0 surface with an odd width (TV app posters,
+667x1000) has a 334x500 chroma plane, but its RG8 view is 333x500, so no
+plane matched and the view read the luma plane: posters came out green and
+magenta. A plane up to one pixel larger now matches too, if its bytes per
+pixel match the view's format.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/pvg-exec.c | 23 +++++++++++++++++------
+ 1 file changed, 17 insertions(+), 6 deletions(-)
+
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index 27cb577..40c8f7a 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -1280,23 +1280,32 @@ static bool guest_image_ex(PVGExec *e, uint32_t task, uint32_t ref, int level, u
+          * The plane index is 0 even for views of other planes (an NV12 surface's RG8 chroma
+          * view): pick the plane whose size and pixel size match the view when plane 0 does
+          * not. Size alone is ambiguous for 4:4:4 surfaces, whose planes are all full size.
++         * Subsampled planes of odd-sized surfaces round up (a 667x1000 4:2:0 surface has a
++         * 334x500 chroma plane) while the view rounds down (333x500): a plane up to one pixel
++         * larger matches as well, if its pixel size does.
+          */
+         {
+-            uint32_t vbpp = 0, nplanes = ldl(bobj + 0x10);
++            uint32_t vbpp = 0, nplanes = ldl(bobj + 0x10), vw = ldl(desc + 4), vh = ldl(desc + 8);
+             VkComponentMapping vswz;
+-            const uint8_t *by_size = NULL;
++            const uint8_t *by_size = NULL, *near = NULL;
+ 
+             mtl_pixel_format(lduw(desc + 2), &vbpp, &vswz);
+             /* k = 0: the given plane, then every plane in order */
+-            for (uint32_t k = 0; ldl(desc + 4) && k <= nplanes &&
+-                 0x14 + 16 * k <= MIN(blen, MAX_OBJ); k++) {
++            for (uint32_t k = 0; vw && k <= nplanes && 0x14 + 16 * k <= MIN(blen, MAX_OBJ);
++                 k++) {
+                 const uint8_t *cand = k ? bobj + 0x14 + 16 * (k - 1) : pl;
++                uint32_t cw = ldl(cand + 4), ch = ldl(cand + 8);
++                bool bpp_ok = !vbpp || ldl(cand + 12) >> 24 == vbpp;
+ 
+-                if (ldl(cand + 4) != ldl(desc + 4) || ldl(cand + 8) != ldl(desc + 8)) {
++                if (cw != vw || ch != vh) {
++                    if (!near && bpp_ok && cw >= vw && cw <= vw + 1 && ch >= vh && ch <= vh + 1) {
++                        near = cand;
++                    }
+                     continue;
+                 }
+-                if (!vbpp || ldl(cand + 12) >> 24 == vbpp) {
++                if (bpp_ok) {
+                     by_size = NULL;
++                    near = NULL;
+                     pl = cand;
+                     break;
+                 }
+@@ -1304,6 +1313,8 @@ static bool guest_image_ex(PVGExec *e, uint32_t task, uint32_t ref, int level, u
+             }
+             if (by_size) {
+                 pl = by_size;
++            } else if (near) {
++                pl = near;
+             }
+         }
+         gi->task = 0;
+-- 
+2.43.0
+

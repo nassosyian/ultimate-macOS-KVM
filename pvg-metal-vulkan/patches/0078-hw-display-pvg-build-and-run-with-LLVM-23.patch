@@ -1,0 +1,174 @@
+From eefba552116f47220ec8ae88fa516867d557c587 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Sat, 31 Oct 2026 17:42:06 +0200
+Subject: [PATCH] hw/display/pvg: build and run with LLVM 23
+
+LLVM 23 split the br opcode into LLVMUncondBr/LLVMCondBr, removed the
+mergereturn pass (replaced by merge_exits() using the C API before
+structurizecfg) and represents vector splats as vector-typed
+ConstantInt/ConstantFP (expanded to OpConstantComposite).
+Still builds with LLVM 19. Corpus: 272/272 translate + spirv-val.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/air2spv.c | 111 +++++++++++++++++++++++++++++++++++----
+ 1 file changed, 100 insertions(+), 11 deletions(-)
+
+diff --git a/hw/display/pvg/air2spv.c b/hw/display/pvg/air2spv.c
+index 0f3278a..a782703 100644
+--- a/hw/display/pvg/air2spv.c
++++ b/hw/display/pvg/air2spv.c
+@@ -17,6 +17,7 @@
+ #include <llvm-c/Core.h>
+ #include <llvm-c/Target.h>
+ #include <llvm-c/Transforms/PassBuilder.h>
++#include <llvm/Config/llvm-config.h>
+ 
+ #include "air2spv.h"
+ #include "spv.h"
+@@ -269,6 +270,23 @@ static uint32_t const_val(Ctx *c, LLVMValueRef v)
+         }
+         return spv_const(&c->m, SpvOpConstantNull, tid, NULL, 0);
+     }
++    if (LLVMGetTypeKind(t) == LLVMVectorTypeKind && (LLVMIsAConstantInt(v) || LLVMIsAConstantFP(v))) {
++        /* LLVM 23 splats are vector-typed ConstantInt/ConstantFP: expand to a composite */
++        LLVMTypeRef et = LLVMGetElementType(t);
++        unsigned n = LLVMGetVectorSize(t);
++        uint32_t ops[64], e;
++        LLVMBool loses;
++
++        if (n > 64) {
++            return fail(c, "constant aggregate too large"), 0;
++        }
++        e = const_val(c, LLVMIsAConstantInt(v) ? LLVMConstInt(et, LLVMConstIntGetZExtValue(v), 0) :
++                                                 LLVMConstReal(et, LLVMConstRealGetDouble(v, &loses)));
++        for (unsigned i = 0; i < n; i++) {
++            ops[i] = e;
++        }
++        return spv_const(&c->m, SpvOpConstantComposite, tid, ops, n);
++    }
+     if (LLVMIsAConstantInt(v)) {
+         unsigned w = LLVMGetIntTypeWidth(t);
+         uint64_t x = LLVMConstIntGetZExtValue(v);
+@@ -2956,7 +2974,12 @@ static int instruction(Ctx *c, Cfg *g, int bi, LLVMValueRef inst)
+         emit(c, SpvOpPhi, tid, r, ops, 2 * n);
+         return 0;
+     }
++#if LLVM_VERSION_MAJOR >= 23
++    case LLVMUncondBr: /* LLVM 23 split br into two opcodes */
++    case LLVMCondBr:
++#else
+     case LLVMBr:
++#endif
+         if (g->loop_merge[bi] >= 0) {
+             ops[0] = label(c, g->bb[g->loop_merge[bi]]);
+             ops[1] = g->cont_label[g->loop_continue[bi]];
+@@ -3179,12 +3202,77 @@ const void *air2spv_metallib_bitcode(const void *lib, size_t liblen, size_t *bcl
+     return NULL;
+ }
+ 
++/*
++ * Give a function a single block for each kind of exit (ret, unreachable), as the
++ * mergereturn pass did before LLVM 23 removed it: structurizecfg needs one exit.
++ */
++static void merge_exits(LLVMContextRef ctx, LLVMValueRef f, LLVMOpcode op)
++{
++    unsigned n = 0, nbb = LLVMCountBasicBlocks(f);
++    LLVMBasicBlockRef *bbs = calloc(nbb, sizeof(*bbs)), nb;
++    LLVMTypeRef rt = LLVMGetReturnType(LLVMGlobalGetValueType(f));
++    LLVMValueRef phi = NULL;
++    LLVMBuilderRef b;
++
++    for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(f); bb; bb = LLVMGetNextBasicBlock(bb)) {
++        LLVMValueRef t = LLVMGetBasicBlockTerminator(bb);
++
++        if (t && LLVMGetInstructionOpcode(t) == op) {
++            bbs[n++] = bb;
++        }
++    }
++    if (n < 2) {
++        free(bbs);
++        return;
++    }
++    b = LLVMCreateBuilderInContext(ctx);
++    nb = LLVMAppendBasicBlockInContext(ctx, f, op == LLVMRet ? "UnifiedReturnBlock" :
++                                                               "UnifiedUnreachableBlock");
++    LLVMPositionBuilderAtEnd(b, nb);
++    if (op == LLVMUnreachable) {
++        LLVMBuildUnreachable(b);
++    } else if (LLVMGetTypeKind(rt) == LLVMVoidTypeKind) {
++        LLVMBuildRetVoid(b);
++    } else {
++        phi = LLVMBuildPhi(b, rt, "UnifiedRetVal");
++        LLVMBuildRet(b, phi);
++    }
++    for (unsigned i = 0; i < n; i++) {
++        LLVMValueRef t = LLVMGetBasicBlockTerminator(bbs[i]);
++
++        if (phi) {
++            LLVMValueRef v = LLVMGetOperand(t, 0);
++
++            LLVMAddIncoming(phi, &v, &bbs[i], 1);
++        }
++        LLVMInstructionEraseFromParent(t);
++        LLVMPositionBuilderAtEnd(b, bbs[i]);
++        LLVMBuildBr(b, nb);
++    }
++    LLVMDisposeBuilder(b);
++    free(bbs);
++}
++
++static int run_passes(Ctx *c, const char *passes)
++{
++    LLVMPassBuilderOptionsRef pbo = LLVMCreatePassBuilderOptions();
++    LLVMErrorRef perr = LLVMRunPasses(c->mod, passes, NULL, pbo);
++
++    LLVMDisposePassBuilderOptions(pbo);
++    if (perr) {
++        char *msg = LLVMGetErrorMessage(perr);
++
++        fail(c, "LLVM passes: %s", msg);
++        LLVMDisposeErrorMessage(msg);
++        return -1;
++    }
++    return 0;
++}
++
+ int air2spv_translate(const void *bitcode, size_t len, A2SResult *io)
+ {
+     Ctx c = { 0 };
+     LLVMMemoryBufferRef buf;
+-    LLVMPassBuilderOptionsRef pbo;
+-    LLVMErrorRef perr;
+     int ret = -1;
+ 
+     io->error[0] = 0;
+@@ -3221,15 +3309,16 @@ int air2spv_translate(const void *bitcode, size_t len, A2SResult *io)
+                                     LLVMCreateEnumAttribute(c.llctx, ai, 0));
+         }
+     }
+-    pbo = LLVMCreatePassBuilderOptions();
+-    perr = LLVMRunPasses(c.mod, "always-inline,cgscc(inline),function(lower-switch,mergereturn,"
+-                         "fix-irreducible,unify-loop-exits,structurizecfg)", NULL, pbo);
+-    LLVMDisposePassBuilderOptions(pbo);
+-    if (perr) {
+-        char *msg = LLVMGetErrorMessage(perr);
+-
+-        fail(&c, "LLVM passes: %s", msg);
+-        LLVMDisposeErrorMessage(msg);
++    if (run_passes(&c, "always-inline,cgscc(inline),function(lower-switch)")) {
++        goto out_mod;
++    }
++    for (LLVMValueRef f = LLVMGetFirstFunction(c.mod); f; f = LLVMGetNextFunction(f)) {
++        if (!LLVMIsDeclaration(f)) {
++            merge_exits(c.llctx, f, LLVMUnreachable);
++            merge_exits(c.llctx, f, LLVMRet);
++        }
++    }
++    if (run_passes(&c, "function(fix-irreducible,unify-loop-exits,structurizecfg)")) {
+         goto out_mod;
+     }
+     c.td = LLVMGetModuleDataLayout(c.mod);
+-- 
+2.56.0
+

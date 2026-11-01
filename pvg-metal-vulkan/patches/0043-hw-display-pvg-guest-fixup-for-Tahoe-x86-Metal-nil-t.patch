@@ -1,0 +1,340 @@
+From 36f7aa63070e2e10ebca385b94d258ca3b5fcfe8 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 23:56:19 +0200
+Subject: [PATCH 43/54] hw/display/pvg: guest fixup for Tahoe x86 Metal nil
+ targetDeviceArchitecture abort
+
+AppleParavirtGPUMetal.bundle (x86 plugin) does not implement
+targetDeviceArchitecture; loading any MTLBinaryArchive aborts in
++[MTLLoader sliceIDForDevice:...] so iconservicesagent, Spotlight and Dock
+extras crash-loop (blank icons). A background thread finds the assertion's
+.cold.1 function in guest RAM and makes it return (slice 0, RenderBox compiles
+shaders from source). Property guest-fixups (default on).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/meson.build            |   4 +-
+ hw/display/pvg-linux-pci.c        |   9 ++
+ hw/display/pvg/pvg-guest-fixups.c | 220 ++++++++++++++++++++++++++++++
+ hw/display/pvg/pvg-guest-fixups.h |  17 +++
+ 4 files changed, 248 insertions(+), 2 deletions(-)
+ create mode 100644 hw/display/pvg/pvg-guest-fixups.c
+ create mode 100644 hw/display/pvg/pvg-guest-fixups.h
+
+diff --git a/hw/display/meson.build b/hw/display/meson.build
+index aafcb82..e9722e9 100644
+--- a/hw/display/meson.build
++++ b/hw/display/meson.build
+@@ -69,10 +69,10 @@ pvg_llvm = dependency('llvm', version: '>=19', method: 'config-tool', required:
+ if pvg_vulkan.found() and pvg_llvm.found()
+   system_ss.add(when: 'CONFIG_PVG_LINUX_PCI',
+                 if_true: [files('pvg-linux-pci.c', 'pvg/pvg-gpu.c', 'pvg/pvg-exec.c', 'pvg/air2spv.c',
+-                                'pvg/spv.c'),
++                                'pvg/spv.c', 'pvg/pvg-guest-fixups.c'),
+                           pvg_vulkan, pvg_llvm])
+ else
+-  system_ss.add(when: 'CONFIG_PVG_LINUX_PCI', if_true: files('pvg-linux-pci.c'))
++  system_ss.add(when: 'CONFIG_PVG_LINUX_PCI', if_true: files('pvg-linux-pci.c', 'pvg/pvg-guest-fixups.c'))
+ endif
+ 
+ if config_all_devices.has_key('CONFIG_VIRTIO_GPU')
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index 09f187d..637a127 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -30,6 +30,7 @@
+ #include "pvg-linux-cmds.h"
+ #include "pvg/pvg-gpu.h"
+ #include "pvg/pvg-exec.h"
++#include "pvg/pvg-guest-fixups.h"
+ 
+ #define TYPE_PVG_LINUX_PCI "pvg-linux-pci"
+ OBJECT_DECLARE_SIMPLE_TYPE(PVGLinuxPCIState, PVG_LINUX_PCI)
+@@ -259,6 +260,8 @@ struct PVGLinuxPCIState {
+     int64_t exec_us, exec_max_us, exec_window_start;   /* executor time per 500 cmdbufs */
+     int64_t exec_read_us, exec_write_us;            /* ... of it copying guest memory */
+     uint64_t exec_read_bytes, exec_write_bytes;
++    bool guest_fixups_enable;
++    PVGGuestFixups *guest_fixups;   /* patches for guest-side x86 PVG bugs */
+     QEMUTimer *efi_timer;           /* EFI display scanout while the GOP driver owns the screen */
+     int64_t fps_start;              /* frame-rate window (realtime ms) */
+     uint32_t fps_frames;
+@@ -1841,6 +1844,9 @@ static void pvg_linux_realize(PCIDevice *dev, Error **errp)
+     if (msi_init(dev, 0, s->msi_vectors, true, false, errp)) {
+         return;
+     }
++    if (s->guest_fixups_enable) {
++        s->guest_fixups = pvg_guest_fixups_start(pvg_exec_log, s);
++    }
+     if (s->display_ports) {
+         s->con = qemu_graphic_console_create(DEVICE(dev), 0, &pvg_display_ops,
+                                              s);
+@@ -1890,6 +1896,8 @@ static void pvg_linux_exit(PCIDevice *dev)
+         pvg_gpu_fini(&s->gpu);
+         s->gpu_ok = false;
+     }
++    pvg_guest_fixups_stop(s->guest_fixups);
++    s->guest_fixups = NULL;
+     if (s->con) {
+         qemu_graphic_console_close(s->con);
+     }
+@@ -1926,6 +1934,7 @@ static const Property pvg_linux_properties[] = {
+     DEFINE_PROP_UINT32("msi-vectors", PVGLinuxPCIState, msi_vectors, 1),
+     /* guestDisplayPortCount (0x122c); only port 0 is implemented */
+     DEFINE_PROP_UINT32("display-ports", PVGLinuxPCIState, display_ports, 1),
++    DEFINE_PROP_BOOL("guest-fixups", PVGLinuxPCIState, guest_fixups_enable, true),
+     DEFINE_PROP_BOOL("gpu", PVGLinuxPCIState, gpu_enable, true),
+     DEFINE_PROP_BOOL("gpu-validation", PVGLinuxPCIState, gpu_validation, false),
+     DEFINE_PROP_BOOL("exec", PVGLinuxPCIState, exec_enable, true),
+diff --git a/hw/display/pvg/pvg-guest-fixups.c b/hw/display/pvg/pvg-guest-fixups.c
+new file mode 100644
+index 0000000..c13453a
+--- /dev/null
++++ b/hw/display/pvg/pvg-guest-fixups.c
+@@ -0,0 +1,220 @@
++/*
++ * Work around guest-side bugs of the x86 paravirtual GPU stack by patching guest memory.
++ *
++ * macOS 26 (Tahoe) x86: AppleParavirtGPUMetal.bundle (the Metal plugin of the PCI
++ * AppleParavirtGPU.kext) does not implement -[MTLDevice targetDeviceArchitecture], so the
++ * _MTLDevice default returns nil. Loading any MTLBinaryArchive then aborts in
++ * +[MTLLoader sliceIDForDevice:legacyDriverVersion:airntDriverVersion:] ("Target device
++ * architecture is nil"): iconservicesagent, Spotlight and Dock extras crash-loop every ~10 s
++ * (blank app icons, invisible Spotlight). The assertion lives in a .cold.1 outlined function
++ * that the caller returns from; turning its first instruction into `ret` makes the loader
++ * continue with a nil architecture (slice id 0: no archive slice matches and RenderBox
++ * compiles the shaders from source, as on a device without binary archives).
++ *
++ * The shared cache text is shared by every process and stays resident, but a clean page can
++ * be dropped and read back from disk, so a background thread scans guest RAM for each
++ * signature and re-checks the patched sites every few seconds.
++ *
++ * Copyright (c) 2026
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/thread.h"
++#include "qemu/units.h"
++#include "qemu/rcu.h"
++#include "system/ramlist.h"
++#include "system/ramblock.h"
++#include "pvg-guest-fixups.h"
++
++typedef struct GuestFixup {
++    const char *name;
++    const uint8_t *sig;
++    size_t sig_len;
++    size_t patch_off;
++    const uint8_t *patch;
++    size_t patch_len;
++} GuestFixup;
++
++/* +[MTLLoader sliceIDForDevice:legacyDriverVersion:airntDriverVersion:].cold.1, Metal 26.x */
++static const uint8_t slice_cold_sig[] = {
++    0x55, 0x48, 0x89, 0xe5,                     /* push rbp; mov rbp, rsp */
++    0x48, 0x8d, 0x35, 0x5b, 0x18, 0x04, 0x00,   /* lea rsi, [rip + "+[MTLLoader slice..."] */
++    0x48, 0x8d, 0x0d, 0x43, 0xe6, 0xb3, 0x31,   /* lea rcx, [rip + @"Target device ..."] */
++    0x31, 0xff,                                 /* xor edi, edi */
++    0xba, 0xb4, 0x02, 0x00, 0x00,               /* mov edx, 0x2b4 (line) */
++    0x31, 0xc0, 0x5d,                           /* xor eax, eax; pop rbp */
++    0xe9, 0x4d, 0x30, 0xfc, 0xff,               /* jmp _MTLReportFailure */
++};
++static const uint8_t ret_insn[] = { 0xc3 };
++
++static const GuestFixup fixups[] = {
++    { "Metal sliceIDForDevice nil-architecture assertion", slice_cold_sig,
++      sizeof(slice_cold_sig), 0, ret_insn, sizeof(ret_insn) },
++};
++
++#define MAX_SITES       16
++#define CHECK_MS        3000
++#define SCAN_MISSING_MS 5000
++#define RESCAN_MS       60000
++
++struct PVGGuestFixups {
++    QemuThread thread;
++    QemuMutex lock;
++    QemuCond cond;
++    bool stop;
++    PVGGuestFixupLog log;
++    void *log_opaque;
++    uint8_t *sites[ARRAY_SIZE(fixups)][MAX_SITES];
++    unsigned nsites[ARRAY_SIZE(fixups)];
++    uint64_t patches;
++};
++
++static void fx_log(PVGGuestFixups *f, const char *fmt, ...) G_GNUC_PRINTF(2, 3);
++static void fx_log(PVGGuestFixups *f, const char *fmt, ...)
++{
++    g_autofree char *msg = NULL;
++    va_list ap;
++
++    va_start(ap, fmt);
++    msg = g_strdup_vprintf(fmt, ap);
++    va_end(ap);
++    if (f->log) {
++        f->log(f->log_opaque, msg);
++    }
++}
++
++typedef struct ScanCtx {
++    PVGGuestFixups *f;
++    unsigned found;
++} ScanCtx;
++
++static void apply(PVGGuestFixups *f, unsigned i, uint8_t *site, uint64_t offset)
++{
++    const GuestFixup *fx = &fixups[i];
++
++    memcpy(site + fx->patch_off, fx->patch, fx->patch_len);
++    smp_mb();
++    f->patches++;
++    fx_log(f, "guest fixup: %s patched at ram offset 0x%" PRIx64 " (patch #%" PRIu64 ")",
++           fx->name, offset, f->patches);
++}
++
++static bool is_patched(const GuestFixup *fx, const uint8_t *site)
++{
++    return !memcmp(site + fx->patch_off, fx->patch, fx->patch_len) &&
++           !memcmp(site + fx->patch_off + fx->patch_len,
++                   fx->sig + fx->patch_off + fx->patch_len,
++                   fx->sig_len - fx->patch_off - fx->patch_len);
++}
++
++static int scan_block(RAMBlock *rb, void *opaque)
++{
++    ScanCtx *c = opaque;
++    PVGGuestFixups *f = c->f;
++    uint8_t *base = qemu_ram_get_host_addr(rb);
++    ram_addr_t len = qemu_ram_get_used_length(rb);
++
++    if (!base || len < 256 * MiB) {
++        return 0;       /* ROMs, VGA RAM, option ROMs: not guest system RAM */
++    }
++    for (unsigned i = 0; i < ARRAY_SIZE(fixups); i++) {
++        const GuestFixup *fx = &fixups[i];
++        uint8_t *p = base, *end = base + len;
++
++        while (p < end) {
++            uint8_t *hit = memmem(p, end - p, fx->sig, fx->sig_len);
++
++            if (!hit) {
++                break;
++            }
++            c->found++;
++            if (f->nsites[i] < MAX_SITES) {
++                bool known = false;
++
++                for (unsigned k = 0; k < f->nsites[i]; k++) {
++                    known |= f->sites[i][k] == hit;
++                }
++                if (!known) {
++                    f->sites[i][f->nsites[i]++] = hit;
++                }
++            }
++            apply(f, i, hit, hit - base);
++            p = hit + fx->sig_len;
++        }
++    }
++    return 0;
++}
++
++static void *fixup_thread(void *opaque)
++{
++    PVGGuestFixups *f = opaque;
++    int64_t last_scan = INT64_MIN / 2;
++
++    rcu_register_thread();
++    qemu_mutex_lock(&f->lock);
++    while (!f->stop) {
++        int64_t now = g_get_monotonic_time() / 1000;
++        bool missing = false;
++
++        /*
++         * Known sites: still patched, or the original bytes again (the page was read back
++         * from disk: patch it again); anything else means the page now holds other data.
++         */
++        for (unsigned i = 0; i < ARRAY_SIZE(fixups); i++) {
++            for (unsigned k = 0; k < f->nsites[i];) {
++                uint8_t *site = f->sites[i][k];
++
++                if (is_patched(&fixups[i], site)) {
++                    k++;
++                } else if (!memcmp(site, fixups[i].sig, fixups[i].sig_len)) {
++                    apply(f, i, site, 0);
++                    k++;
++                } else {
++                    f->sites[i][k] = f->sites[i][--f->nsites[i]];
++                }
++            }
++            missing |= !f->nsites[i];
++        }
++        /* full scans are expensive (all of guest RAM): often until found, then rarely */
++        if (now - last_scan >= (missing ? SCAN_MISSING_MS : RESCAN_MS)) {
++            ScanCtx c = { .f = f };
++
++            last_scan = now;
++            WITH_RCU_READ_LOCK_GUARD() {
++                qemu_ram_foreach_block(scan_block, &c);
++            }
++        }
++        qemu_cond_timedwait(&f->cond, &f->lock, CHECK_MS);
++    }
++    qemu_mutex_unlock(&f->lock);
++    rcu_unregister_thread();
++    return NULL;
++}
++
++PVGGuestFixups *pvg_guest_fixups_start(PVGGuestFixupLog log, void *opaque)
++{
++    PVGGuestFixups *f = g_new0(PVGGuestFixups, 1);
++
++    f->log = log;
++    f->log_opaque = opaque;
++    qemu_mutex_init(&f->lock);
++    qemu_cond_init(&f->cond);
++    qemu_thread_create(&f->thread, "pvg-fixups", fixup_thread, f, QEMU_THREAD_JOINABLE);
++    return f;
++}
++
++void pvg_guest_fixups_stop(PVGGuestFixups *f)
++{
++    if (!f) {
++        return;
++    }
++    qemu_mutex_lock(&f->lock);
++    f->stop = true;
++    qemu_cond_signal(&f->cond);
++    qemu_mutex_unlock(&f->lock);
++    qemu_thread_join(&f->thread);
++    qemu_cond_destroy(&f->cond);
++    qemu_mutex_destroy(&f->lock);
++    g_free(f);
++}
+diff --git a/hw/display/pvg/pvg-guest-fixups.h b/hw/display/pvg/pvg-guest-fixups.h
+new file mode 100644
+index 0000000..8ee91e2
+--- /dev/null
++++ b/hw/display/pvg/pvg-guest-fixups.h
+@@ -0,0 +1,17 @@
++/*
++ * Guest-memory patches for bugs in the guest's x86 paravirtual GPU stack.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_DISPLAY_PVG_GUEST_FIXUPS_H
++#define HW_DISPLAY_PVG_GUEST_FIXUPS_H
++
++typedef struct PVGGuestFixups PVGGuestFixups;
++typedef void (*PVGGuestFixupLog)(void *opaque, const char *msg);
++
++/* Start the background thread that finds and patches known guest bugs in guest RAM */
++PVGGuestFixups *pvg_guest_fixups_start(PVGGuestFixupLog log, void *opaque);
++void pvg_guest_fixups_stop(PVGGuestFixups *f);
++
++#endif
+-- 
+2.43.0
+

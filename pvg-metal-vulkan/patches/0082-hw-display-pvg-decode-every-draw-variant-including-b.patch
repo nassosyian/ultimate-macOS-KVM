@@ -1,0 +1,146 @@
+From e3f6741c8e7527680395b5f6504315cd74030a78 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Sun, 1 Nov 2026 00:02:31 +0200
+Subject: [PATCH 1/2] hw/display/pvg: decode every draw variant, including base
+ instance
+
+Draws with a base instance (0x04/0x05, 0x0a/0x0b, 0x1c/0x1d) and the 64-bit
+forms (0x00, 0x02, 0x08) were unhandled and skipped, so wgpu's
+draw(.., first_instance..) never ran. Layouts from the
+PGDeserializerRenderDecoder decoders; the indexed Base variants put the
+index buffer offset before the count.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/pvg-exec.c | 84 ++++++++++++++++++++++++++-------------
+ 1 file changed, 56 insertions(+), 28 deletions(-)
+
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index 3c2a459..6c69786 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -3891,8 +3891,7 @@ static VkRect2D segment_damage(const uint8_t *p, uint32_t off, uint32_t len, uin
+             sy0 = (int64_t)ldq(r + 8);
+             sx1 = sx0 + (int64_t)ldq(r + 16);
+             sy1 = sy0 + (int64_t)ldq(r + 24);
+-        } else if (id == 0x01 || id == 0x03 || id == 0x06 || id == 0x07 || id == 0x09 ||
+-                   id == 0x10 || id == 0x11) {
++        } else if (id <= 0x0b || id == 0x10 || id == 0x11 || id == 0x1c || id == 0x1d) {
+             dx0 = MIN(dx0, MAX(vx0, sx0));
+             dy0 = MIN(dy0, MAX(vy0, sy0));
+             dx1 = MAX(dx1, MIN(vx1, sx1));
+@@ -5287,15 +5286,26 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                                          { (uint32_t)ldq(a + 16), (uint32_t)ldq(a + 24) } };
+             }
+             break;
+-        case 0x01: case 0x07: case 0x03: case 0x09: case 0x06: case 0x10: case 0x11: {
++        case 0x00: case 0x01: case 0x02: case 0x03: case 0x04: case 0x05: case 0x06: case 0x07:
++        case 0x08: case 0x09: case 0x0a: case 0x0b: case 0x10: case 0x11: case 0x1c: case 0x1d: {
+             /*
+-             * Draw[Indexed][Instanced]Primitives16, layouts from the PGDeserializerRenderDecoder
+-             * decoders: 0x01 {u32 prim, u16 start, u16 count}; 0x03 {u16 start, u16 count,
+-             * u16 instances, u16 prim}; 0x07/0x09 {u16 prim, u16 indexType, u32 ib,
+-             * u16 count, u16 offset[, u16 instances]}; 0x06 DrawIndexedPrimitives64 {u16 prim,
+-             * u16 indexType, u32 ib, u64 count, u64 offset}
++             * Draw[Indexed][Instanced][Base]Primitives{64,16}, layouts from the
++             * PGDeserializerRenderDecoder decoders (packed):
++             *   0x00 {u32 prim, u64 start, u64 count}; 0x01 {u32 prim, u16 start, u16 count}
++             *   0x02/0x03 {start, count, instances, u16 prim}, u64/u16 fields
++             *   0x04/0x05 {start, count, instances, baseInstance, u16 prim}, u64/u16 fields
++             *   0x06/0x07 {u16 prim, u16 indexType, u32 ib, count, offset}, u64/u16 fields;
++             *   0x08/0x09 the same + instances
++             *   0x0a/0x0b, 0x1c/0x1d {u16 prim, u16 indexType, u32 ib, offset, count, instances,
++             *   baseVertex, baseInstance}, u64/u16 fields (offset first); 0x1d's baseVertex is
++             *   signed, 0x0b's is not
+              */
+-            bool indexed = id == 0x06 || id == 0x07 || id == 0x09 || id == 0x11;
++            static const uint8_t min_len[0x1e] = {
++                [0x00] = 20, [0x01] = 8, [0x02] = 26, [0x03] = 8, [0x04] = 34, [0x05] = 10,
++                [0x06] = 24, [0x07] = 12, [0x08] = 32, [0x09] = 14, [0x0a] = 48, [0x0b] = 18,
++                [0x10] = 14, [0x11] = 28, [0x1c] = 48, [0x1d] = 18,
++            };
++            bool indexed = (id >= 0x06 && id <= 0x0b) || id == 0x11 || id == 0x1c || id == 0x1d;
+             uint32_t prim, count, first = 0, instances = 1, idx_size = 2, base_instance = 0;
+             int32_t base_vertex = 0;
+             Pipeline *pp;
+@@ -5303,8 +5313,8 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+             uint32_t ib = 0, unnorm[2];
+             uint64_t ib_off = 0;
+ 
+-            if (alen < (id == 0x06 ? 24u : id == 0x11 ? 28u : id == 0x10 ? 14u :
+-                        id == 0x09 ? 14u : id == 0x07 ? 12u : 8u)) {
++#define CLAMP32(v) ((v) > UINT32_MAX ? UINT32_MAX : (uint32_t)(v))
++            if (alen < min_len[id]) {
+                 break;
+             }
+             if (id == 0x10 || id == 0x11) {
+@@ -5338,31 +5348,49 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                     base_vertex = (int32_t)args[3];
+                     base_instance = args[4];
+                 }
+-            } else if (id == 0x06) {
+-                uint64_t n = ldq(a + 8);
+-
+-                prim = lduw(a);
+-                idx_size = lduw(a + 2) ? 4 : 2;
+-                ib = ldl(a + 4);
+-                count = n > UINT32_MAX ? UINT32_MAX : (uint32_t)n;
+-                ib_off = ldq(a + 16);
+             } else if (indexed) {
+                 prim = lduw(a);
+                 idx_size = lduw(a + 2) ? 4 : 2;
+                 ib = ldl(a + 4);
+-                count = lduw(a + 8);
+-                ib_off = lduw(a + 10);
+-                instances = id == 0x09 ? lduw(a + 12) : 1;
+-            } else if (id == 0x03) {
++                if (id == 0x06 || id == 0x08) {
++                    count = CLAMP32(ldq(a + 8));
++                    ib_off = ldq(a + 16);
++                    instances = id == 0x08 ? CLAMP32(ldq(a + 24)) : 1;
++                } else if (id == 0x07 || id == 0x09) {
++                    count = lduw(a + 8);
++                    ib_off = lduw(a + 10);
++                    instances = id == 0x09 ? lduw(a + 12) : 1;
++                } else if (id == 0x0a || id == 0x1c) {
++                    ib_off = ldq(a + 8);
++                    count = CLAMP32(ldq(a + 16));
++                    instances = CLAMP32(ldq(a + 24));
++                    base_vertex = (int32_t)ldq(a + 32);
++                    base_instance = CLAMP32(ldq(a + 40));
++                } else {
++                    ib_off = lduw(a + 8);
++                    count = lduw(a + 10);
++                    instances = lduw(a + 12);
++                    base_vertex = id == 0x1d ? (int16_t)lduw(a + 14) : lduw(a + 14);
++                    base_instance = lduw(a + 16);
++                }
++            } else if (id == 0x00 || id == 0x01) {
++                prim = ldl(a);
++                first = id == 0x00 ? CLAMP32(ldq(a + 4)) : lduw(a + 4);
++                count = id == 0x00 ? CLAMP32(ldq(a + 12)) : lduw(a + 6);
++            } else if (id == 0x02 || id == 0x04) {
++                first = CLAMP32(ldq(a));
++                count = CLAMP32(ldq(a + 8));
++                instances = CLAMP32(ldq(a + 16));
++                base_instance = id == 0x04 ? CLAMP32(ldq(a + 24)) : 0;
++                prim = lduw(a + (id == 0x04 ? 32 : 24));
++            } else {
+                 first = lduw(a);
+                 count = lduw(a + 2);
+                 instances = lduw(a + 4);
+-                prim = lduw(a + 6);
+-            } else {
+-                prim = ldl(a);
+-                first = lduw(a + 4);
+-                count = lduw(a + 6);
++                base_instance = id == 0x05 ? lduw(a + 6) : 0;
++                prim = lduw(a + (id == 0x05 ? 8 : 6));
+             }
++#undef CLAMP32
+             if (count > (1u << 20) || instances > 4096) {
+                 elog(e, "task %u draw 0x%x: count %u instances %u: skipped", task, id, count,
+                      instances);
+-- 
+2.43.0
+

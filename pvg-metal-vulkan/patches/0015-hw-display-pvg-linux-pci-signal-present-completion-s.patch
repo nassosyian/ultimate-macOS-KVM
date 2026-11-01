@@ -1,0 +1,88 @@
+From 4b2cecb9a1b7f5ba86d64f51e6f25a9b8024c6ae Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 12:58:49 +0200
+Subject: [PATCH 15/54] hw/display/pvg-linux-pci: signal present completion
+ (shared-state event bit 2)
+
+The host's presentFrame completion ORs 2 into the shared state events
+and pokes the port when the guest unmasked it; without it WindowServer
+stops presenting after a handful of frames.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-pci.c | 25 +++++++++++++++++--------
+ hw/display/trace-events    |  1 +
+ 2 files changed, 18 insertions(+), 8 deletions(-)
+
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index e045ef9..c72b3bd 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -110,6 +110,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(PVGLinuxPCIState, PVG_LINUX_PCI)
+ #define DS_ACKED_GENERATION     0xfbc   /* u32 */
+ #define DS_STATE                0xfc0   /* u32: 0 idle, 1 wait ack, 2 configured */
+ 
++#define DS_EVENT_PRESENTED      0x2     /* frame presented (_presentSurface completion block) */
+ #define DS_EVENT_CONFIG         0x4
+ #define DS_EVENT_DONE           0x8
+ 
+@@ -681,6 +682,18 @@ static void pvg_display_poke(PVGLinuxPCIState *s, uint32_t port)
+     }
+ }
+ 
++/* OR event bits into the shared state page; interrupt the guest if it unmasked any of them */
++static void pvg_display_event(PVGLinuxPCIState *s, uint32_t events)
++{
++    if (!events) {
++        return;
++    }
++    ds_st32(s, DS_EVENTS, ds_ld32(s, DS_EVENTS) | events);
++    if (ds_ld32(s, DS_EVENT_MASK) & events) {
++        pvg_display_poke(s, 0);
++    }
++}
++
+ /*
+  * Port of -[_PGDisplayNub stateMachineWithCaller:] for a host side whose
+  * display client always exists. State 0 publishes settings and modes and
+@@ -732,14 +745,7 @@ static void pvg_display_state_machine(PVGLinuxPCIState *s)
+             events = DS_EVENT_DONE;
+         }
+     }
+-    if (events) {
+-        uint32_t mask = ds_ld32(s, DS_EVENT_MASK);
+-
+-        ds_st32(s, DS_EVENTS, ds_ld32(s, DS_EVENTS) | events);
+-        if (mask & events) {
+-            pvg_display_poke(s, 0);
+-        }
+-    }
++    pvg_display_event(s, events);
+     ds_st32(s, DS_STATE, state);
+     trace_pvg_linux_display_state(state, events, ds_ld32(s, DS_GENERATION));
+ }
+@@ -1318,6 +1324,9 @@ static void pvg_dispatch(PVGLinuxPCIState *s, const PVGCmdHeader *h,
+         if (len >= 0x24 && ldl_le_p(payload) == 0 && ldl_le_p(payload + 4) == 0) {
+             trace_pvg_linux_present(0, 0, ldl_le_p(payload + 8));
+             pvg_display_scanout(s, ldl_le_p(payload + 8));
++            /* the host's presentFrame completion: the guest waits for it before the next frame */
++            pvg_display_event(s, DS_EVENT_PRESENTED);
++            trace_pvg_linux_present_done(ds_ld32(s, DS_EVENTS), ds_ld32(s, DS_EVENT_MASK));
+         }
+         break;
+     case PVG_CMD_SET_OBJECT_LIST:
+diff --git a/hw/display/trace-events b/hw/display/trace-events
+index 92ba9a3..0cdaa8d 100644
+--- a/hw/display/trace-events
++++ b/hw/display/trace-events
+@@ -240,6 +240,7 @@ pvg_linux_display_state(uint32_t state, uint32_t events, uint32_t gen) "state=%u
+ pvg_linux_cursor_glyph(uint64_t va, uint64_t stride, uint32_t w, uint32_t h, uint32_t hx, uint32_t hy) "va=0x%"PRIx64" stride=%"PRIu64" %ux%u hot=%u,%u"
+ pvg_linux_doorbell(uint32_t port, uint32_t show, int x, int y) "port %u show=%u pos=%d,%d"
+ pvg_linux_present(uint32_t port, uint32_t task, uint32_t surface) "port %u task %u surface %u"
++pvg_linux_present_done(uint32_t events, uint32_t mask) "events=0x%x mask=0x%x"
+ pvg_linux_object_list(uint32_t task, uint64_t va, uint32_t len) "task %u objects at va=0x%"PRIx64" len=0x%x"
+ pvg_linux_scanout(uint32_t surface, uint32_t w, uint32_t h, uint64_t va, uint32_t missing_rows, uint32_t nonzero_samples) "surface %u %ux%u va=0x%"PRIx64" unreadable_rows=%u nonzero_samples=%u"
+ pvg_linux_scanout_skip(uint32_t surface, const char *why) "surface %u: %s"
+-- 
+2.43.0
+

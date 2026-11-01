@@ -1,0 +1,41 @@
+From 801bfd4a1d3d7ff6af163cfdd5f377eca8eb1822 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Sat, 31 Oct 2026 16:28:23 +0200
+Subject: [PATCH] hw/display/pvg: three recording frames by default
+
+With asynchronous write-backs, two frames left the executor waiting for
+the submission before (12-14 ms per 500 command buffers). Mission
+Control test: 27.3-27.6 -> 28.8-29.8 presents/s; executor 92 -> 77 ms,
+wall 141 -> 130 ms per 500 command buffers. PVG_FRAMES=2..4 overrides.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/pvg-exec.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index 2325969..0fe3e1f 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -240,7 +240,7 @@ struct PVGExec {
+     uint64_t submit_seq, visible_seq, completed_seq;
+     bool async_visible;
+     uint64_t *page_sub, *block_sub;
+-    uint32_t nframes;           /* recording frames in use (2: one in flight while recording) */
++    uint32_t nframes;           /* recording frames in use (default 3) */
+     uint32_t cur;
+     bool early;                 /* complete command buffers without guest-visible writes early */
+     uint64_t arena_lo, arena_hi;    /* the current frame's part of the arena */
+@@ -7156,7 +7156,8 @@ PVGExec *pvg_exec_new(PVGGpu *gpu, const PVGExecHost *host)
+     for (uint32_t i = 0; i < PVG_SCANOUT_BUFS; i++) {
+         e->scan[i].fd = -1;
+     }
+-    e->nframes = g_getenv("PVG_FRAMES") ? CLAMP(atoi(g_getenv("PVG_FRAMES")), 2, MAX_FRAMES) : 2;
++    /* three: with asynchronous write-backs two left the executor waiting for the frame before */
++    e->nframes = g_getenv("PVG_FRAMES") ? CLAMP(atoi(g_getenv("PVG_FRAMES")), 2, MAX_FRAMES) : 3;
+     for (uint32_t i = 0; i < e->nframes; i++) {
+         e->fr[i].retired = g_ptr_array_new();
+         e->fr[i].dead_pipes = g_ptr_array_new_with_free_func(pipeline_free);
+-- 
+2.43.0
+

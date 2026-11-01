@@ -1,0 +1,96 @@
+From b9d911ee186b87f2dfc5ee36081dd0bb1f00a2dc Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Fri, 30 Oct 2026 23:39:34 +0200
+Subject: [PATCH] audio/pa: apply output volume once the stream is ready
+
+Devices like usb-audio set their volume while the PulseAudio stream is
+still being created; it has no index yet, so the calls failed with
+'set_sink_input_volume() failed Reason: Invalid argument' (and mute) on
+every start. Keep the volume and apply it when the stream is ready.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ audio/paaudio.c | 30 ++++++++++++++++++++++++++----
+ 1 file changed, 26 insertions(+), 4 deletions(-)
+
+diff --git a/audio/paaudio.c b/audio/paaudio.c
+index 24327ec..42bfb93 100644
+--- a/audio/paaudio.c
++++ b/audio/paaudio.c
+@@ -38,6 +38,9 @@ typedef struct {
+     HWVoiceOut hw;
+     pa_stream *stream;
+     AudioPa *g;
++    /* volume set before the stream was ready (it has no index yet): applied once it is */
++    bool volume_pending;
++    Volume volume;
+ } PAVoiceOut;
+ 
+ typedef struct {
+@@ -189,6 +192,8 @@ unlock_and_fail:
+     return 0;
+ }
+ 
++static void qpa_apply_volume_out(PAVoiceOut *pa, const Volume *vol);
++
+ static size_t qpa_buffer_get_free(HWVoiceOut *hw)
+ {
+     PAVoiceOut *p = (PAVoiceOut *)hw;
+@@ -205,6 +210,10 @@ static size_t qpa_buffer_get_free(HWVoiceOut *hw)
+         goto unlock;
+     }
+ 
++    if (p->volume_pending) {
++        p->volume_pending = false;
++        qpa_apply_volume_out(p, &p->volume);
++    }
+     l = pa_stream_writable_size(p->stream);
+     CHECK_SUCCESS_GOTO(c, l != (size_t) -1, unlock_and_fail,
+                        "pa_stream_writable_size failed");
+@@ -654,9 +663,9 @@ static void qpa_fini_in (HWVoiceIn *hw)
+     }
+ }
+ 
+-static void qpa_volume_out(HWVoiceOut *hw, Volume *vol)
++/* with the mainloop locked and the stream ready */
++static void qpa_apply_volume_out(PAVoiceOut *pa, const Volume *vol)
+ {
+-    PAVoiceOut *pa = (PAVoiceOut *) hw;
+     pa_operation *op;
+     pa_cvolume v;
+     PAConnection *c = pa->g->conn;
+@@ -669,8 +678,6 @@ static void qpa_volume_out(HWVoiceOut *hw, Volume *vol)
+         v.values[i] = ((PA_VOLUME_NORM - PA_VOLUME_MUTED) * vol->vol[i]) / 255;
+     }
+ 
+-    pa_threaded_mainloop_lock(c->mainloop);
+-
+     op = pa_context_set_sink_input_volume(c->context,
+                                           pa_stream_get_index(pa->stream),
+                                           &v, NULL, NULL);
+@@ -690,7 +697,22 @@ static void qpa_volume_out(HWVoiceOut *hw, Volume *vol)
+     } else {
+         pa_operation_unref(op);
+     }
++}
+ 
++static void qpa_volume_out(HWVoiceOut *hw, Volume *vol)
++{
++    PAVoiceOut *pa = (PAVoiceOut *) hw;
++    PAConnection *c = pa->g->conn;
++
++    pa_threaded_mainloop_lock(c->mainloop);
++    if (pa->stream && pa_stream_get_state(pa->stream) == PA_STREAM_READY) {
++        pa->volume_pending = false;
++        qpa_apply_volume_out(pa, vol);
++    } else {
++        /* the device sets its volume while the stream is still being created */
++        pa->volume = *vol;
++        pa->volume_pending = true;
++    }
+     pa_threaded_mainloop_unlock(c->mainloop);
+ }
+ 
+-- 
+2.43.0
+

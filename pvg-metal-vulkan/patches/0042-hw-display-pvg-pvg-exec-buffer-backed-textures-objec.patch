@@ -1,0 +1,144 @@
+From d5c1e441b9fc983c861d95eac8804238e33b137b Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 23:29:16 +0200
+Subject: [PATCH 42/54] hw/display/pvg/pvg-exec: buffer-backed textures (object
+ 0x08); MSAA passes render into the resolve texture; more texture/blit
+ diagnostics
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/pvg-exec.c | 67 ++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 59 insertions(+), 8 deletions(-)
+
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index f03a98e..f622d3f 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -33,6 +33,7 @@
+ #define OBJ_BACKING_REF_TEX 0x05
+ #define OBJ_FUNCTION        0x06
+ #define OBJ_SERIALIZED      0x07
++#define OBJ_BUFFER_TEX      0x08    /* texture over an MTLBuffer (newTextureWithDescriptor:offset:bytesPerRow:) */
+ #define SER_RENDER_PIPELINE 0x0e
+ #define SER_COMPUTE_PIPELINE 0x0b
+ 
+@@ -156,7 +157,7 @@ struct PVGExec {
+     GHashTable *uploaded;       /* per command buffer: task << 32 | id → arena offset + 1 */
+     GHashTable *samplers;       /* task << 32 | id → VkSampler (as pointer) */
+     uint32_t upload_failures, ds_kind_logged, ds_states_logged, ds_dumps, blends_logged;
+-    uint32_t texfail_logged, cwb_logged, cio_dumps, buffail_logged, ccmd_logged;
++    uint32_t texfail_logged, blit_unhandled, resolve_logged, cwb_logged, cio_dumps, buffail_logged, ccmd_logged;
+     DSAttachmentSave last_ds;
+     HostImage dummy[7];         /* 1x1 placeholders per VkImageViewType */
+     GHashTable *written;
+@@ -480,6 +481,9 @@ static uint64_t guest_image_size(const GuestImage *gi)
+  * level < 0: the whole mip chain (for sampling); otherwise one level and array slice / 3D plane
+  * as a single 2D image (render targets, blits).
+  */
++static bool buffer_range(PVGExec *e, uint32_t task, uint32_t ref, uint64_t off, uint64_t len,
++                         uint64_t *va);
++
+ static bool guest_image_ex(PVGExec *e, uint32_t task, uint32_t ref, int level, uint32_t slice,
+                            GuestImage *gi)
+ {
+@@ -585,7 +589,34 @@ static bool guest_image_ex(PVGExec *e, uint32_t task, uint32_t ref, int level, u
+         gi->view_type = VK_IMAGE_VIEW_TYPE_2D;
+         gi->depth = gi->layers = 1;
+         gi->mips = 1;
++    } else if (type == OBJ_BUFFER_TEX && len >= 0x40) {
++        /* {u32 buffer id, u32 ?, u32 own id, u32 ?, u64 offset, u64 bytes per row}, desc @0x20 */
++        uint64_t row = ldq(obj + 0x18), size;
++
++        desc = obj + 0x20;
++        gi->width = ldl(desc + 4);
++        gi->height = ldl(desc + 8);
++        size = row * gi->height;
++        if (!gi->height || !buffer_range(e, task, ldl(obj), ldq(obj + 0x10), size, &gi->va)) {
++            return false;
++        }
++        gi->task = task;
++        gi->row_bytes = (uint32_t)row;
++        gi->span = size;
++        gi->view_type = VK_IMAGE_VIEW_TYPE_2D;
++        gi->depth = gi->layers = 1;
++        gi->mips = 1;
+     } else {
++        if (type && e->texfail_logged < 60) {
++            g_autoptr(GString) hex = g_string_new(NULL);
++
++            e->texfail_logged++;
++            for (uint32_t i = 0; i < MIN(len, 0x40u); i += 4) {
++                g_string_append_printf(hex, " %08x", ldl(obj + i));
++            }
++            elog(e, "task %u texture %u: object type 0x%x len 0x%x not a texture:%s", task, ref,
++                 type, len, hex->str);
++        }
+         return false;
+     }
+     /* the per-image stride only matters between layers/slices; a single image is rows only */
+@@ -606,11 +637,11 @@ static bool guest_image_ex(PVGExec *e, uint32_t task, uint32_t ref, int level, u
+         }
+     }
+     gi->format = mtl_pixel_format(lduw(desc + 2), &gi->bpp, &gi->swizzle);
+-    if (gi->format == VK_FORMAT_UNDEFINED && type == OBJ_BACKING_REF_TEX &&
+-        e->texfail_logged < 60) {
++    if (gi->format == VK_FORMAT_UNDEFINED && e->texfail_logged < 60) {
+         e->texfail_logged++;
+-        elog(e, "task %u texture %u: MTLPixelFormat %u not mapped (%ux%u row %u)", task, ref,
+-             lduw(desc + 2), gi->width, gi->height, gi->row_bytes);
++        elog(e, "task %u texture %u: MTLPixelFormat %u not mapped (%ux%u row %u, %s)", task, ref,
++             lduw(desc + 2), gi->width, gi->height, gi->row_bytes,
++             type == OBJ_BACKING_REF_TEX ? "IOSurface" : "texture");
+     }
+     return gi->format != VK_FORMAT_UNDEFINED && gi->width && gi->height &&
+            gi->width <= 16384 && gi->height <= 16384 && gi->row_bytes >= gi->width * gi->bpp &&
+@@ -1814,9 +1845,6 @@ static void tex_census(PVGExec *e, uint32_t task, uint32_t ref, const GuestImage
+     }
+ }
+ 
+-static bool buffer_range(PVGExec *e, uint32_t task, uint32_t ref, uint64_t off, uint64_t len,
+-                         uint64_t *va);
+-
+ /* frame capture: vertex buffer bindings of a draw and the first words of each */
+ static void capture_vertex_data(PVGExec *e, uint32_t task, const RenderState *st,
+                                 const Pipeline *pp G_GNUC_UNUSED)
+@@ -1910,6 +1938,24 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                 for (int k = 0; k < 4; k++) {
+                     att[i].clear[k] = ldd(c + 7 * 4 + 8 * k);
+                 }
++                /*
++                 * MSAA: store 2 (multisampleResolve) / 3 (storeAndMultisampleResolve) with a
++                 * resolve texture at +4. Without multisampling on the host, render straight
++                 * into the resolve texture (resolve level/slice/plane at +14/+16/+18): that is
++                 * what gets sampled later; the multisample texture is scratch.
++                 */
++                if (ldl(c + 4) && (att[i].store == 2 || att[i].store == 3)) {
++                    if (e->resolve_logged < 20) {
++                        e->resolve_logged++;
++                        elog(e, "task %u att %d: msaa ref %u -> resolve ref %u level %u slice %u "
++                             "load %u store %u", task, i, att[i].ref, ldl(c + 4), lduw(c + 14),
++                             lduw(c + 16), att[i].load, att[i].store);
++                    }
++                    att[i].ref = ldl(c + 4);
++                    att[i].level = lduw(c + 14);
++                    att[i].slice = lduw(c + 16) + lduw(c + 18);
++                    att[i].store = 1;
++                }
+             }
+             found = true;
+             break;
+@@ -3101,6 +3147,11 @@ static void exec_blit_segment(PVGExec *e, uint32_t task, const uint8_t *p, uint3
+             }
+             break;
+         default:        /* mipmaps, optimise, synchronise, fences: nothing to do in v0 */
++            if (e->blit_unhandled++ < 200) {
++                elog(e, "blit 0x%x len %u unhandled: %08x %08x %08x %08x", id, clen,
++                     alen >= 4 ? ldl(a) : 0, alen >= 8 ? ldl(a + 4) : 0,
++                     alen >= 12 ? ldl(a + 8) : 0, alen >= 16 ? ldl(a + 12) : 0);
++            }
+             break;
+         }
+     }
+-- 
+2.43.0
+

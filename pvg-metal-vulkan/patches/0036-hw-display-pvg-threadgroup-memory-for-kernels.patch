@@ -1,0 +1,270 @@
+From 1b5d9dd19b312cdceaf8561863a3d33189041fc3 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 21:08:18 +0200
+Subject: [PATCH 36/54] hw/display/pvg: threadgroup memory for kernels
+
+air.buffer arguments in address space 3 are threadgroup buffers, not
+device buffers: they now become Workgroup word arrays sized by spec
+constants 8+index (setThreadgroupMemoryLength), and address-space-3
+globals fixed-size Workgroup arrays, both through the private-memory
+path. Before, a threadgroup buffer aliased device buffer slot of the same
+index (VideoToolbox scaler: its scratch overwrote the parameter buffer).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/air2spv.c  | 68 ++++++++++++++++++++++++++++++++++++++-
+ hw/display/pvg/air2spv.h  |  4 +++
+ hw/display/pvg/pvg-exec.c | 52 +++++++++++++++++++++++++-----
+ 3 files changed, 115 insertions(+), 9 deletions(-)
+
+diff --git a/hw/display/pvg/air2spv.c b/hw/display/pvg/air2spv.c
+index f46cf3b..e70e955 100644
+--- a/hw/display/pvg/air2spv.c
++++ b/hw/display/pvg/air2spv.c
+@@ -30,6 +30,7 @@ enum ArgKind {
+     /* kernel builtins */
+     ARG_GLOBAL_ID, ARG_LOCAL_ID, ARG_GROUP_ID, ARG_GROUPS, ARG_LOCAL_INDEX, ARG_THREADS_PER_GROUP,
+     ARG_GRID_SIZE, ARG_SIMD_LANE, ARG_SIMD_GROUP, ARG_SIMD_SIZE,
++    ARG_THREADGROUP,            /* air.buffer in address space 3: threadgroup memory */
+ };
+ 
+ enum Interp { INTERP_PERSPECTIVE, INTERP_NOPERSPECTIVE, INTERP_FLAT };
+@@ -467,7 +468,10 @@ static int parse_entry(Ctx *c)
+         if (arg->kind != ARG_NONE) {
+             continue;
+         } else if (!strcmp(kind, "air.buffer")) {
+-            arg->kind = ARG_BUFFER;
++            int as = md_find(a, n, "air.address_space");
++
++            arg->kind = as >= 0 && as + 1 < n && md_int(a[as + 1]) == 3 ? ARG_THREADGROUP :
++                        ARG_BUFFER;
+         } else if (!strcmp(kind, "air.texture")) {
+             arg->kind = ARG_TEXTURE;
+             p = md_find(a, n, "air.arg_type_name");
+@@ -783,6 +787,34 @@ static int setup_interface(Ctx *c)
+                                  spv_type_vec(&c->m, c->t_u32, 3), bi[a->kind]);
+             break;
+         }
++        case ARG_THREADGROUP: {
++            uint32_t sc[3] = { c->t_u32, spv_id(&c->m), 1024 }, arr[2], arr_t, ops[3];
++
++            if (c->stage != A2S_STAGE_COMPUTE || a->index >= A2S_MAX_THREADGROUP ||
++                c->npriv == 64) {
++                return fail(c, "unsupported threadgroup buffer %d", a->index);
++            }
++            spv_emit(&c->m, SPV_SEC_TYPES, SpvOpSpecConstant, sc, 3);
++            decorate1(c, sc[1], SpvDecorationSpecId, A2S_SPEC_THREADGROUP + a->index);
++            arr[0] = c->t_u32;
++            arr[1] = sc[1];
++            arr_t = spv_type(&c->m, SpvOpTypeArray, arr, 2);
++            ops[0] = spv_type_ptr(&c->m, SpvStorageWorkgroup, arr_t);
++            ops[1] = spv_id(&c->m);
++            ops[2] = SpvStorageWorkgroup;
++            spv_emit(&c->m, SPV_SEC_TYPES, SpvOpVariable, ops, 3);
++            if (c->niface < 128) {
++                c->iface[c->niface++] = ops[1];
++            }
++            c->priv[c->npriv].v = LLVMGetParam(c->fn, i);
++            c->priv[c->npriv].var = ops[1];
++            c->priv[c->npriv].off = spv_const_u32(&c->m, 0);
++            c->priv[c->npriv].words = 1u << 20;     /* runtime length: no static bound */
++            c->priv[c->npriv].ptr_t = spv_type_ptr(&c->m, SpvStorageWorkgroup, c->t_u32);
++            c->npriv++;
++            c->res->threadgroup_mask |= 1u << a->index;
++            break;
++        }
+         case ARG_THREADS_PER_GROUP: case ARG_GRID_SIZE:
+             if (c->stage != A2S_STAGE_COMPUTE) {
+                 return fail(c, "kernel builtin outside a kernel");
+@@ -2097,6 +2129,34 @@ static int declare_constant_global(Ctx *c, LLVMValueRef g)
+     return 0;
+ }
+ 
++/* `threadgroup` variables of a kernel: module-scope Workgroup word arrays */
++static int declare_threadgroup_global(Ctx *c, LLVMValueRef g)
++{
++    uint64_t size = LLVMABISizeOfType(c->td, LLVMGlobalGetValueType(g));
++    uint32_t arr[2], arr_t, ops[3];
++
++    if (c->stage != A2S_STAGE_COMPUTE || !size || size > 64 * 1024 || c->npriv == 64) {
++        return fail(c, "unsupported threadgroup global %s", vname(g, NULL));
++    }
++    arr[0] = c->t_u32;
++    arr[1] = spv_const_u32(&c->m, (uint32_t)((size + 3) / 4));
++    arr_t = spv_type(&c->m, SpvOpTypeArray, arr, 2);
++    ops[0] = spv_type_ptr(&c->m, SpvStorageWorkgroup, arr_t);
++    ops[1] = spv_id(&c->m);
++    ops[2] = SpvStorageWorkgroup;
++    spv_emit(&c->m, SPV_SEC_TYPES, SpvOpVariable, ops, 3);
++    if (c->niface < 128) {
++        c->iface[c->niface++] = ops[1];
++    }
++    c->priv[c->npriv].v = g;
++    c->priv[c->npriv].var = ops[1];
++    c->priv[c->npriv].off = spv_const_u32(&c->m, 0);
++    c->priv[c->npriv].words = (uint32_t)((size + 3) / 4);
++    c->priv[c->npriv].ptr_t = spv_type_ptr(&c->m, SpvStorageWorkgroup, c->t_u32);
++    c->npriv++;
++    return 0;
++}
++
+ static int declare_constant_globals(Ctx *c)
+ {
+     for (LLVMValueRef g = LLVMGetFirstGlobal(c->mod); g; g = LLVMGetNextGlobal(g)) {
+@@ -2105,6 +2165,12 @@ static int declare_constant_globals(Ctx *c)
+         if (!LLVMGetFirstUse(g) || resource_for(c, g) || !strncmp(n, "llvm.", 5)) {
+             continue;
+         }
++        if (LLVMGetPointerAddressSpace(LLVMTypeOf(g)) == 3) {
++            if (declare_threadgroup_global(c, g)) {
++                return -1;
++            }
++            continue;
++        }
+         if (declare_constant_global(c, g)) {
+             return -1;
+         }
+diff --git a/hw/display/pvg/air2spv.h b/hw/display/pvg/air2spv.h
+index c150178..24adc4d 100644
+--- a/hw/display/pvg/air2spv.h
++++ b/hw/display/pvg/air2spv.h
+@@ -30,6 +30,9 @@ enum { A2S_VIEW_1D = 0, A2S_VIEW_2D = 1, A2S_VIEW_3D = 2, A2S_VIEW_CUBE = 3,
+ #define A2S_SPEC_LOCAL_Z        3
+ /* kernels: push-constant uvec3 grid size (threads); threads beyond it return at entry */
+ #define A2S_PUSH_GRID           128
++/* kernels: length in 32-bit words of threadgroup buffer i (setThreadgroupMemoryLength) */
++#define A2S_SPEC_THREADGROUP    8
++#define A2S_MAX_THREADGROUP     8
+ 
+ /*
+  * AIR constant sampler state word (inferred from the shader corpus): bits 0-2/3-5/6-8 s/t/r
+@@ -51,6 +54,7 @@ typedef struct A2SResult {
+     uint32_t sampler_mask;
+     uint32_t storage_mask;      /* texture indices bound as storage images (write / read_write) */
+     uint32_t buffer_write_mask; /* buffer indices the function may write */
++    uint32_t threadgroup_mask;  /* kernels: threadgroup buffer indices (address space 3) */
+     uint32_t push_base;         /* in: byte offset of this stage's buffer table */
+     uint32_t push_size;         /* out: end offset of the push constants used */
+     int nconst_samplers;
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index ab191eb..624db9c 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -156,7 +156,7 @@ struct PVGExec {
+     GHashTable *uploaded;       /* per command buffer: task << 32 | id → arena offset + 1 */
+     GHashTable *samplers;       /* task << 32 | id → VkSampler (as pointer) */
+     uint32_t upload_failures, ds_kind_logged, ds_states_logged, ds_dumps, blends_logged;
+-    uint32_t texfail_logged, cwb_logged, cio_dumps, buffail_logged;
++    uint32_t texfail_logged, cwb_logged, cio_dumps, buffail_logged, ccmd_logged;
+     DSAttachmentSave last_ds;
+     HostImage dummy[7];         /* 1x1 placeholders per VkImageViewType */
+     GHashTable *written;
+@@ -2467,14 +2467,17 @@ static bool copy_rows(PVGExec *e, uint32_t stask, uint64_t sva, uint64_t sstride
+  * (threads per threadgroup, unnormalised-sampler mask).
+  */
+ static Pipeline *compute_pipeline_get(PVGExec *e, uint32_t task, uint32_t ref,
+-                                      const uint32_t local[3], uint32_t unnorm)
++                                      const uint32_t local[3], uint32_t unnorm,
++                                      const uint32_t tg_bytes[A2S_MAX_THREADGROUP])
+ {
+     PVGGpu *g = e->gpu;
+-    g_autofree char *key = g_strdup_printf("%u:%u:c%u,%u,%u:%x", task, ref, local[0], local[1],
+-                                           local[2], unnorm);
++    g_autofree char *key = g_strdup_printf("%u:%u:c%u,%u,%u:%x:%u,%u,%u,%u", task, ref,
++                                           local[0], local[1], local[2], unnorm, tg_bytes[0],
++                                           tg_bytes[1], tg_bytes[2], tg_bytes[3]);
+     Pipeline *p = g_hash_table_lookup(e->pipelines, key);
+     uint8_t obj[MAX_OBJ];
+-    uint32_t len, plen, fn = 0, spec_data[4] = { unnorm, local[0], local[1], local[2] };
++    uint32_t len, plen, fn = 0, spec_data[4 + A2S_MAX_THREADGROUP] = {
++        unnorm, local[0], local[1], local[2] };
+     PlEntry ents[16];
+     A2SResult cs = { 0 };
+     VkShaderModule csm = VK_NULL_HANDLE;
+@@ -2555,11 +2558,18 @@ static Pipeline *compute_pipeline_get(PVGExec *e, uint32_t task, uint32_t ref,
+         VkPipelineLayoutCreateInfo lci = {
+             .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
+             .pSetLayouts = &p->dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr };
+-        VkSpecializationMapEntry sme[4] = {
++        VkSpecializationMapEntry sme[4 + A2S_MAX_THREADGROUP] = {
+             { A2S_SPEC_UNNORMALIZED, 0, 4 }, { A2S_SPEC_LOCAL_X, 4, 4 },
+             { A2S_SPEC_LOCAL_Y, 8, 4 }, { A2S_SPEC_LOCAL_Z, 12, 4 },
+         };
+-        VkSpecializationInfo spec = { 4, sme, sizeof(spec_data), spec_data };
++        VkSpecializationInfo spec = { 4 + A2S_MAX_THREADGROUP, sme, sizeof(spec_data),
++                                      spec_data };
++
++        /* threadgroup buffers: length in words (at least one) */
++        for (int i = 0; i < A2S_MAX_THREADGROUP; i++) {
++            sme[4 + i] = (VkSpecializationMapEntry){ A2S_SPEC_THREADGROUP + i, 16 + 4 * i, 4 };
++            spec_data[4 + i] = MAX((tg_bytes[i] + 3) / 4, 1);
++        }
+         VkComputePipelineCreateInfo cci = {
+             .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+             .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+@@ -2604,6 +2614,7 @@ static bool cio_match(PVGExec *e, const char *kernel)
+ 
+ typedef struct ComputeState {
+     uint32_t pipeline;
++    uint32_t tg_bytes[A2S_MAX_THREADGROUP];     /* setThreadgroupMemoryLength:atIndex: */
+     Binding buf[MAX_SLOTS];
+     uint32_t tex[MAX_SLOTS], smp[MAX_SLOTS];
+ } ComputeState;
+@@ -2645,6 +2656,13 @@ static void exec_compute_segment(PVGExec *e, uint32_t task, const uint8_t *p, ui
+             break;
+         }
+         off += clen;
++        if (e->dump_dir && e->cio_dumps < 12 && getenv("PVG_CIO_FILTER") && e->ccmd_logged < 300) {
++            e->ccmd_logged++;
++            elog(e, "ccmd task %u 0x%x len %u: %08x %08x %08x %08x %08x %08x", task, id, alen,
++                 alen >= 4 ? ldl(a) : 0, alen >= 8 ? ldl(a + 4) : 0, alen >= 12 ? ldl(a + 8) : 0,
++                 alen >= 16 ? ldl(a + 12) : 0, alen >= 20 ? ldl(a + 16) : 0,
++                 alen >= 24 ? ldl(a + 20) : 0);
++        }
+         switch (id) {
+         case 0xd0:
+             cs.pipeline = alen >= 4 ? ldl(a) : 0;
+@@ -2663,6 +2681,11 @@ static void exec_compute_segment(PVGExec *e, uint32_t task, const uint8_t *p, ui
+         case 0xcc:
+             set_refs(cs.smp, a, alen);
+             break;
++        case 0xd3:      /* SetThreadgroupMemoryLength {u64 length, u32 index} */
++            if (alen >= 12 && ldl(a + 8) < A2S_MAX_THREADGROUP) {
++                cs.tg_bytes[ldl(a + 8)] = (uint32_t)MIN(ldq(a), 64 * 1024);
++            }
++            break;
+         case 0xc8: case 0xca: {
+             uint32_t local[3], groups[3], grid[3], unnorm = 0;
+             uint8_t pc[256] = { 0 };
+@@ -2697,7 +2720,8 @@ static void exec_compute_segment(PVGExec *e, uint32_t task, const uint8_t *p, ui
+                 sampler_get(e, task, cs.smp[i]);
+                 unnorm |= cs.smp[i] && g_hash_table_contains(e->unnorm, &k) ? 1u << i : 0;
+             }
+-            pp = cs.pipeline ? compute_pipeline_get(e, task, cs.pipeline, local, unnorm) : NULL;
++            pp = cs.pipeline ? compute_pipeline_get(e, task, cs.pipeline, local, unnorm,
++                                                    cs.tg_bytes) : NULL;
+             if (!pp || !pp->ok) {
+                 e->stats.skipped_draws++;
+                 break;
+@@ -2731,6 +2755,18 @@ static void exec_compute_segment(PVGExec *e, uint32_t task, const uint8_t *p, ui
+                     continue;
+                 }
+                 stq(pc + 8 * i, e->arena_addr + boff + cs.buf[i].offset);
++                if (e->dump_dir && e->cio_dumps < 12 && cio_match(e, pp->fs_name)) {
++                    const uint8_t *b = e->arena_ptr + boff + cs.buf[i].offset;
++                    uint64_t left = size - cs.buf[i].offset;
++
++                    elog(e, "cio %u %s buffer %d ref %u off 0x%" G_GINT64_MODIFIER "x size 0x%"
++                         G_GINT64_MODIFIER "x: %08x %08x %08x %08x %08x %08x %08x %08x",
++                         e->cio_dumps, pp->fs_name, i, cs.buf[i].ref, cs.buf[i].offset, size,
++                         left >= 4 ? ldl(b) : 0, left >= 8 ? ldl(b + 4) : 0,
++                         left >= 12 ? ldl(b + 8) : 0, left >= 16 ? ldl(b + 12) : 0,
++                         left >= 20 ? ldl(b + 16) : 0, left >= 24 ? ldl(b + 20) : 0,
++                         left >= 28 ? ldl(b + 24) : 0, left >= 32 ? ldl(b + 28) : 0);
++                }
+                 if ((pp->buffer_write_mask >> i & 1) && nout < G_N_ELEMENTS(out)) {
+                     uint64_t va;
+ 
+-- 
+2.43.0
+

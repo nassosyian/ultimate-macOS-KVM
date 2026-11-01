@@ -1,0 +1,79 @@
+From 92d8c894350dc12b95567fe52f473afbaffb1f16 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 13:28:18 +0200
+Subject: [PATCH 19/54] hw/display/pvg/air2spv: 8/16-bit stores to private
+ memory
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/air2spv.c | 54 +++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 53 insertions(+), 1 deletion(-)
+
+diff --git a/hw/display/pvg/air2spv.c b/hw/display/pvg/air2spv.c
+index e9f1de6..af0bacf 100644
+--- a/hw/display/pvg/air2spv.c
++++ b/hw/display/pvg/air2spv.c
+@@ -1848,7 +1848,59 @@ static int priv_store(Ctx *c, int pi, LLVMValueRef value)
+     etid = ty(c, et);
+     v = val(c, value);
+     if (!priv_type_ok(t, &n)) {
+-        return fail(c, "private store of an unsupported type");
++        unsigned esize = (unsigned)LLVMABISizeOfType(c->td, et);
++
++        n = LLVMGetTypeKind(t) == LLVMVectorTypeKind ? LLVMGetVectorSize(t) : 1;
++        if (n > 16 || (esize != 1 && esize != 2) || is_bool(et) ||
++            (LLVMGetTypeKind(et) != LLVMIntegerTypeKind &&
++             LLVMGetTypeKind(et) != LLVMHalfTypeKind)) {
++            return fail(c, "private store of an unsupported type");
++        }
++        /* 8/16-bit elements: read-modify-write of the word holding each one */
++        for (unsigned k = 0; k < n; k++) {
++            uint32_t ops[3], e, bits, co, word, ptr, w, shift, mask, it;
++
++            ops[0] = v;
++            ops[1] = k;
++            e = n == 1 ? v : emit(c, SpvOpCompositeExtract, etid, 0, ops, 2);
++            it = spv_type_int(&c->m, esize * 8, false);
++            bits = LLVMGetTypeKind(et) == LLVMHalfTypeKind ?
++                   emit(c, SpvOpBitcast, it, 0, &e, 1) : e;
++            bits = emit(c, SpvOpUConvert, c->t_u32, 0, &bits, 1);
++            ops[0] = c->priv[pi].off;
++            ops[1] = spv_const_u32(&c->m, esize * k);
++            co = k ? emit(c, SpvOpIAdd, c->t_u32, 0, ops, 2) : c->priv[pi].off;
++            ops[0] = co;
++            ops[1] = spv_const_u32(&c->m, 2);
++            word = emit(c, SpvOpShiftRightLogical, c->t_u32, 0, ops, 2);
++            ops[0] = c->priv[pi].var;
++            ops[1] = word;
++            ptr = emit(c, SpvOpAccessChain, c->priv[pi].ptr_t, 0, ops, 2);
++            w = emit(c, SpvOpLoad, c->t_u32, 0, &ptr, 1);
++            ops[0] = co;
++            ops[1] = spv_const_u32(&c->m, 3);
++            shift = emit(c, SpvOpBitwiseAnd, c->t_u32, 0, ops, 2);
++            ops[0] = shift;
++            ops[1] = spv_const_u32(&c->m, 3);
++            shift = emit(c, SpvOpShiftLeftLogical, c->t_u32, 0, ops, 2);
++            ops[0] = spv_const_u32(&c->m, esize == 2 ? 0xffff : 0xff);
++            ops[1] = shift;
++            mask = emit(c, SpvOpShiftLeftLogical, c->t_u32, 0, ops, 2);
++            mask = emit(c, SpvOpNot, c->t_u32, 0, &mask, 1);
++            ops[0] = w;
++            ops[1] = mask;
++            w = emit(c, SpvOpBitwiseAnd, c->t_u32, 0, ops, 2);
++            ops[0] = bits;
++            ops[1] = shift;
++            bits = emit(c, SpvOpShiftLeftLogical, c->t_u32, 0, ops, 2);
++            ops[0] = w;
++            ops[1] = bits;
++            w = emit(c, SpvOpBitwiseOr, c->t_u32, 0, ops, 2);
++            ops[0] = ptr;
++            ops[1] = w;
++            spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpStore, ops, 2);
++        }
++        return 0;
+     }
+     for (unsigned k = 0; k < n; k++) {
+         uint32_t ops[2] = { v, k }, e = n == 1 ? v : emit(c, SpvOpCompositeExtract, etid, 0, ops, 2);
+-- 
+2.43.0
+

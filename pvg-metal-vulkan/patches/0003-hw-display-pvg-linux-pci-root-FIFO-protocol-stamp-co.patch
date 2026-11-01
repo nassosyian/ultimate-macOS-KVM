@@ -1,0 +1,390 @@
+From acf4baad439a60ae6159cf76d4ea9ecc2e468f86 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 10:08:58 +0200
+Subject: [PATCH 03/54] hw/display/pvg-linux-pci: root FIFO protocol, stamp
+ completion + MSI, GetDeviceInfo
+
+Implements the root FIFO record format, stamp publication into the FIFO
+base page with the read-and-clear status registers and MSI vector 0, and
+a synthesized GetDeviceInfo reply. Other commands complete as stubs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-pci.c | 255 +++++++++++++++++++++++++++++--------
+ hw/display/trace-events    |   5 +-
+ 2 files changed, 209 insertions(+), 51 deletions(-)
+
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index ad64f7d..1b0a070 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -7,11 +7,10 @@
+  * Apple's closed ParavirtualizedGraphics.framework. This device is a
+  * from-scratch reimplementation of that host side for non-macOS hosts.
+  *
+- * Stage 1 ("tracer"): present the PCI identity the guest's AppleParavirtGPU
+- * kext matches on, back BAR0 with a plain register file, and trace every
+- * access so the protocol can be reverse-engineered from a live guest.
+- * PCI IDs, BAR size and MSI vector count are properties until the real
+- * values are pinned down from the guest driver.
++ * Stage 2: PCI identity 106b:eeee (AppleParavirtGPU.kext IOPCIMatch), the
++ * root FIFO protocol with stamp completion and MSI, and GetDeviceInfo. Other
++ * commands are traced and completed without effect. Every register access
++ * is traced so the protocol can keep being checked against a live guest.
+  */
+ 
+ #include "qemu/osdep.h"
+@@ -31,28 +30,86 @@ OBJECT_DECLARE_SIMPLE_TYPE(PVGLinuxPCIState, PVG_LINUX_PCI)
+ 
+ #define PVG_MAX_MMIO_SIZE (64 * MiB)
+ 
+-/* BAR0 registers, see docs/pvg-protocol.md (names are provisional) */
+-#define PVG_REG_RING_SIZE       0x1004
+-#define PVG_REG_RING_TAIL       0x1008  /* guest producer offset */
+-#define PVG_REG_RING_HEAD       0x100c  /* host consumer offset */
+-#define PVG_REG_RING_DATA_OFF   0x1010
+-#define PVG_REG_RING_PFN        0x1030
++/*
++ * BAR0 registers. Names follow the _PGDevice methods they dispatch to in
++ * Apple's host framework; see docs/pvg-protocol.md.
++ */
++#define PVG_REG_ENABLE_FIFO     0x1000
++#define PVG_REG_FIFO_LENGTH     0x1004
++#define PVG_REG_FIFO_WRITTEN    0x1008  /* guest producer offset */
++#define PVG_REG_FIFO_READ       0x100c  /* host consumer offset */
++#define PVG_REG_FIFO_START      0x1010  /* command data offset in base page */
++#define PVG_REG_IRQ_STATUS      0x1014  /* read-and-clear */
++#define PVG_REG_STAMP_STATUS    0x1018  /* read-and-clear, bit n = stamps[n] */
++#define PVG_REG_ROOT_PAGE       0x101c
++#define PVG_REG_FIFO_BASE_PAGE  0x1030
++#define PVG_REG_DISPLAY_PORTS   0x122c
++
++#define PVG_CMD_HDR_SIZE        12
++#define PVG_CMD_MAX_BARRIERS    0x40
++#define PVG_CMD_MAX_PAYLOAD     (64 * KiB)
++#define PVG_CMD_TRACE_WORDS     8
++
++#define PVG_CMD_DEFINE_CHILD_FIFO   0x30
++#define PVG_CMD_SET_OBJECT_LIST     0x33
++#define PVG_CMD_DEFINE_TASK2        0x38
++#define PVG_CMD_GET_DEVICE_INFO     0x3a
++
++#define PVG_ROOT_STAMP_INDEX    0
++
++typedef struct QEMU_PACKED PVGCmdHeader {
++    uint16_t opcode;
++    uint16_t barrier_count;
++    uint32_t length;
++    uint32_t stamp_value;
++} PVGCmdHeader;
+ 
+-#define PVG_RECORD_HDR_SIZE     12      /* u32 opcode, u32 size, u32 seq */
+-#define PVG_RECORD_TRACE_WORDS  8
++/*
++ * Answers to GetDeviceInfo, as {key, value} pairs in key order. Keys and
++ * meanings come from _writeDeviceInfo in the host framework. Values are
++ * provisional: modelled on an AMD-GPU Intel Mac until they are derived from
++ * the host's Vulkan limits. Keys the framework only emits behind optional
++ * features are left out.
++ */
++static const uint32_t pvg_device_info[][2] = {
++    { 0x01, 8 },        /* max MSAA sample count */
++    { 0x02, 1 },        /* Depth24Stencil8 supported */
++    { 0x03, 1024 },     /* maxThreadsPerThreadgroup.width */
++    { 0x04, 1024 },     /* maxThreadsPerThreadgroup.height */
++    { 0x05, 1024 },     /* maxThreadsPerThreadgroup.depth */
++    { 0x06, 32768 },    /* maxThreadgroupMemoryLength */
++    { 0x07, 0 },        /* framebuffer read */
++    { 0x08, 0 },        /* RGB10A2 gamma */
++    { 0x09, 1 },        /* native FP16 */
++    { 0x0a, 8 },        /* constant in the framework */
++    { 0x0b, 0x1f },     /* supportsPrimitiveType: bitmask */
++    { 0x0c, 0 },        /* device feature byte */
++    { 0x0d, 256 },      /* linearTextureAlignmentBytes */
++    { 0x12, 0x20007 },  /* value for device feature level unset/high */
++    { 0x15, 0 },        /* programmable sample positions */
++    { 0x1d, 1024 },     /* maxTotalComputeThreadsPerThreadgroup */
++    { 0x1f, 32768 },    /* maxComputeThreadgroupMemory */
++    { 0x20, 16 },       /* maxComputeThreadgroupMemoryAlignmentBytes */
++    { 0x23, 2048 },     /* maxTextureLayers */
++    { 0x25, 0x3ed },    /* highest MTLGPUFamilyApple*: none beyond Apple5 */
++    { 0x29, 1 },        /* texture write rounding modes */
++};
+ 
+ struct PVGLinuxPCIState {
+     PCIDevice parent_obj;
+ 
+     MemoryRegion mmio;
+     uint32_t *regs;
++    uint32_t irq_status;
++    uint32_t stamp_status;
++    uint8_t *payload;
+ 
+     /* properties */
+     uint16_t vendor_id;
+     uint16_t device_id;
+     uint32_t mmio_size;
+     uint32_t msi_vectors;
+-    bool ack_ring;
++    uint32_t display_ports;
+ };
+ 
+ static uint32_t pvg_reg(PVGLinuxPCIState *s, hwaddr off)
+@@ -60,12 +117,16 @@ static uint32_t pvg_reg(PVGLinuxPCIState *s, hwaddr off)
+     return s->regs[off / 4];
+ }
+ 
+-static bool pvg_ring_read(PVGLinuxPCIState *s, uint32_t off, void *buf,
++static uint64_t pvg_fifo_base(PVGLinuxPCIState *s)
++{
++    return (uint64_t)pvg_reg(s, PVG_REG_FIFO_BASE_PAGE) << 12;
++}
++
++static bool pvg_fifo_read(PVGLinuxPCIState *s, uint32_t off, void *buf,
+                           uint32_t len)
+ {
+-    uint32_t size = pvg_reg(s, PVG_REG_RING_SIZE);
+-    uint64_t base = ((uint64_t)pvg_reg(s, PVG_REG_RING_PFN) << 12) +
+-                    pvg_reg(s, PVG_REG_RING_DATA_OFF);
++    uint32_t size = pvg_reg(s, PVG_REG_FIFO_LENGTH);
++    uint64_t base = pvg_fifo_base(s) + pvg_reg(s, PVG_REG_FIFO_START);
+     uint8_t *p = buf;
+ 
+     while (len) {
+@@ -82,45 +143,125 @@ static bool pvg_ring_read(PVGLinuxPCIState *s, uint32_t off, void *buf,
+     return true;
+ }
+ 
+-/* Decode and trace every record between the current head and the new tail. */
+-static void pvg_ring_consume(PVGLinuxPCIState *s, uint32_t tail)
++/* Equivalent of -[_PGDevice signalStamp:value:] */
++static void pvg_signal_stamp(PVGLinuxPCIState *s, uint32_t index,
++                             uint32_t value)
++{
++    uint32_t le = cpu_to_le32(value);
++
++    pci_dma_write(PCI_DEVICE(s), pvg_fifo_base(s) + index * 4, &le, 4);
++    s->stamp_status |= 1u << index;
++    trace_pvg_linux_signal_stamp(index, value);
++    if (msi_enabled(PCI_DEVICE(s))) {
++        msi_notify(PCI_DEVICE(s), 0);
++    }
++}
++
++static void pvg_cmd_get_device_info(PVGLinuxPCIState *s, const uint32_t *p,
++                                    uint32_t len)
+ {
+-    uint32_t size = pvg_reg(s, PVG_REG_RING_SIZE);
+-    uint32_t head = pvg_reg(s, PVG_REG_RING_HEAD);
++    uint32_t version, max_pairs, n = 0;
++    uint32_t out[4096 / 8][2];   /* the framework maps a single page */
++    uint64_t dst;
+ 
+-    if (!size || size > 16 * MiB) {
+-        qemu_log_mask(LOG_GUEST_ERROR, "pvg: ring size 0x%x unusable\n", size);
++    if (len < 12) {
++        qemu_log_mask(LOG_GUEST_ERROR, "pvg: GetDeviceInfo payload too short\n");
+         return;
+     }
++    version = le32_to_cpu(p[0]);
++    max_pairs = MIN(le32_to_cpu(p[1]), 4096u) / 8;
++    dst = (uint64_t)le32_to_cpu(p[2]) << 12;
++
++    for (size_t i = 0; i < ARRAY_SIZE(pvg_device_info) && n < max_pairs; i++) {
++        if (pvg_device_info[i][0] < version) {
++            out[n][0] = cpu_to_le32(pvg_device_info[i][0]);
++            out[n][1] = cpu_to_le32(pvg_device_info[i][1]);
++            n++;
++        }
++    }
++    pci_dma_write(PCI_DEVICE(s), dst, out, n * 8);
++    trace_pvg_linux_device_info(version, n, dst);
++}
+ 
+-    while (head != tail) {
+-        uint32_t words[3 + PVG_RECORD_TRACE_WORDS] = { 0 };
+-        uint32_t nwords;
++static void pvg_dispatch(PVGLinuxPCIState *s, const PVGCmdHeader *h,
++                         const uint8_t *payload, uint32_t len)
++{
++    switch (h->opcode) {
++    case PVG_CMD_GET_DEVICE_INFO:
++        pvg_cmd_get_device_info(s, (const uint32_t *)payload, len);
++        break;
++    default:
++        /* not implemented yet: completed without effect */
++        trace_pvg_linux_cmd_stub(h->opcode);
++        break;
++    }
++}
++
++/*
++ * Process every root FIFO command between the consumer and the new producer
++ * offset (-[PGFIFO processFifo]). All commands currently complete
++ * synchronously, so the stamp of the last one is published afterwards,
++ * matching PGPendingStampQueue::pump().
++ */
++static void pvg_fifo_process(PVGLinuxPCIState *s, uint32_t written)
++{
++    uint32_t size = pvg_reg(s, PVG_REG_FIFO_LENGTH);
++    uint32_t head = pvg_reg(s, PVG_REG_FIFO_READ);
++    bool completed = false;
++    uint32_t last_stamp = 0;
+ 
+-        if (!pvg_ring_read(s, head, words, PVG_RECORD_HDR_SIZE)) {
+-            qemu_log_mask(LOG_GUEST_ERROR, "pvg: ring read failed @0x%x\n", head);
+-            return;
++    if (!pvg_reg(s, PVG_REG_ENABLE_FIFO)) {
++        return;
++    }
++    if (!size || size > 0x20000 || (size & 0xfff)) {
++        qemu_log_mask(LOG_GUEST_ERROR, "pvg: FIFO length 0x%x unusable\n", size);
++        return;
++    }
++
++    while (head != written) {
++        PVGCmdHeader h;
++        uint32_t skip, len;
++
++        if (!pvg_fifo_read(s, head, &h, sizeof(h))) {
++            qemu_log_mask(LOG_GUEST_ERROR, "pvg: FIFO read failed @0x%x\n", head);
++            break;
+         }
+-        if (words[1] < PVG_RECORD_HDR_SIZE || words[1] > size) {
++        h.opcode = le16_to_cpu(h.opcode);
++        h.barrier_count = le16_to_cpu(h.barrier_count);
++        h.length = le32_to_cpu(h.length);
++        h.stamp_value = le32_to_cpu(h.stamp_value);
++        skip = PVG_CMD_HDR_SIZE + 8 * h.barrier_count;
++        if (h.length < skip || h.length > size ||
++            h.barrier_count > PVG_CMD_MAX_BARRIERS ||
++            h.length - skip > PVG_CMD_MAX_PAYLOAD) {
+             qemu_log_mask(LOG_GUEST_ERROR,
+-                          "pvg: bad record size 0x%x @0x%x\n", words[1], head);
+-            return;
++                          "pvg: bad command op=0x%x len=0x%x @0x%x\n",
++                          h.opcode, h.length, head);
++            break;
++        }
++        len = h.length - skip;
++        if (!pvg_fifo_read(s, head + skip, s->payload, len)) {
++            break;
+         }
+-        nwords = MIN(words[1] / 4, 3 + PVG_RECORD_TRACE_WORDS);
+-        pvg_ring_read(s, head, words, nwords * 4);
+         if (trace_event_get_state_backends(TRACE_PVG_LINUX_CMD)) {
+-            g_autoptr(GString) payload = g_string_new(NULL);
++            g_autoptr(GString) words = g_string_new(NULL);
+ 
+-            for (uint32_t i = 3; i < nwords; i++) {
+-                g_string_append_printf(payload, " 0x%x", words[i]);
++            for (uint32_t i = 0; i < MIN(len / 4, PVG_CMD_TRACE_WORDS); i++) {
++                g_string_append_printf(words, " 0x%x",
++                                       ldl_le_p(s->payload + 4 * i));
+             }
+-            trace_pvg_linux_cmd(head, words[0], words[1], words[2],
+-                                payload->str);
+-        }
+-        head = (head + words[1]) % size;
+-        if (s->ack_ring) {
+-            s->regs[PVG_REG_RING_HEAD / 4] = head;
++            trace_pvg_linux_cmd(head, h.opcode, h.barrier_count, h.length,
++                                h.stamp_value, words->str);
+         }
++        /* barriers wait for other FIFOs' stamps; nothing else runs yet */
++        pvg_dispatch(s, &h, s->payload, len);
++        head = (head + h.length) % size;
++        s->regs[PVG_REG_FIFO_READ / 4] = head;
++        last_stamp = h.stamp_value;
++        completed = true;
++    }
++    if (completed) {
++        pvg_signal_stamp(s, PVG_ROOT_STAMP_INDEX, last_stamp);
+     }
+ }
+ 
+@@ -129,7 +270,17 @@ static uint64_t pvg_linux_mmio_read(void *opaque, hwaddr addr, unsigned size)
+     PVGLinuxPCIState *s = opaque;
+     uint64_t val = 0;
+ 
+-    memcpy(&val, (uint8_t *)s->regs + addr, size);
++    if (size == 4 && addr == PVG_REG_IRQ_STATUS) {
++        val = s->irq_status;
++        s->irq_status = 0;
++    } else if (size == 4 && addr == PVG_REG_STAMP_STATUS) {
++        val = s->stamp_status;
++        s->stamp_status = 0;
++    } else if (size == 4 && addr == PVG_REG_DISPLAY_PORTS) {
++        val = s->display_ports;
++    } else {
++        memcpy(&val, (uint8_t *)s->regs + addr, size);
++    }
+     trace_pvg_linux_mmio_read(addr, size, val);
+     return val;
+ }
+@@ -140,10 +291,10 @@ static void pvg_linux_mmio_write(void *opaque, hwaddr addr, uint64_t val,
+     PVGLinuxPCIState *s = opaque;
+ 
+     trace_pvg_linux_mmio_write(addr, size, val);
+-    if (addr == PVG_REG_RING_TAIL && size == 4) {
+-        pvg_ring_consume(s, val);
+-    }
+     memcpy((uint8_t *)s->regs + addr, &val, size);
++    if (addr == PVG_REG_FIFO_WRITTEN && size == 4) {
++        pvg_fifo_process(s, val);
++    }
+ }
+ 
+ static const MemoryRegionOps pvg_linux_mmio_ops = {
+@@ -177,6 +328,7 @@ static void pvg_linux_realize(PCIDevice *dev, Error **errp)
+     pci_set_word(dev->config + PCI_SUBSYSTEM_ID, s->device_id);
+ 
+     s->regs = g_malloc0(s->mmio_size);
++    s->payload = g_malloc(PVG_CMD_MAX_PAYLOAD);
+     memory_region_init_io(&s->mmio, OBJECT(s), &pvg_linux_mmio_ops, s,
+                           "pvg-linux-mmio", s->mmio_size);
+     pci_register_bar(dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mmio);
+@@ -192,6 +344,7 @@ static void pvg_linux_exit(PCIDevice *dev)
+ 
+     msi_uninit(dev);
+     g_free(s->regs);
++    g_free(s->payload);
+ }
+ 
+ static void pvg_linux_reset(DeviceState *dev)
+@@ -199,6 +352,8 @@ static void pvg_linux_reset(DeviceState *dev)
+     PVGLinuxPCIState *s = PVG_LINUX_PCI(dev);
+ 
+     memset(s->regs, 0, s->mmio_size);
++    s->irq_status = 0;
++    s->stamp_status = 0;
+ }
+ 
+ static const Property pvg_linux_properties[] = {
+@@ -206,8 +361,8 @@ static const Property pvg_linux_properties[] = {
+     DEFINE_PROP_UINT16("device-id", PVGLinuxPCIState, device_id, 0xeeee),
+     DEFINE_PROP_UINT32("mmio-size", PVGLinuxPCIState, mmio_size, 16 * KiB),
+     DEFINE_PROP_UINT32("msi-vectors", PVGLinuxPCIState, msi_vectors, 1),
+-    /* advance the consumer pointer after decoding, to see the guest's next step */
+-    DEFINE_PROP_BOOL("ack-ring", PVGLinuxPCIState, ack_ring, false),
++    /* reported via guestDisplayPortCount (0x122c); no scanout yet, so 0 */
++    DEFINE_PROP_UINT32("display-ports", PVGLinuxPCIState, display_ports, 0),
+ };
+ 
+ static void pvg_linux_class_init(ObjectClass *klass, const void *data)
+diff --git a/hw/display/trace-events b/hw/display/trace-events
+index 1b02b95..a73239d 100644
+--- a/hw/display/trace-events
++++ b/hw/display/trace-events
+@@ -231,4 +231,7 @@ apple_gfx_iosfc_raise_irq(uint32_t vector) "vector=0x%x"
+ # pvg-linux-pci.c
+ pvg_linux_mmio_read(uint64_t offset, unsigned size, uint64_t val) "offset=0x%"PRIx64" size=%u val=0x%"PRIx64
+ pvg_linux_mmio_write(uint64_t offset, unsigned size, uint64_t val) "offset=0x%"PRIx64" size=%u val=0x%"PRIx64
+-pvg_linux_cmd(uint32_t off, uint32_t op, uint32_t size, uint32_t seq, const char *payload) "@0x%04x op=0x%02x size=0x%x seq=%u |%s"
++pvg_linux_cmd(uint32_t off, uint32_t op, uint32_t barriers, uint32_t len, uint32_t stamp, const char *payload) "@0x%04x op=0x%02x barriers=%u len=0x%x stamp=%u |%s"
++pvg_linux_cmd_stub(uint32_t op) "op=0x%02x not implemented, completed"
++pvg_linux_signal_stamp(uint32_t index, uint32_t value) "stamps[%u]=%u"
++pvg_linux_device_info(uint32_t version, uint32_t pairs, uint64_t dst) "version=0x%x pairs=%u dst=0x%"PRIx64
+-- 
+2.43.0
+

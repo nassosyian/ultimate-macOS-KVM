@@ -1,0 +1,125 @@
+From 4f81ca6cd55e6e1be0c8b99e767aba876907f373 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Fri, 30 Oct 2026 19:50:17 +0200
+Subject: [PATCH 55/56] hw/display/pvg: guest fixup patches the hot branch too,
+ scans by page offset
+
+Scan guest RAM per 4 KiB page at the functions' page offsets and also patch
+the conditional branch into the outlined assertion, so the abort cannot
+happen before the .cold.1 function is found. Rescan quickly while nothing
+has been found yet.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/pvg-guest-fixups.c | 45 ++++++++++++++++++++++---------
+ 1 file changed, 32 insertions(+), 13 deletions(-)
+
+diff --git a/hw/display/pvg/pvg-guest-fixups.c b/hw/display/pvg/pvg-guest-fixups.c
+index c13453a..847b8ca 100644
+--- a/hw/display/pvg/pvg-guest-fixups.c
++++ b/hw/display/pvg/pvg-guest-fixups.c
+@@ -31,6 +31,7 @@ typedef struct GuestFixup {
+     const char *name;
+     const uint8_t *sig;
+     size_t sig_len;
++    size_t page_off;            /* offset of sig in its 4 KiB page (the cache slides by pages) */
+     size_t patch_off;
+     const uint8_t *patch;
+     size_t patch_len;
+@@ -48,15 +49,32 @@ static const uint8_t slice_cold_sig[] = {
+ };
+ static const uint8_t ret_insn[] = { 0xc3 };
+ 
++/*
++ * The branch to that .cold.1 in the function itself: the .cold page is only paged in by the
++ * first failure (a process has crashed by then), the function's page usually long before.
++ * `je cold.1` becomes `je +0`.
++ */
++static const uint8_t slice_branch_sig[] = {
++    0xff, 0x15, 0xe0, 0x32, 0xa9, 0x30,         /* call [rip + objc_msgSend] (architecture) */
++    0x49, 0x89, 0xc7,                           /* mov r15, rax */
++    0x48, 0x85, 0xc0,                           /* test rax, rax */
++    0x74, 0x73,                                 /* je .cold.1 call */
++    0x4d, 0x85, 0xe4,                           /* test r12, r12 */
++    0x74, 0x14,
++};
++static const uint8_t je_next[] = { 0x00 };
++
+ static const GuestFixup fixups[] = {
+     { "Metal sliceIDForDevice nil-architecture assertion", slice_cold_sig,
+-      sizeof(slice_cold_sig), 0, ret_insn, sizeof(ret_insn) },
++      sizeof(slice_cold_sig), 0x31b, 0, ret_insn, sizeof(ret_insn) },
++    { "Metal sliceIDForDevice nil-architecture branch", slice_branch_sig,
++      sizeof(slice_branch_sig), 0x36a, 13, je_next, sizeof(je_next) },
+ };
+ 
+ #define MAX_SITES       16
+-#define CHECK_MS        3000
+-#define SCAN_MISSING_MS 5000
+-#define RESCAN_MS       60000
++#define CHECK_MS        1000
++#define SCAN_MISSING_MS 200        /* a page-offset scan of 8 GiB takes ~10-20 ms */
++#define RESCAN_MS       30000
+ 
+ struct PVGGuestFixups {
+     QemuThread thread;
+@@ -120,13 +138,13 @@ static int scan_block(RAMBlock *rb, void *opaque)
+     }
+     for (unsigned i = 0; i < ARRAY_SIZE(fixups); i++) {
+         const GuestFixup *fx = &fixups[i];
+-        uint8_t *p = base, *end = base + len;
+ 
+-        while (p < end) {
+-            uint8_t *hit = memmem(p, end - p, fx->sig, fx->sig_len);
++        /* code keeps its offset within the page: compare there only */
++        for (ram_addr_t pg = 0; pg + fx->page_off + fx->sig_len <= len; pg += 4096) {
++            uint8_t *hit = base + pg + fx->page_off;
+ 
+-            if (!hit) {
+-                break;
++            if (hit[0] != fx->sig[0] || memcmp(hit, fx->sig, fx->sig_len)) {
++                continue;
+             }
+             c->found++;
+             if (f->nsites[i] < MAX_SITES) {
+@@ -140,7 +158,6 @@ static int scan_block(RAMBlock *rb, void *opaque)
+                 }
+             }
+             apply(f, i, hit, hit - base);
+-            p = hit + fx->sig_len;
+         }
+     }
+     return 0;
+@@ -155,7 +172,7 @@ static void *fixup_thread(void *opaque)
+     qemu_mutex_lock(&f->lock);
+     while (!f->stop) {
+         int64_t now = g_get_monotonic_time() / 1000;
+-        bool missing = false;
++        bool missing, found_any = false;
+ 
+         /*
+          * Known sites: still patched, or the original bytes again (the page was read back
+@@ -174,8 +191,10 @@ static void *fixup_thread(void *opaque)
+                     f->sites[i][k] = f->sites[i][--f->nsites[i]];
+                 }
+             }
+-            missing |= !f->nsites[i];
++            found_any |= f->nsites[i] != 0;
+         }
++        /* either site fixes the bug (the .cold page may never be paged in once the branch is) */
++        missing = !found_any;
+         /* full scans are expensive (all of guest RAM): often until found, then rarely */
+         if (now - last_scan >= (missing ? SCAN_MISSING_MS : RESCAN_MS)) {
+             ScanCtx c = { .f = f };
+@@ -185,7 +204,7 @@ static void *fixup_thread(void *opaque)
+                 qemu_ram_foreach_block(scan_block, &c);
+             }
+         }
+-        qemu_cond_timedwait(&f->cond, &f->lock, CHECK_MS);
++        qemu_cond_timedwait(&f->cond, &f->lock, missing ? SCAN_MISSING_MS : CHECK_MS);
+     }
+     qemu_mutex_unlock(&f->lock);
+     rcu_unregister_thread();
+-- 
+2.43.0
+

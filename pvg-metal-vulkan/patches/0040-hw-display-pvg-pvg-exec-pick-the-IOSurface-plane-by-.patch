@@ -1,0 +1,38 @@
+From 88cc5f8215722b4dfe814b42996d8c35995db85a Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 22:31:03 +0200
+Subject: [PATCH 40/54] hw/display/pvg/pvg-exec: pick the IOSurface plane by
+ view size (NV12 chroma views carry plane 0)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/pvg-exec.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index fc25a22..bb446a7 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -553,6 +553,19 @@ static bool guest_image_ex(PVGExec *e, uint32_t task, uint32_t ref, int level, u
+         }
+         /* APVObjectBacking planes: {u32 offset, u32 width, u32 height, u32 bpp << 24 | row} */
+         pl = bobj + 0x14 + 16 * plane;
++        /*
++         * The plane index is 0 even for views of other planes (an NV12 surface's RG8 chroma
++         * view): pick the plane whose size matches the view when plane 0 does not.
++         */
++        for (uint32_t p = 0; p < ldl(bobj + 0x10) && 0x14 + 16 * (p + 1) <= MIN(blen, MAX_OBJ) &&
++             ldl(desc + 4) && (ldl(pl + 4) != ldl(desc + 4) || ldl(pl + 8) != ldl(desc + 8));
++             p++) {
++            const uint8_t *cand = bobj + 0x14 + 16 * p;
++
++            if (ldl(cand + 4) == ldl(desc + 4) && ldl(cand + 8) == ldl(desc + 8)) {
++                pl = cand;
++            }
++        }
+         gi->task = 0;
+         gi->va = ((uint64_t)ldl(bobj + 0x08) << 12) + ldl(pl);
+         /* a texture may view the surface's pixels in another format: its own size wins */
+-- 
+2.43.0
+

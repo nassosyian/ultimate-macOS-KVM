@@ -1,0 +1,89 @@
+From a1939c35686a5dd83cc201872c956add3919bbff Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Sat, 31 Oct 2026 13:10:41 +0200
+Subject: [PATCH 71/71] hw/display/pvg: render into 2D multisample textures
+
+Textures of type 2DMultisample were not accepted as render targets, so
+passes drawing into them were skipped, and MSAA passes that resolve them
+fell back to single-sample rendering into the resolve texture. VectorKit
+(Weather's precipitation map) draws the map into a multisample texture
+over several passes and resolves it in the last one: the map came out
+black. 2DMultisample now resolves like 2D, and passes that render into a
+multisample texture without resolving use the same host-only multisample
+image as the pass that later resolves it (nothing written back).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/pvg-exec.c | 33 +++++++++++++++++++++++++--------
+ 1 file changed, 25 insertions(+), 8 deletions(-)
+
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index d1307fc..27cb577 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -1224,6 +1224,7 @@ static bool guest_image_ex(PVGExec *e, uint32_t task, uint32_t ref, int level, u
+         case 1: gi->view_type = VK_IMAGE_VIEW_TYPE_1D_ARRAY; break;
+         case 2: gi->view_type = VK_IMAGE_VIEW_TYPE_2D; break;
+         case 3: gi->view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY; break;
++        case 4: gi->view_type = VK_IMAGE_VIEW_TYPE_2D; break;    /* 2DMultisample */
+         case 5: gi->view_type = VK_IMAGE_VIEW_TYPE_CUBE; break;
+         case 6: gi->view_type = VK_IMAGE_VIEW_TYPE_CUBE_ARRAY; break;
+         case 7: gi->view_type = VK_IMAGE_VIEW_TYPE_3D; break;
+@@ -3294,6 +3295,7 @@ typedef struct Attachment {
+     /* MSAA: gi/img describe the resolve texture; rendering goes to a host-only image */
+     uint32_t ms_ref, samples;
+     HostImage *msimg;
++    bool ms_only;               /* rendering into a multisample texture itself (no resolve) */
+     bool kept;                  /* image fully equal to the guest's copy before the pass */
+     bool priv;                  /* MTLStorageModePrivate target kept on the GPU, not written back */
+     /*
+@@ -3754,6 +3756,17 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+             att[i].ref = 0;
+         }
+     }
++    /*
++     * Passes that render straight into a multisample texture (resolved by a later pass) use
++     * the same host-only multisample image as that pass: nothing is written back (the guest
++     * never reads multisample memory directly)
++     */
++    for (uint32_t i = 0; e->msaa && i < natt; i++) {
++        if (att[i].ref && !att[i].ms_ref && att[i].gi.desc_samples > 1) {
++            att[i].ms_ref = att[i].ref;
++            att[i].ms_only = true;
++        }
++    }
+     /* MSAA: every multisample attachment must agree on the sample count, else none is used */
+     for (uint32_t i = 0; e->msaa && i < natt; i++) {
+         GuestImage mg;
+@@ -3957,16 +3970,20 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
+                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+             att[i].msimg->initialized = true;
+-            cache_drop(e, att[i].img);      /* the resolve rewrites it; refilled after write-back */
+-            barrier(e, att[i].img->image, VK_IMAGE_LAYOUT_UNDEFINED,
+-                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+-            att[i].img->layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+             ca[i].imageView = att[i].msimg->view;
+             ca[i].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+-            ca[i].resolveMode = format_is_integer(att[i].gi.format) ?
+-                                VK_RESOLVE_MODE_SAMPLE_ZERO_BIT : VK_RESOLVE_MODE_AVERAGE_BIT;
+-            ca[i].resolveImageView = att[i].img->view;
+-            ca[i].resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++            if (!att[i].ms_only) {
++                cache_drop(e, att[i].img);  /* the resolve rewrites it; refilled after write-back */
++                barrier(e, att[i].img->image, VK_IMAGE_LAYOUT_UNDEFINED,
++                        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++                att[i].img->layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++                ca[i].resolveMode = format_is_integer(att[i].gi.format) ?
++                                    VK_RESOLVE_MODE_SAMPLE_ZERO_BIT : VK_RESOLVE_MODE_AVERAGE_BIT;
++                ca[i].resolveImageView = att[i].img->view;
++                ca[i].resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++            } else {
++                att[i].store = 0;           /* the contents stay in the multisample image */
++            }
+             ca[i].loadOp = att[i].load == 2 ? VK_ATTACHMENT_LOAD_OP_CLEAR :
+                            att[i].load == 1 ? VK_ATTACHMENT_LOAD_OP_LOAD :
+                            VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+-- 
+2.43.0
+

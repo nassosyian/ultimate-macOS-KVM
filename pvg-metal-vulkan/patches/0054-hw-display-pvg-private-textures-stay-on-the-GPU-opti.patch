@@ -1,0 +1,1177 @@
+From 2f1fd810180cfe8bbacac60810d5098459cd0dc9 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Fri, 30 Oct 2026 12:07:42 +0200
+Subject: [PATCH 54/54] hw/display/pvg: private textures stay on the GPU;
+ optional dirty-tracked upload cache
+
+- MTLStorageModePrivate render targets are not written back and not
+  re-uploaded: the host image is resident, guest memory is marked stale and
+  flushed when something reads it from the guest side (SynchronizeResources,
+  Unmap, uploads of an overlapping image, CPU-side blits / mipmaps, an image
+  about to be re-created for another level). ~200-280 MiB per 500 command
+  buffers not copied; executor time per 500 cmdbufs ~680-1100 -> ~500 ms.
+  Property private-resident (default on).
+- upload-cache (default off): KVM dirty logging on guest RAM keeps textures on
+  the GPU while their pages stay clean. Works, but guest pages are almost all
+  physically scattered (one run per page) and entries churn, so tracking costs
+  about what it saves; kept for experiments.
+- physmem: physical_memory_range_is_dirty() (no clear, no KVM call).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-pci.c | 122 ++++++++
+ hw/display/pvg/pvg-exec.c  | 613 ++++++++++++++++++++++++++++++++++++-
+ hw/display/pvg/pvg-exec.h  |  39 ++-
+ hw/display/trace-events    |   2 +
+ include/system/physmem.h   |   2 +
+ system/physmem.c           |   5 +
+ 6 files changed, 765 insertions(+), 18 deletions(-)
+
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index e558fb7..f7cf800 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -25,6 +25,10 @@
+ #include "ui/surface.h"
+ #include "system/address-spaces.h"
+ #include "system/dma.h"
++#include "system/memory.h"
++#include "system/physmem.h"
++#include "system/ramlist.h"
++#include "hw/core/boards.h"
+ #include "qom/object.h"
+ #include "trace.h"
+ #include "pvg-linux-cmds.h"
+@@ -270,6 +274,10 @@ struct PVGLinuxPCIState {
+     bool async_exec;
+     bool damage_limit;
+     bool msaa;
++    bool upload_cache;
++    bool private_resident;
++    MemoryRegion *dirty_ram;        /* guest RAM with dirty logging on (upload cache) */
++    int64_t dirty_sync_us;          /* of the upload cache sync time: the KVM log sync */
+     QemuThread exec_thread;
+     QemuMutex exec_lock;
+     QemuCond exec_cond;
+@@ -565,6 +573,10 @@ static void pvg_cmd_map_memory(PVGLinuxPCIState *s, const uint8_t *p,
+     task = ldl_le_p(p);
+     va = ldq_le_p(p + 4);
+     size = ldq_le_p(p + 12);
++    if (!map && s->exec && task < PVG_MAX_TASKS && s->tasks[task].root) {
++        /* GPU-only contents not written back yet must reach the pages before they go */
++        pvg_exec_flush_range(s->exec, task, va, size);
++    }
+     if (task >= PVG_MAX_TASKS || !s->tasks[task].root || (va | size) & 0xfff ||
+         size > 4 * GiB) {
+         qemu_log_mask(LOG_GUEST_ERROR, "pvg: bad map task %u va 0x%" PRIx64
+@@ -572,6 +584,10 @@ static void pvg_cmd_map_memory(PVGLinuxPCIState *s, const uint8_t *p,
+         return;
+     }
+     pvg_task_unmap(s, task, va, size);
++    if (s->exec) {
++        /* other pages may back these addresses from now on */
++        pvg_exec_cache_invalidate(s->exec, task, va, size);
++    }
+     if (!map) {
+         return;
+     }
+@@ -1251,6 +1267,68 @@ static bool pvg_exec_translate(void *opaque, uint32_t task, uint64_t va, uint64_
+     return pvg_task_translate(opaque, task, va, gpa);
+ }
+ 
++/* RAM offsets (ram_addr_t) backing task va..va+len, merged into contiguous runs */
++static uint32_t pvg_exec_ram_runs(void *opaque, uint32_t task, uint64_t va, uint64_t len,
++                                  uint64_t (*runs)[2], uint32_t max)
++{
++    PVGLinuxPCIState *s = opaque;
++    uint32_t n = 0;
++
++    RCU_READ_LOCK_GUARD();
++    for (uint64_t p = va & ~0xfffull; p < va + len; p += 0x1000) {
++        uint64_t gpa, xlat, l = 0x1000;
++        MemoryRegion *mr;
++        ram_addr_t ra;
++
++        if (!pvg_task_translate(s, task, p, &gpa)) {
++            return 0;
++        }
++        mr = address_space_translate(&address_space_memory, gpa & ~0xfffull, &xlat, &l, false,
++                                     MEMTXATTRS_UNSPECIFIED);
++        if (!memory_region_is_ram(mr) || l < 0x1000) {
++            return 0;
++        }
++        ra = memory_region_get_ram_addr(mr) + xlat;
++        if (n && runs[n - 1][0] + runs[n - 1][1] == ra) {
++            runs[n - 1][1] += 0x1000;
++        } else if (n == max) {
++            return 0;
++        } else {
++            runs[n][0] = ra;
++            runs[n][1] = 0x1000;
++            n++;
++        }
++    }
++    return n;
++}
++
++static void pvg_exec_dirty_sync(void *opaque)
++{
++    PVGLinuxPCIState *s = opaque;
++    int64_t t0 = g_get_monotonic_time();
++
++    memory_global_dirty_log_sync(false);
++    s->dirty_sync_us += g_get_monotonic_time() - t0;
++}
++
++static void pvg_exec_dirty_test_clear_many(void *opaque, const uint64_t (*runs)[2], uint32_t n,
++                                           bool *dirty)
++{
++    RCU_READ_LOCK_GUARD();
++    for (uint32_t i = 0; i < n; i++) {
++        dirty[i] = physical_memory_range_is_dirty(runs[i][0], runs[i][1], DIRTY_MEMORY_VGA) &&
++                   physical_memory_test_and_clear_dirty(runs[i][0], runs[i][1],
++                                                        DIRTY_MEMORY_VGA, NULL) != 0;
++    }
++}
++
++static bool pvg_exec_dirty_test_clear(void *opaque, uint64_t ram, uint64_t len)
++{
++    /* clearing re-protects the pages in KVM (an ioctl): only for ranges that are dirty */
++    return physical_memory_range_is_dirty(ram, len, DIRTY_MEMORY_VGA) &&
++           physical_memory_test_and_clear_dirty(ram, len, DIRTY_MEMORY_VGA, NULL) != 0;
++}
++
+ static uint8_t pvg_exec_object(void *opaque, uint32_t task, uint32_t id, void *buf,
+                                uint32_t size, uint32_t *len)
+ {
+@@ -1432,6 +1510,10 @@ static void pvg_exec_run_buf(PVGLinuxPCIState *s, uint32_t task, const uint8_t *
+                                   s->exec_max_us, s->exec_read_us / 1000,
+                                   s->exec_read_bytes >> 20, s->exec_write_us / 1000,
+                                   s->exec_write_bytes >> 20, st->gpu_wait_us / 1000);
++        trace_pvg_linux_exec_private(st->priv_skipped >> 20, st->priv_flushes);
++        trace_pvg_linux_exec_cache(st->cache_hits, st->cache_saved >> 20, st->cache_invalidated,
++                                   st->cache_sync_us / 1000, s->dirty_sync_us / 1000);
++        s->dirty_sync_us = 0;
+         trace_pvg_linux_exec_pipelines(st->pipeline_us / 1000, st->spv_cache_hits,
+                                        st->damage_saved >> 20);
+         trace_pvg_linux_exec_stats(s->exec_cmdbufs, st->render_passes, st->draws,
+@@ -1722,6 +1804,7 @@ static void pvg_dispatch(PVGLinuxPCIState *s, const PVGCmdHeader *h,
+ 
+             if (s->exec) {
+                 pvg_exec_task_reset(s->exec, id);
++                pvg_exec_cache_invalidate(s->exec, id, 0, 0);
+             }
+             if (s->tasks[id].mappings) {
+                 g_array_set_size(s->tasks[id].mappings, 0);
+@@ -1729,6 +1812,20 @@ static void pvg_dispatch(PVGLinuxPCIState *s, const PVGCmdHeader *h,
+             s->tasks[id].root = 0;
+         }
+         break;
++    case 0x35:          /* SynchronizeResources {u32 task, u32 count, u32 ids[count]} */
++        if (s->exec && len >= 8) {
++            uint32_t n = MIN(ldl_le_p(payload + 4), (len - 8) / 4);
++
++            for (uint32_t i = 0; i < n; i++) {
++                pvg_exec_synchronize(s->exec, ldl_le_p(payload), ldl_le_p(payload + 8 + 4 * i));
++            }
++        }
++        break;
++    case 0x3c:          /* ReplacePhysical {u32 task, u32 resource}: its pages were swapped */
++        if (s->exec && len >= 4 && ldl_le_p(payload) < PVG_MAX_TASKS) {
++            pvg_exec_cache_invalidate(s->exec, ldl_le_p(payload), 0, 0);
++        }
++        break;
+     case PVG_CMD_DELETE_RESOURCE:
+     case PVG_CMD_DELETE_OBJECT:
+         /* ids are recycled: drop whatever the executor cached for this one */
+@@ -1757,6 +1854,10 @@ static bool pvg_fifo_run(PVGLinuxPCIState *s, uint32_t fifo,
+ {
+     bool ran = false;
+ 
++    if (s->exec && *head != written) {
++        pvg_exec_cache_mark_stale(s->exec);     /* the guest ran (and wrote) since last time */
++    }
++
+     while (*head != written) {
+         PVGCmdHeader h;
+         uint32_t skip, len;
+@@ -2064,6 +2165,9 @@ static void pvg_linux_realize(PCIDevice *dev, Error **errp)
+                     .opaque = s, .read = pvg_exec_read, .write = pvg_exec_write,
+                     .object = pvg_exec_object, .log = pvg_exec_log,
+                     .log_enabled = pvg_exec_log_enabled,
++                    .ram_runs = pvg_exec_ram_runs, .dirty_sync = pvg_exec_dirty_sync,
++                    .dirty_test_clear = pvg_exec_dirty_test_clear,
++                    .dirty_test_clear_many = pvg_exec_dirty_test_clear_many,
+                     .translate = pvg_exec_translate,
+                 };
+ 
+@@ -2075,6 +2179,18 @@ static void pvg_linux_realize(PCIDevice *dev, Error **errp)
+                     pvg_exec_set_dry_run(s->exec, s->exec_dry_run);
+                     pvg_exec_set_damage_limit(s->exec, s->damage_limit);
+                     pvg_exec_set_msaa(s->exec, s->msaa);
++                    pvg_exec_set_private_resident(s->exec, s->private_resident &&
++                                                  !s->async_exec);
++                    /*
++                     * Upload cache: KVM dirty logging on guest RAM tells which texture pages
++                     * the guest wrote. Not with the async worker (syncing needs the BQL).
++                     */
++                    if (s->upload_cache && !s->async_exec && current_machine &&
++                        current_machine->ram) {
++                        s->dirty_ram = current_machine->ram;
++                        memory_region_set_log(s->dirty_ram, true, DIRTY_MEMORY_VGA);
++                        pvg_exec_set_upload_cache(s->exec, true);
++                    }
+                 }
+                 if (!s->exec) {
+                     warn_report("pvg-linux-pci: Metal executor initialisation failed");
+@@ -2107,6 +2223,10 @@ static void pvg_linux_exit(PCIDevice *dev)
+         qemu_bh_delete(s->exec_bh);
+         s->exec_thread_started = false;
+     }
++    if (s->dirty_ram) {
++        memory_region_set_log(s->dirty_ram, false, DIRTY_MEMORY_VGA);
++        s->dirty_ram = NULL;
++    }
+     if (s->exec) {
+         pvg_exec_free(s->exec);
+         s->exec = NULL;
+@@ -2170,6 +2290,8 @@ static const Property pvg_linux_properties[] = {
+     DEFINE_PROP_BOOL("async", PVGLinuxPCIState, async_exec, false),
+     DEFINE_PROP_BOOL("damage-limit", PVGLinuxPCIState, damage_limit, true),
+     DEFINE_PROP_BOOL("msaa", PVGLinuxPCIState, msaa, true),
++    DEFINE_PROP_BOOL("upload-cache", PVGLinuxPCIState, upload_cache, false),
++    DEFINE_PROP_BOOL("private-resident", PVGLinuxPCIState, private_resident, true),
+     DEFINE_PROP_BOOL("gpu", PVGLinuxPCIState, gpu_enable, true),
+     DEFINE_PROP_BOOL("gpu-validation", PVGLinuxPCIState, gpu_validation, false),
+     DEFINE_PROP_BOOL("exec", PVGLinuxPCIState, exec_enable, true),
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index d88874a..0a68da4 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -74,16 +74,6 @@ static inline void stq(uint8_t *p, uint64_t v)
+     memcpy(p, &v, 8);
+ }
+ 
+-typedef struct HostImage {
+-    VkImage image;
+-    VkDeviceMemory mem;
+-    VkImageView view;
+-    VkFormat format;
+-    uint32_t width, height, depth, layers, mips, samples;
+-    VkImageViewType view_type;
+-    VkImageLayout layout;       /* after the last image_upload */
+-    bool initialized;           /* depth/stencil: contents defined (host-only images) */
+-} HostImage;
+ 
+ /* A texture's linear copy in guest memory */
+ typedef struct GuestImage {
+@@ -95,6 +85,7 @@ typedef struct GuestImage {
+     uint32_t mips;              /* levels described below (1 for a single level/slice view) */
+     uint32_t samples;           /* host image sample count (set only for MSAA render targets) */
+     uint32_t desc_samples;      /* MTLTextureDescriptor sampleCount */
++    uint32_t storage;           /* MTLStorageMode: 0 shared, 1 managed, 2 private, 3 memoryless */
+     uint64_t span;              /* bytes from va that belong to the object (0 = unknown) */
+     uint64_t mip_off[MAX_MIPS], mip_slice[MAX_MIPS];   /* relative to va; bytes per image */
+     uint32_t mip_row[MAX_MIPS];
+@@ -103,6 +94,33 @@ typedef struct GuestImage {
+     VkComponentMapping swizzle;
+ } GuestImage;
+ 
++typedef struct HostImage {
++    VkImage image;
++    VkDeviceMemory mem;
++    VkImageView view;
++    VkFormat format;
++    uint32_t width, height, depth, layers, mips, samples;
++    VkImageViewType view_type;
++    VkImageLayout layout;       /* current layout (as recorded in the command buffer) */
++    bool initialized;           /* depth/stencil: contents defined (host-only images) */
++    /*
++     * Upload cache: the image holds exactly the guest's copy at c_task/c_va (c_len bytes) as
++     * long as none of the RAM pages in runs has been written since (dirty tracking).
++     */
++    bool cached;
++    uint64_t checked;           /* cache epoch of the last dirty check */
++    /*
++     * MTLStorageModePrivate textures (GPU only): the image keeps their contents. resident:
++     * it holds the latest contents of pgi's memory; guest_stale: guest memory is older
++     * (not written back yet: flushed when something reads that memory from the guest side).
++     */
++    bool priv, resident, guest_stale;
++    GuestImage pgi;
++    uint32_t c_task, nruns;
++    uint64_t c_va, c_len;
++    uint64_t (*runs)[2];
++} HostImage;
++
+ typedef struct DSAttachmentSave {
+     uint32_t depth_ref, stencil_ref;
+ } DSAttachmentSave;
+@@ -165,6 +183,17 @@ struct PVGExec {
+     VkPipelineCache vk_cache;
+     bool damage_limit;          /* upload / write back only what a pass draws */
+     bool msaa;                  /* render multisample passes multisampled (else into the resolve texture) */
++    bool upload_cache;
++    GPtrArray *cached;          /* HostImages with cached == true */
++    GArray *pending;            /* RAM runs found dirty while filling, for the next sync */
++    uint64_t cache_syncs;
++    bool cache_stale;          /* guest may have written memory since the last sync */
++    uint64_t wb_storage[4];     /* diagnostics: bytes written back per MTLStorageMode */
++    bool private_resident;      /* keep MTLStorageModePrivate textures on the GPU */
++    GPtrArray *priv_imgs;       /* HostImages with priv set */
++    uint64_t cache_epoch;      /* bumped at every dirty-log sync */
++    uint64_t dirty_floor;      /* entries checked before this epoch may have missed writes */
++    HostImage *cache_writer;    /* the image whose own contents are being written back */
+     uint8_t unhandled_seen[3][128];   /* command ids already reported */
+     uint32_t texfail_logged, blit_unhandled, resolve_logged, cwb_logged, cio_dumps, buffail_logged, ccmd_logged;
+     DSAttachmentSave last_ds;
+@@ -425,10 +454,16 @@ static uint64_t arena_alloc(PVGExec *e, uint64_t len)
+  * Diagnostics (dump mode only): remember which guest-physical pages the executor wrote, so
+  * aliases of the same memory in other tasks (shared IOSurfaces) are recognised.
+  */
++static void priv_invalidate_range(PVGExec *e, uint32_t task, uint64_t va, uint64_t len,
++                                  const HostImage *writer);
++
+ static void note_write(PVGExec *e, uint32_t task, uint64_t va, uint64_t len, char kind)
+ {
+     uint64_t gpa;
+ 
++    /* the executor changed guest memory: cached GPU copies of it are stale */
++    pvg_exec_cache_invalidate(e, task, va, len);
++    priv_invalidate_range(e, task, va, len, e->cache_writer);
+     if (!e->dump_dir || !e->host.translate) {
+         return;
+     }
+@@ -722,6 +757,7 @@ static bool guest_image_ex(PVGExec *e, uint32_t task, uint32_t ref, int level, u
+     }
+     gi->format = mtl_pixel_format(lduw(desc + 2), &gi->bpp, &gi->swizzle);
+     gi->desc_samples = MAX(lduw(desc + 18), 1);
++    gi->storage = (lduw(desc + 22) >> 4) & 0xf;
+     if (gi->format == VK_FORMAT_UNDEFINED && e->texfail_logged < 60) {
+         e->texfail_logged++;
+         elog(e, "task %u texture %u: MTLPixelFormat %u not mapped (%ux%u row %u, %s)", task, ref,
+@@ -943,6 +979,382 @@ static bool image_upload(PVGExec *e, const GuestImage *gi, HostImage *hi, VkImag
+     return true;
+ }
+ 
++/* ---- upload cache: GPU copies of textures, valid while their guest pages stay clean ---- */
++
++#define CACHE_MAX_RUNS 4096
++
++static void cache_drop(PVGExec *e, HostImage *hi)
++{
++    if (!hi->cached) {
++        return;
++    }
++    g_ptr_array_remove_fast(e->cached, hi);
++    g_free(hi->runs);
++    hi->runs = NULL;
++    hi->nruns = 0;
++    hi->cached = false;
++    e->stats.cache_invalidated++;
++}
++
++static void dirty_log_add(PVGExec *e, uint64_t start, uint64_t len, const HostImage *owner);
++static bool cache_valid(const HostImage *hi, const GuestImage *gi);
++
++/* the image now equals the guest's copy of gi (just uploaded, or rendered and written back) */
++static void cache_fill(PVGExec *e, HostImage *hi, const GuestImage *gi)
++{
++    uint64_t (*runs)[2];
++    uint64_t len = guest_image_size(gi);
++    uint32_t n;
++
++    if (!e->upload_cache || !e->host.ram_runs || !len) {
++        return;
++    }
++    if (cache_valid(hi, gi)) {
++        /* same pages as before (mapping changes drop entries): just clear their bits */
++        for (uint32_t i = 0; i < hi->nruns; i++) {
++            if (e->host.dirty_test_clear(e->host.opaque, hi->runs[i][0], hi->runs[i][1])) {
++                dirty_log_add(e, hi->runs[i][0], hi->runs[i][1], hi);
++            }
++        }
++        hi->checked = e->cache_epoch;
++        return;
++    }
++    runs = g_malloc(sizeof(*runs) * CACHE_MAX_RUNS);
++    n = e->host.ram_runs(e->host.opaque, gi->task, gi->va, len, runs, CACHE_MAX_RUNS);
++    if (!n) {
++        g_free(runs);
++        cache_drop(e, hi);
++        return;
++    }
++    /*
++     * Clear the pages' dirty bits (they include our own upload source / write-back) but keep
++     * what was dirty for the next sync: other cached images may share these pages.
++     */
++    for (uint32_t i = 0; i < n; i++) {
++        if (e->host.dirty_test_clear(e->host.opaque, runs[i][0], runs[i][1])) {
++            dirty_log_add(e, runs[i][0], runs[i][1], hi);
++        }
++    }
++    if (!hi->cached) {
++        g_ptr_array_add(e->cached, hi);
++    }
++    g_free(hi->runs);
++    hi->runs = g_realloc(runs, sizeof(*runs) * n);
++    hi->nruns = n;
++    hi->c_task = gi->task;
++    hi->c_va = gi->va;
++    hi->c_len = len;
++    hi->cached = true;
++    hi->checked = e->cache_epoch;
++}
++
++static bool cache_valid(const HostImage *hi, const GuestImage *gi)
++{
++    return hi->cached && hi->c_task == gi->task && hi->c_va == gi->va &&
++           hi->c_len == guest_image_size(gi);
++}
++
++#define CACHE_DIRTY_LOG 8192     /* recently dirty runs remembered for images sharing pages */
++
++/* remember runs found dirty: other cached images on the same pages check this list */
++static void dirty_log_add(PVGExec *e, uint64_t start, uint64_t len, const HostImage *owner)
++{
++    uint64_t r[4] = { start, len, (uintptr_t)owner, e->cache_epoch };
++
++    if (e->pending->len >= CACHE_DIRTY_LOG) {
++        /* forget the oldest half; images not checked since then are dropped when used */
++        guint keep = e->pending->len / 2;
++
++        e->dirty_floor = g_array_index(e->pending, uint64_t, 4 * (e->pending->len - keep) + 3);
++        g_array_remove_range(e->pending, 0, e->pending->len - keep);
++    }
++    g_array_append_vals(e->pending, r, 1);
++}
++
++/*
++ * Start of a command buffer: collect the guest's writes since the last FIFO run (one KVM
++ * dirty-log sync). Cached images are checked lazily, when a command buffer uses them.
++ */
++static void cache_sync(PVGExec *e)
++{
++    int64_t t0;
++
++    if (!e->upload_cache || !e->cache_stale || !e->cached->len) {
++        return;
++    }
++    e->cache_stale = false;
++    t0 = g_get_monotonic_time();
++    e->host.dirty_sync(e->host.opaque);
++    e->cache_epoch++;
++    e->stats.cache_sync_us += g_get_monotonic_time() - t0;
++    if (++e->cache_syncs % 1000 == 0) {
++        elog(e, "write-back by storage mode: shared %" G_GUINT64_FORMAT " MiB, managed %"
++             G_GUINT64_FORMAT " MiB, private %" G_GUINT64_FORMAT " MiB", e->wb_storage[0] >> 20,
++             e->wb_storage[1] >> 20, e->wb_storage[2] >> 20);
++        uint64_t runs = 0, bytes = 0;
++
++        for (guint i = 0; i < e->cached->len; i++) {
++            HostImage *hi = g_ptr_array_index(e->cached, i);
++
++            runs += hi->nruns;
++            bytes += hi->c_len;
++        }
++        elog(e, "upload cache: %u images, %" G_GUINT64_FORMAT " runs, %" G_GUINT64_FORMAT
++             " MiB, %u recent dirty runs", e->cached->len, runs, bytes >> 20, e->pending->len);
++    }
++}
++
++/* is the cached copy still the guest's? (tests and clears its pages' dirty bits) */
++static bool cache_check(PVGExec *e, HostImage *hi)
++{
++    int64_t t0;
++    g_autofree bool *dirty = NULL;
++    bool ok = true;
++
++    if (hi->checked == e->cache_epoch) {
++        return true;
++    }
++    if (hi->checked < e->dirty_floor) {
++        cache_drop(e, hi);      /* writes it may have missed are no longer remembered */
++        return false;
++    }
++    t0 = g_get_monotonic_time();
++    dirty = g_new(bool, hi->nruns);
++    e->host.dirty_test_clear_many(e->host.opaque, (const uint64_t (*)[2])hi->runs, hi->nruns,
++                                  dirty);
++    for (uint32_t k = 0; k < hi->nruns; k++) {
++        if (dirty[k]) {
++            dirty_log_add(e, hi->runs[k][0], hi->runs[k][1], NULL);
++            ok = false;
++        }
++    }
++    /* pages written while another image sharing them was checked or filled */
++    for (guint i = e->pending->len, seen = 0; ok && i-- > 0; seen++) {
++        const uint64_t *r = &g_array_index(e->pending, uint64_t, 4 * i);
++
++        if (r[3] <= hi->checked) {
++            break;
++        }
++        if (seen >= 512) {
++            ok = false;         /* long unused: re-uploading beats scanning the whole log */
++            break;
++        }
++        if (r[2] == (uintptr_t)hi) {
++            continue;
++        }
++        for (uint32_t k = 0; k < hi->nruns; k++) {
++            if (r[0] < hi->runs[k][0] + hi->runs[k][1] && hi->runs[k][0] < r[0] + r[1]) {
++                ok = false;
++                break;
++            }
++        }
++    }
++    e->stats.cache_sync_us += g_get_monotonic_time() - t0;
++    if (!ok) {
++        cache_drop(e, hi);
++        return false;
++    }
++    hi->checked = e->cache_epoch;
++    return true;
++}
++
++void pvg_exec_cache_mark_stale(PVGExec *e)
++{
++    e->cache_stale = true;
++}
++
++void pvg_exec_cache_invalidate(PVGExec *e, uint32_t task, uint64_t va, uint64_t len)
++{
++    for (guint i = e->cached ? e->cached->len : 0; i-- > 0;) {
++        HostImage *hi = g_ptr_array_index(e->cached, i);
++
++        if (hi != e->cache_writer && hi->c_task == task &&
++            (!len || (hi->c_va < va + len && va < hi->c_va + hi->c_len))) {
++            cache_drop(e, hi);
++        }
++    }
++}
++
++/* ---- private textures: resident on the GPU, written back only when the guest needs it ---- */
++
++static bool gi_overlap(const GuestImage *a, uint32_t task, uint64_t va, uint64_t len)
++{
++    uint64_t alen = guest_image_size(a);
++
++    return a->task == task && a->va < va + len && va < a->va + alen;
++}
++
++/* will hi be used as is for gi (else it gets re-created and loses unflushed contents) */
++static bool priv_same(const HostImage *hi, const GuestImage *gi)
++{
++    return hi && hi->priv && hi->pgi.task == gi->task && hi->pgi.va == gi->va &&
++           hi->pgi.width == gi->width && hi->pgi.height == gi->height &&
++           hi->pgi.mips == gi->mips && hi->pgi.layers == gi->layers &&
++           hi->pgi.depth == gi->depth && hi->pgi.format == gi->format;
++}
++
++static void priv_track(PVGExec *e, HostImage *hi, const GuestImage *gi)
++{
++    if (!hi->priv) {
++        hi->priv = true;
++        g_ptr_array_add(e->priv_imgs, hi);
++    }
++    hi->pgi = *gi;
++}
++
++static bool submit_wait(PVGExec *e, const VkSubmitInfo *si);
++
++/*
++ * write a stale image back to guest memory (its own submission: call only while no command
++ * buffer is being recorded). Stale images are single-level 2D render targets.
++ */
++static void priv_flush(PVGExec *e, HostImage *hi)
++{
++    const GuestImage *gi = &hi->pgi;
++    uint64_t size = (uint64_t)gi->row_bytes * gi->height, off;
++    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
++    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
++                        .pCommandBuffers = &e->cmd };
++    VkBufferImageCopy r = {
++        .bufferRowLength = gi->row_bytes / MAX(gi->bpp, 1),
++        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++        .imageExtent = { gi->width, gi->height, 1 },
++    };
++
++    if (!hi->guest_stale) {
++        return;
++    }
++    hi->guest_stale = false;
++    off = arena_alloc(e, size);
++    if (off == UINT64_MAX || hi->layout == VK_IMAGE_LAYOUT_UNDEFINED) {
++        return;
++    }
++    r.bufferOffset = off;
++    vkResetCommandBuffer(e->cmd, 0);
++    vkBeginCommandBuffer(e->cmd, &bi);
++    barrier(e, hi->image, hi->layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++    hi->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    vkCmdCopyImageToBuffer(e->cmd, hi->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, e->arena, 1,
++                           &r);
++    vkEndCommandBuffer(e->cmd);
++    if (!submit_wait(e, &si)) {
++        return;
++    }
++    e->host.write(e->host.opaque, gi->task, gi->va, e->arena_ptr + off, wb_size(gi, size));
++    e->stats.priv_flushes++;
++}
++
++/* guest memory task:va..va+len is about to be read from the guest side: write back stale images */
++static void priv_flush_range(PVGExec *e, uint32_t task, uint64_t va, uint64_t len,
++                             const HostImage *except)
++{
++    for (guint i = 0; i < e->priv_imgs->len; i++) {
++        HostImage *hi = g_ptr_array_index(e->priv_imgs, i);
++
++        if (hi != except && hi->guest_stale && gi_overlap(&hi->pgi, task, va, len)) {
++            priv_flush(e, hi);
++        }
++    }
++}
++
++/* the memory was rewritten (by the GPU into 'writer', or by the executor): others are stale */
++static void priv_invalidate_range(PVGExec *e, uint32_t task, uint64_t va, uint64_t len,
++                                  const HostImage *writer)
++{
++    for (guint i = 0; i < e->priv_imgs->len; i++) {
++        HostImage *hi = g_ptr_array_index(e->priv_imgs, i);
++
++        if (hi != writer && hi->resident && gi_overlap(&hi->pgi, task, va, len)) {
++            hi->resident = false;
++        }
++    }
++}
++
++void pvg_exec_synchronize(PVGExec *e, uint32_t task, uint32_t id)
++{
++    static const uint32_t variants[] = { 0, 0x10000000u };
++
++    for (size_t i = 0; i < G_N_ELEMENTS(variants); i++) {
++        gint64 key = key_of(task, id | variants[i]);
++        HostImage *hi = g_hash_table_lookup(e->images, &key);
++
++        if (hi && hi->guest_stale) {
++            priv_flush(e, hi);
++        }
++    }
++}
++
++void pvg_exec_flush_range(PVGExec *e, uint32_t task, uint64_t va, uint64_t len)
++{
++    for (guint i = 0; e->priv_imgs && i < e->priv_imgs->len; i++) {
++        HostImage *hi = g_ptr_array_index(e->priv_imgs, i);
++
++        if (hi->guest_stale && (!len || gi_overlap(&hi->pgi, task, va, len)) &&
++            hi->pgi.task == task) {
++            priv_flush(e, hi);
++        }
++    }
++}
++
++/*
++ * before a segment records anything: make guest memory current for every texture it may
++ * upload (other images' stale contents overlapping it)
++ */
++static void priv_prepare_refs(PVGExec *e, uint32_t task, const uint32_t *refs, uint32_t n)
++{
++    for (uint32_t i = 0; i < n && e->priv_imgs->len; i++) {
++        GuestImage gi;
++        gint64 key = key_of(task, refs[i]);
++
++        if (refs[i] && guest_image(e, task, refs[i], &gi)) {
++            HostImage *own = g_hash_table_lookup(e->images, &key);
++
++            if (own && own->guest_stale && !priv_same(own, &gi)) {
++                priv_flush(e, own);     /* about to be re-created for another shape */
++            }
++            priv_flush_range(e, gi.task, gi.va, guest_image_size(&gi),
++                             priv_same(own, &gi) ? own : NULL);
++        }
++    }
++}
++
++/* make hi a shader-readable texture: reuse the cached copy or upload the guest's */
++static void texture_prepare(PVGExec *e, const GuestImage *gi, HostImage *hi,
++                            VkImageLayout final)
++{
++    if (e->private_resident && gi->storage == 2) {
++        if (hi->resident && priv_same(hi, gi)) {
++            if (hi->layout != final) {
++                barrier(e, hi->image, hi->layout, final);
++                hi->layout = final;
++            }
++            e->stats.priv_skipped += guest_image_size(gi);
++            return;
++        }
++        if (image_upload(e, gi, hi, final)) {
++            priv_track(e, hi, gi);
++            hi->resident = true;
++            hi->guest_stale = false;
++        }
++        return;
++    }
++    if (cache_valid(hi, gi) && cache_check(e, hi)) {
++        if (hi->layout != final) {
++            barrier(e, hi->image, hi->layout, final);
++            hi->layout = final;
++        }
++        e->stats.cache_hits++;
++        e->stats.cache_saved += hi->c_len;
++        return;
++    }
++    if (image_upload(e, gi, hi, final)) {
++        cache_fill(e, hi, gi);
++    } else {
++        cache_drop(e, hi);
++    }
++}
++
+ /* one level-0 rectangle of a single-image attachment: guest rows -> arena -> image */
+ static bool image_upload_rect(PVGExec *e, const GuestImage *gi, HostImage *hi, VkRect2D rc,
+                               VkImageLayout final)
+@@ -1674,6 +2086,35 @@ static VkRect2D segment_damage(const uint8_t *p, uint32_t off, uint32_t len, uin
+                        { (uint32_t)(dx1 - dx0), (uint32_t)(dy1 - dy0) } };
+ }
+ 
++static void set_refs(uint32_t *refs, const uint8_t *a, uint32_t alen);
++
++/* texture refs a segment binds (Set{Fragment,Vertex}Textures, compute SetTextures) */
++static uint32_t segment_texture_refs(const uint8_t *p, uint32_t off, uint32_t len, uint32_t *out,
++                                     uint32_t max)
++{
++    uint32_t n = 0;
++
++    for (uint32_t o = off; o + 8 <= len;) {
++        uint32_t id = ldl(p + o), clen = ldl(p + o + 4);
++
++        if (clen < 8 || o + clen > len) {
++            break;
++        }
++        if (id == 0x72 || id == 0x81 || id == 0xce) {
++            uint32_t refs[MAX_SLOTS] = { 0 };
++
++            set_refs(refs, p + o + 8, clen - 8);
++            for (int i = 0; i < MAX_SLOTS && n < max; i++) {
++                if (refs[i]) {
++                    out[n++] = refs[i];
++                }
++            }
++        }
++        o += clen;
++    }
++    return n;
++}
++
+ /* census: the first time an encoder command id is seen but not executed */
+ static void note_unhandled(PVGExec *e, const char *enc, uint32_t id, uint32_t len)
+ {
+@@ -1869,6 +2310,8 @@ typedef struct Attachment {
+     /* MSAA: gi/img describe the resolve texture; rendering goes to a host-only image */
+     uint32_t ms_ref, samples;
+     HostImage *msimg;
++    bool kept;                  /* image fully equal to the guest's copy before the pass */
++    bool priv;                  /* MTLStorageModePrivate target kept on the GPU, not written back */
+ } Attachment;
+ 
+ /* DescribeRenderPass depth (bytes 0..39) and stencil (40..75) attachments */
+@@ -2354,6 +2797,27 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+     }
+     e->stats.render_passes++;
+ 
++    if (e->private_resident && e->priv_imgs->len) {
++        /* guest copies this pass may upload must include other images' stale contents */
++        uint32_t refs[128], n = segment_texture_refs(p, off, len, refs, 128);
++
++        for (uint32_t i = 0; i < natt; i++) {
++            if (att[i].ref) {
++                gint64 key = key_of(task, att[i].level || att[i].slice ?
++                                    att[i].ref | 0x10000000u : att[i].ref);
++                HostImage *own = g_hash_table_lookup(e->images, &key);
++
++                if (own && own->guest_stale && !priv_same(own, &att[i].gi)) {
++                    priv_flush(e, own);     /* about to be re-created for another level */
++                }
++                priv_flush_range(e, att[i].gi.task, att[i].gi.va,
++                                 guest_image_size(&att[i].gi),
++                                 priv_same(own, &att[i].gi) ? own : NULL);
++            }
++        }
++        priv_prepare_refs(e, task, refs, n);
++    }
++
+     vkResetCommandBuffer(e->cmd, 0);
+     vkBeginCommandBuffer(e->cmd, &bi);
+     for (uint32_t i = 0; i < natt; i++) {
+@@ -2410,7 +2874,7 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                     done[ndone++] = refs[i];
+                     hi = host_image(e, task, refs[i], &gi, false);
+                     if (hi) {
+-                        image_upload(e, &gi, hi, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++                        texture_prepare(e, &gi, hi, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                     }
+                     tex_census(e, task, refs[i], &gi);
+                     if (att[0].gi.task == 0 && rw >= 1920 && e->stats.uploads < 6000) {
+@@ -2457,8 +2921,10 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
+                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+             att[i].msimg->initialized = true;
++            cache_drop(e, att[i].img);      /* the resolve rewrites it; refilled after write-back */
+             barrier(e, att[i].img->image, VK_IMAGE_LAYOUT_UNDEFINED,
+                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++            att[i].img->layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+             ca[i].imageView = att[i].msimg->view;
+             ca[i].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+             ca[i].resolveMode = format_is_integer(att[i].gi.format) ?
+@@ -2479,8 +2945,46 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+             att[i].gi.width == rw && att[i].gi.height == rh) {
+             att[i].damage = damage;
+         }
+-        if (att[i].load == 1 && (att[i].damage.extent.width < att[i].gi.width ||
+-                                 att[i].damage.extent.height < att[i].gi.height)) {
++        att[i].priv = e->private_resident && att[i].gi.storage == 2 && att[i].samples <= 1;
++        if (att[i].priv) {
++            HostImage *hi = att[i].img;
++
++            if (att[i].load == 1 && !(hi->resident && priv_same(hi, &att[i].gi))) {
++                /* not on the GPU yet: load all of it (it stays resident afterwards) */
++                image_upload(e, &att[i].gi, hi, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++            } else if (att[i].load == 1) {
++                e->stats.priv_skipped += guest_image_size(&att[i].gi);
++            }
++            if (hi->layout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) {
++                barrier(e, hi->image, att[i].load == 1 ? hi->layout : VK_IMAGE_LAYOUT_UNDEFINED,
++                        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++            }
++            hi->layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++            ca[i].imageView = hi->view;
++            ca[i].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++            ca[i].loadOp = att[i].load == 2 ? VK_ATTACHMENT_LOAD_OP_CLEAR :
++                           att[i].load == 1 ? VK_ATTACHMENT_LOAD_OP_LOAD :
++                           VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++            ca[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++            for (int k = 0; k < 4; k++) {
++                ca[i].clearValue.color.float32[k] = att[i].clear[k];
++            }
++            continue;
++        }
++        att[i].kept = att[i].load == 1 && cache_valid(att[i].img, &att[i].gi) &&
++                      cache_check(e, att[i].img);
++        if (att[i].kept) {
++            /* the image already holds the guest's copy: load from it as is */
++            if (att[i].img->layout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) {
++                barrier(e, att[i].img->image, att[i].img->layout,
++                        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++            }
++            e->stats.cache_hits++;
++            e->stats.cache_saved += (uint64_t)att[i].damage.extent.width *
++                                    att[i].damage.extent.height * att[i].gi.bpp;
++        } else if (att[i].load == 1 && (att[i].damage.extent.width < att[i].gi.width ||
++                                        att[i].damage.extent.height < att[i].gi.height)) {
++            cache_drop(e, att[i].img);  /* only the rectangle will be defined */
+             if (att[i].damage.extent.width && att[i].damage.extent.height) {
+                 image_upload_rect(e, &att[i].gi, att[i].img, att[i].damage,
+                                   VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+@@ -2492,10 +2996,13 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                 (uint64_t)att[i].damage.extent.width * att[i].damage.extent.height * att[i].gi.bpp;
+         } else if (att[i].load == 1) {
+             image_upload(e, &att[i].gi, att[i].img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++            att[i].kept = true;         /* fully defined: equal to the guest's copy again */
+         } else {
++            cache_drop(e, att[i].img);
+             barrier(e, att[i].img->image, VK_IMAGE_LAYOUT_UNDEFINED,
+                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+         }
++        att[i].img->layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+         ca[i].imageView = att[i].img->view;
+         ca[i].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+         ca[i].loadOp = att[i].load == 2 ? VK_ATTACHMENT_LOAD_OP_CLEAR :
+@@ -2871,9 +3378,17 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+         };
+ 
+         att[i].wb_off = UINT64_MAX;
+-        if (!att[i].img || att[i].store != 1) {
++        if (!att[i].img) {
++            continue;
++        }
++        if (att[i].store != 1) {
++            cache_drop(e, att[i].img);  /* rendered but not stored to the guest's copy */
++            att[i].img->resident = false;
+             continue;
+         }
++        if (att[i].priv) {
++            continue;           /* stays on the GPU; written back only when the guest needs it */
++        }
+         if (!att[i].damage.extent.width || !att[i].damage.extent.height) {
+             continue;           /* nothing drawn into a loaded/undefined attachment */
+         }
+@@ -2889,6 +3404,7 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+         r.imageExtent = (VkExtent3D){ att[i].damage.extent.width, att[i].damage.extent.height, 1 };
+         barrier(e, att[i].img->image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++        att[i].img->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+         vkCmdCopyImageToBuffer(e->cmd, att[i].img->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                e->arena, 1, &r);
+     }
+@@ -2974,10 +3490,25 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                                     (gssize)att[i].gi.row_bytes * att[i].gi.height, NULL);
+             }
+         }
++        if (att[i].priv && att[i].img && att[i].store == 1) {
++            HostImage *hi = att[i].img;
++
++            priv_track(e, hi, &att[i].gi);
++            hi->resident = true;
++            hi->guest_stale = true;
++            priv_invalidate_range(e, att[i].gi.task, att[i].gi.va, guest_image_size(&att[i].gi),
++                                  hi);
++            pvg_exec_cache_invalidate(e, att[i].gi.task, att[i].gi.va,
++                                      guest_image_size(&att[i].gi));
++            e->stats.priv_skipped += (uint64_t)att[i].gi.row_bytes * att[i].gi.height;
++        }
+         if (att[i].wb_off != UINT64_MAX) {
+             uint64_t n = wb_size(&att[i].gi, (uint64_t)att[i].gi.row_bytes * att[i].gi.height);
+             VkRect2D d = att[i].damage;
+ 
++            /* writing back the image's own contents keeps it valid if it was (see below) */
++            e->cache_writer = att[i].kept ? att[i].img : NULL;
++
+             if (d.extent.width == att[i].gi.width && d.extent.height == att[i].gi.height) {
+                 note_write(e, att[i].gi.task, att[i].gi.va, n, 'R');
+                 e->host.write(e->host.opaque, att[i].gi.task, att[i].gi.va,
+@@ -3000,6 +3531,19 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                 e->stats.damage_saved += n - (uint64_t)d.extent.height * w;
+             }
+             e->stats.writebacks++;
++            e->wb_storage[MIN(att[i].gi.storage, 3u)] += (uint64_t)d.extent.height *
++                                                         d.extent.width * att[i].gi.bpp;
++            e->cache_writer = NULL;
++            /*
++             * The guest's copy now equals the image if all of it was written back, or if the
++             * image matched it before the pass (only the drawn rectangle changed)
++             */
++            if (att[i].kept || (d.extent.width == att[i].gi.width &&
++                                d.extent.height == att[i].gi.height)) {
++                cache_fill(e, att[i].img, &att[i].gi);
++            } else {
++                cache_drop(e, att[i].img);
++            }
+         }
+     }
+     memcpy(e->last_att, att, sizeof(att));
+@@ -3228,6 +3772,11 @@ static void exec_compute_segment(PVGExec *e, uint32_t task, const uint8_t *p, ui
+     bool started = false;
+ 
+     e->stats.compute_segments++;
++    if (e->private_resident && e->priv_imgs->len) {
++        uint32_t refs[128], n = segment_texture_refs(p, 0, len, refs, 128);
++
++        priv_prepare_refs(e, task, refs, n);
++    }
+     while (off + 8 <= len) {
+         uint32_t id = ldl(p + off), clen = ldl(p + off + 4);
+         const uint8_t *a = p + off + 8;
+@@ -3424,8 +3973,8 @@ static void exec_compute_segment(PVGExec *e, uint32_t task, const uint8_t *p, ui
+                     gi.view_type == pp->texture_view[i] &&
+                     (hi = host_image(e, task, cs.tex[i], &gi, false))) {
+                     if (!seen) {
+-                        image_upload(e, &gi, hi, general ? VK_IMAGE_LAYOUT_GENERAL :
+-                                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++                        texture_prepare(e, &gi, hi, general ? VK_IMAGE_LAYOUT_GENERAL :
++                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                         up_ref[nup++] = cs.tex[i];
+                         if (e->dump_dir && e->cio_dumps < 12 && gi.layers * gi.depth == 1 &&
+                             cio_match(e, pp->fs_name)) {
+@@ -3749,6 +4298,9 @@ static void generate_mipmaps(PVGExec *e, uint32_t task, uint32_t ref)
+ 
+ static void exec_blit_segment(PVGExec *e, uint32_t task, const uint8_t *p, uint32_t len)
+ {
++    if (e->private_resident) {
++        pvg_exec_flush_range(e, task, 0, 0);    /* blits copy through guest memory */
++    }
+     for (uint32_t off = 0; off + 8 <= len;) {
+         uint32_t id = ldl(p + off), clen = ldl(p + off + 4);
+         const uint8_t *a = p + off + 8;
+@@ -3877,6 +4429,7 @@ void pvg_exec_cmdbuf(PVGExec *e, uint32_t task, const uint8_t *buf, uint64_t len
+     if (e->disabled) {
+         return;
+     }
++    cache_sync(e);
+     if (e->dump_dir && !e->capture_left) {
+         /* frame capture on demand: touch <dump-dir>/capture */
+         g_autofree char *trig = g_build_filename(e->dump_dir, "capture", NULL);
+@@ -3937,6 +4490,9 @@ static gboolean match_task_str(gpointer key, gpointer value, gpointer task)
+ void pvg_exec_reset_wait(PVGExec *e)
+ {
+     e->stats.gpu_wait_us = e->stats.pipeline_us = e->stats.damage_saved = 0;
++    e->stats.cache_hits = e->stats.cache_saved = e->stats.cache_invalidated = 0;
++    e->stats.cache_sync_us = 0;
++    e->stats.priv_skipped = e->stats.priv_flushes = 0;
+ }
+ 
+ void pvg_exec_object_deleted(PVGExec *e, uint32_t task, uint32_t id)
+@@ -4006,6 +4562,18 @@ void pvg_exec_set_msaa(PVGExec *e, bool on)
+     e->msaa = on;
+ }
+ 
++void pvg_exec_set_private_resident(PVGExec *e, bool on)
++{
++    e->private_resident = on;
++}
++
++void pvg_exec_set_upload_cache(PVGExec *e, bool on)
++{
++    e->upload_cache = on && e->host.ram_runs && e->host.dirty_sync && e->host.dirty_test_clear &&
++                      e->host.dirty_test_clear_many;
++    e->cache_stale = true;
++}
++
+ void pvg_exec_set_dump_dir(PVGExec *e, const char *dir)
+ {
+     g_free(e->dump_dir);
+@@ -4024,6 +4592,13 @@ static void image_free(gpointer v)
+     HostImage *hi = v;
+     VkDevice d = free_ctx->gpu->device;
+ 
++    if (hi->cached) {
++        g_ptr_array_remove_fast(free_ctx->cached, hi);
++        g_free(hi->runs);
++    }
++    if (hi->priv) {
++        g_ptr_array_remove_fast(free_ctx->priv_imgs, hi);
++    }
+     vkDestroyImageView(d, hi->view, NULL);
+     vkDestroyImage(d, hi->image, NULL);
+     vkFreeMemory(d, hi->mem, NULL);
+@@ -4065,6 +4640,9 @@ PVGExec *pvg_exec_new(PVGGpu *gpu, const PVGExecHost *host)
+     e->gpu = gpu;
+     e->host = *host;
+     free_ctx = e;
++    e->cached = g_ptr_array_new();
++    e->priv_imgs = g_ptr_array_new();
++    e->pending = g_array_new(false, false, sizeof(uint64_t) * 4);
+     e->images = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, image_free);
+     e->pipelines = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, pipeline_free);
+     e->spv_cache = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, spv_cache_free);
+@@ -4114,6 +4692,9 @@ void pvg_exec_free(PVGExec *e)
+     vkDeviceWaitIdle(d);
+     free_ctx = e;
+     g_hash_table_destroy(e->images);
++    g_ptr_array_free(e->cached, true);
++    g_ptr_array_free(e->priv_imgs, true);
++    g_array_free(e->pending, true);
+     g_hash_table_destroy(e->pipelines);
+     g_hash_table_destroy(e->spv_cache);
+     if (e->vk_cache) {
+diff --git a/hw/display/pvg/pvg-exec.h b/hw/display/pvg/pvg-exec.h
+index 73a1bc2..d3ad58f 100644
+--- a/hw/display/pvg/pvg-exec.h
++++ b/hw/display/pvg/pvg-exec.h
+@@ -23,6 +23,20 @@ typedef struct PVGExecHost {
+     bool (*log_enabled)(void *opaque);   /* optional: skip formatting when false */
+     /* guest-physical address of task virtual address va (diagnostics) */
+     bool (*translate)(void *opaque, uint32_t task, uint64_t va, uint64_t *gpa);
++    /*
++     * Optional dirty tracking of guest RAM (texture upload cache). ram_runs: the RAM ranges
++     * (host RAM offsets, page granular) backing task va..va+len, at most max of them; returns
++     * how many, 0 if untranslatable or too fragmented. dirty_sync: collect the guest's writes
++     * since the last sync. dirty_test_clear: whether any page of the RAM range was written
++     * (by the guest CPU or by DMA) since its bits were last cleared; clears them.
++     */
++    uint32_t (*ram_runs)(void *opaque, uint32_t task, uint64_t va, uint64_t len,
++                         uint64_t (*runs)[2], uint32_t max);
++    void (*dirty_sync)(void *opaque);
++    bool (*dirty_test_clear)(void *opaque, uint64_t ram, uint64_t len);
++    /* batch form: dirty[i] = whether runs[i] is dirty (tested and cleared) */
++    void (*dirty_test_clear_many)(void *opaque, const uint64_t (*runs)[2], uint32_t n,
++                                  bool *dirty);
+ } PVGExecHost;
+ 
+ typedef struct PVGExecStats {
+@@ -30,8 +44,11 @@ typedef struct PVGExecStats {
+     uint64_t uploads, writebacks, blits, skipped_passes, continuations, feedback_copies;
+     uint64_t compute_segments, dispatches;
+     uint64_t gpu_wait_us;       /* since pvg_exec_reset_wait() */
+-    uint64_t spv_cache_hits, pipeline_us;
+-    uint64_t damage_saved;      /* bytes not copied thanks to damage rectangles */   /* translations reused; time building pipelines */
++    uint64_t spv_cache_hits, pipeline_us;   /* translations reused; time building pipelines */
++    uint64_t damage_saved;      /* bytes not copied thanks to damage rectangles */
++    /* upload cache: textures reused, bytes not uploaded, entries dropped, time syncing */
++    uint64_t cache_hits, cache_saved, cache_invalidated, cache_sync_us;
++    uint64_t priv_skipped, priv_flushes;    /* private residency: bytes not copied, flushes */
+ } PVGExecStats;
+ 
+ typedef struct PVGExec PVGExec;
+@@ -45,6 +62,24 @@ void pvg_exec_set_dry_run(PVGExec *e, bool dry);
+ void pvg_exec_set_damage_limit(PVGExec *e, bool on);
+ /* multisample render passes on the host (default on); off renders into the resolve texture */
+ void pvg_exec_set_msaa(PVGExec *e, bool on);
++/* keep textures on the GPU while their guest pages stay clean (needs the dirty callbacks) */
++void pvg_exec_set_upload_cache(PVGExec *e, bool on);
++/* guest mappings of va..va+len in task changed (len 0: the whole task): drop cached textures */
++void pvg_exec_cache_invalidate(PVGExec *e, uint32_t task, uint64_t va, uint64_t len);
++/*
++ * The guest may have written memory since the last command buffer: check cached textures
++ * before the next one. Call when new work arrives (a FIFO run), not between the command
++ * buffers of one: their resources were written before they were submitted.
++ */
++void pvg_exec_cache_mark_stale(PVGExec *e);
++/*
++ * Keep MTLStorageModePrivate textures on the GPU (no write-back, no re-upload). Their guest
++ * copy is updated when the guest asks (SynchronizeResources: pvg_exec_synchronize) or before
++ * the memory is unmapped (pvg_exec_flush_range; len 0 = the whole task).
++ */
++void pvg_exec_set_private_resident(PVGExec *e, bool on);
++void pvg_exec_synchronize(PVGExec *e, uint32_t task, uint32_t id);
++void pvg_exec_flush_range(PVGExec *e, uint32_t task, uint64_t va, uint64_t len);
+ void pvg_exec_free(PVGExec *e);
+ void pvg_exec_reset_wait(PVGExec *e);
+ /* Execute one serialized Metal command buffer of a user task */
+diff --git a/hw/display/trace-events b/hw/display/trace-events
+index 71c24a9..e543c5a 100644
+--- a/hw/display/trace-events
++++ b/hw/display/trace-events
+@@ -256,6 +256,8 @@ pvg_linux_exec(const char *msg) "%s"
+ pvg_linux_exec_stats(uint64_t cmdbufs, uint64_t passes, uint64_t draws, uint64_t skipped, uint64_t pipelines, uint64_t pipe_fail, uint64_t writebacks, uint64_t blits, uint64_t feedback, uint64_t dispatches) "cmdbufs=%"PRIu64" passes=%"PRIu64" draws=%"PRIu64" skipped=%"PRIu64" pipelines=%"PRIu64" failed=%"PRIu64" writebacks=%"PRIu64" blits=%"PRIu64" feedback=%"PRIu64" dispatches=%"PRIu64
+ pvg_linux_exec_time(uint64_t cmdbufs, int64_t exec_ms, int64_t wall_ms, int64_t max_us, int64_t read_ms, uint64_t read_mb, int64_t write_ms, uint64_t write_mb, uint64_t wait_ms) "cmdbufs=%"PRIu64" exec %"PRId64" ms of %"PRId64" ms wall, slowest %"PRId64" us; guest read %"PRId64" ms %"PRIu64" MiB, write %"PRId64" ms %"PRIu64" MiB, gpu wait %"PRIu64" ms"
+ pvg_linux_exec_pipelines(uint64_t pipe_ms, uint64_t spv_hits, uint64_t damage_mb) "building pipelines %"PRIu64" ms, translations reused %"PRIu64", damage rectangles saved %"PRIu64" MiB"
++pvg_linux_exec_cache(uint64_t hits, uint64_t saved_mb, uint64_t dropped, uint64_t sync_ms, int64_t kvm_ms) "upload cache: %"PRIu64" hits, %"PRIu64" MiB not uploaded, %"PRIu64" dropped, sync %"PRIu64" ms (KVM log %"PRId64" ms)"
++pvg_linux_exec_private(uint64_t skipped_mb, uint64_t flushes) "private textures: %"PRIu64" MiB not copied, %"PRIu64" flushes"
+ pvg_linux_child_poke(uint32_t index, uint32_t written, uint32_t read, uint32_t length) "child FIFO %u written=0x%x read=0x%x length=0x%x"
+ pvg_linux_cmd_stub(uint32_t op) "op=0x%02x not implemented, completed"
+ pvg_linux_signal_stamp(uint32_t index, uint32_t value) "stamps[%u]=%u"
+diff --git a/include/system/physmem.h b/include/system/physmem.h
+index c47b378..f73180f 100644
+--- a/include/system/physmem.h
++++ b/include/system/physmem.h
+@@ -65,6 +65,8 @@ void physical_memory_write(hwaddr addr, const void *buf, hwaddr len);
+ #define DIRTY_CLIENTS_NOCODE  (DIRTY_CLIENTS_ALL & ~(1 << DIRTY_MEMORY_CODE))
+ 
+ bool physical_memory_get_dirty_flag(ram_addr_t addr, unsigned client);
++/* any page of the range dirty for client (no clearing, no KVM call) */
++bool physical_memory_range_is_dirty(ram_addr_t start, ram_addr_t length, unsigned client);
+ 
+ bool physical_memory_is_clean(ram_addr_t addr);
+ 
+diff --git a/system/physmem.c b/system/physmem.c
+index c21ea92..a7558e5 100644
+--- a/system/physmem.c
++++ b/system/physmem.c
+@@ -927,6 +927,11 @@ bool physical_memory_get_dirty_flag(ram_addr_t addr, unsigned client)
+     return physical_memory_get_dirty(addr, 1, client);
+ }
+ 
++bool physical_memory_range_is_dirty(ram_addr_t start, ram_addr_t length, unsigned client)
++{
++    return physical_memory_get_dirty(start, length, client);
++}
++
+ bool physical_memory_is_clean(ram_addr_t addr)
+ {
+     bool vga = physical_memory_get_dirty_flag(addr, DIRTY_MEMORY_VGA);
+-- 
+2.43.0
+

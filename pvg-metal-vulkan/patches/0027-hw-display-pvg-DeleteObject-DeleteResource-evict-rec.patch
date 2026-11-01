@@ -1,0 +1,106 @@
+From 79c2739c94cab98698edd8c8ff3f3ce844aa03a8 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 15:33:17 +0200
+Subject: [PATCH 27/54] hw/display/pvg: DeleteObject/DeleteResource evict
+ recycled ids from the executor caches
+
+The guest recycles object ids; pipelines, samplers and host images cached
+by (task, id) kept serving the deleted object, e.g. the lock-screen clock's
+second render ran the previous pipelines under the new ids.
+DeleteResource = {task, id}; DeleteObject = {task, serialized {kind, len, id}}.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-pci.c | 11 +++++++++++
+ hw/display/pvg/pvg-exec.c  | 32 ++++++++++++++++++++++++++++++++
+ hw/display/pvg/pvg-exec.h  |  2 ++
+ 3 files changed, 45 insertions(+)
+
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index cd5c34f..ff038bb 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -68,6 +68,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(PVGLinuxPCIState, PVG_LINUX_PCI)
+ #define PVG_CMD_DEFINE_CHILD_FIFO   0x30
+ #define PVG_CMD_SET_OBJECT_LIST     0x33
+ #define PVG_CMD_EXEC_INDIRECT2      0x37
++#define PVG_CMD_DELETE_RESOURCE     0x25    /* {u32 task, u32 id} */
++#define PVG_CMD_DELETE_OBJECT       0x28    /* {u32 task, serialized {u32 kind, u32 len, u32 id}} */
+ #define PVG_CMD_DEFINE_TASK2        0x38
+ #define PVG_CMD_MAP_MEMORY2         0x39
+ #define PVG_CMD_GET_DEVICE_INFO     0x3a
+@@ -1396,6 +1398,15 @@ static void pvg_dispatch(PVGLinuxPCIState *s, const PVGCmdHeader *h,
+     case PVG_CMD_GET_DEVICE_INFO:
+         pvg_cmd_get_device_info(s, (const uint32_t *)payload, len);
+         break;
++    case PVG_CMD_DELETE_RESOURCE:
++    case PVG_CMD_DELETE_OBJECT:
++        /* ids are recycled: drop whatever the executor cached for this one */
++        if (s->exec && len >= (h->opcode == PVG_CMD_DELETE_OBJECT ? 16u : 8u)) {
++            pvg_exec_object_deleted(s->exec, ldl_le_p(payload),
++                                    ldl_le_p(payload + (h->opcode == PVG_CMD_DELETE_OBJECT ?
++                                                        12 : 4)));
++        }
++        break;
+     default:
+         /* not implemented yet: completed without effect */
+         trace_pvg_linux_cmd_stub(h->opcode);
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index 9777407..48c846c 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -2527,6 +2527,38 @@ static gboolean match_task_str(gpointer key, gpointer value, gpointer task)
+     return (uint32_t)strtoul(key, NULL, 10) == GPOINTER_TO_UINT(task);
+ }
+ 
++void pvg_exec_object_deleted(PVGExec *e, uint32_t task, uint32_t id)
++{
++    g_autofree char *prefix = g_strdup_printf("%u:%u:", task, id);
++    static const uint32_t variants[] = { 0, 0x10000000u, 0x40000000u, 0x80000000u };
++    GHashTableIter it;
++    gpointer k, v;
++    gint64 key = key_of(task, id);
++
++    if (!id) {
++        return;
++    }
++    vkQueueWaitIdle(e->gpu->queue);
++    g_hash_table_iter_init(&it, e->pipelines);
++    while (g_hash_table_iter_next(&it, &k, &v)) {
++        if (g_str_has_prefix(k, prefix)) {
++            g_hash_table_iter_remove(&it);
++        }
++    }
++    if (g_hash_table_lookup_extended(e->samplers, &key, NULL, &v)) {
++        if (v) {
++            vkDestroySampler(e->gpu->device, (VkSampler)v, NULL);
++        }
++        g_hash_table_remove(e->samplers, &key);
++    }
++    g_hash_table_remove(e->unnorm, &key);
++    for (size_t i = 0; i < G_N_ELEMENTS(variants); i++) {
++        gint64 ik = key_of(task, id | variants[i]);
++
++        g_hash_table_remove(e->images, &ik);
++    }
++}
++
+ void pvg_exec_task_reset(PVGExec *e, uint32_t task)
+ {
+     GHashTableIter it;
+diff --git a/hw/display/pvg/pvg-exec.h b/hw/display/pvg/pvg-exec.h
+index fe5967f..3559bf4 100644
+--- a/hw/display/pvg/pvg-exec.h
++++ b/hw/display/pvg/pvg-exec.h
+@@ -39,6 +39,8 @@ void pvg_exec_set_dry_run(PVGExec *e, bool dry);
+ void pvg_exec_free(PVGExec *e);
+ /* Execute one serialized Metal command buffer of a user task */
+ void pvg_exec_cmdbuf(PVGExec *e, uint32_t task, const uint8_t *buf, uint64_t len);
++/* An object id of a task was deleted (ids are recycled): drop what is cached for it */
++void pvg_exec_object_deleted(PVGExec *e, uint32_t task, uint32_t id);
+ /* A task was (re)defined: drop everything cached for it */
+ void pvg_exec_task_reset(PVGExec *e, uint32_t task);
+ const PVGExecStats *pvg_exec_stats(PVGExec *e);
+-- 
+2.43.0
+

@@ -1,0 +1,324 @@
+From af3f2e5b94c4f604cb5d8b016009e461c907efc3 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Fri, 30 Oct 2026 21:25:27 +0200
+Subject: [PATCH] hw/display/pvg: generate mipmaps on the GPU
+
+GenerateMipmaps ran on the CPU over guest memory: for the 4K R16/RG16
+video planes behind the Wallpaper settings preview that is ~30 calls a
+second, each reading ~22 MiB. Now level 0 is made current on the host
+image and a chain of linear vkCmdBlitImage fills the other levels.
+Private textures keep the result resident (flushed when the guest needs
+the memory); others get levels 1.. written back. Formats without linear
+blit support, and arena overflow, fall back to the CPU path.
+
+priv_flush writes back every mip level and layer (shared readback
+helpers), blit segments with only mipmap/hint commands no longer flush
+all private textures first, and a GPU-only image of another shape is
+flushed before the mip chain image replaces it.
+
+Wallpaper pane open, per 500 cmdbufs (medians): executor 1087 -> 502 ms,
+wall 1215 -> 623 ms, slowest cmdbuf 89 -> 18 ms, presents 2x. Validation
+layer: 0 errors.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-pci.c |   2 +-
+ hw/display/pvg/pvg-exec.c  | 196 +++++++++++++++++++++++++++++++++----
+ hw/display/pvg/pvg-exec.h  |   1 +
+ hw/display/trace-events    |   2 +-
+ 4 files changed, 182 insertions(+), 19 deletions(-)
+
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index e611e89..bb1fd30 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -1510,7 +1510,7 @@ static void pvg_exec_run_buf(PVGLinuxPCIState *s, uint32_t task, const uint8_t *
+                                   s->exec_max_us, s->exec_read_us / 1000,
+                                   s->exec_read_bytes >> 20, s->exec_write_us / 1000,
+                                   s->exec_write_bytes >> 20, st->gpu_wait_us / 1000);
+-        trace_pvg_linux_exec_private(st->priv_skipped >> 20, st->priv_flushes);
++        trace_pvg_linux_exec_private(st->priv_skipped >> 20, st->priv_flushes, st->gpu_mipmaps);
+         trace_pvg_linux_exec_cache(st->cache_hits, st->cache_saved >> 20, st->cache_invalidated,
+                                    st->cache_sync_us / 1000, s->dirty_sync_us / 1000);
+         s->dirty_sync_us = 0;
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index 3ea5ec4..4b556d3 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -1238,44 +1238,106 @@ static void priv_track(PVGExec *e, HostImage *hi, const GuestImage *gi)
+ 
+ static bool submit_wait(PVGExec *e, const VkSubmitInfo *si);
+ 
++/* barrier on mip levels first..first+count-1 (all layers) */
++static void barrier_levels(PVGExec *e, VkImage img, uint32_t first, uint32_t count,
++                           VkImageLayout from, VkImageLayout to)
++{
++    VkImageMemoryBarrier b = {
++        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
++        .oldLayout = from, .newLayout = to,
++        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .image = img, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, first, count,
++                                            0, VK_REMAINING_ARRAY_LAYERS },
++    };
++
++    vkCmdPipelineBarrier(e->cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b);
++}
++
++/* bytes of mip level l in the guest layout: its layers / 3D planes are consecutive images */
++static uint64_t level_bytes(const GuestImage *gi, uint32_t l)
++{
++    return gi->mip_slice[l] * gi->layers * MAX(gi->depth >> l, 1);
++}
++
++/*
++ * Record copies of levels first.. of an image (in TRANSFER_SRC_OPTIMAL) into the arena, laid
++ * out like the guest copy; returns the arena offset of level 0's position, UINT64_MAX if full.
++ */
++static uint64_t record_readback(PVGExec *e, const GuestImage *gi, HostImage *hi, uint32_t first)
++{
++    VkBufferImageCopy r[MAX_MIPS];
++    uint64_t off = arena_alloc(e, guest_image_size(gi));
++
++    if (off == UINT64_MAX) {
++        return off;
++    }
++    for (uint32_t l = first; l < gi->mips; l++) {
++        uint32_t row = gi->mip_row[l] ? gi->mip_row[l] : gi->row_bytes;
++
++        r[l - first] = (VkBufferImageCopy){
++            .bufferOffset = off + gi->mip_off[l],
++            .bufferRowLength = row / MAX(gi->bpp, 1),
++            .bufferImageHeight = (uint32_t)(gi->mip_slice[l] / row),
++            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, l, 0, gi->layers },
++            .imageExtent = { MAX(gi->width >> l, 1), MAX(gi->height >> l, 1),
++                             MAX(gi->depth >> l, 1) },
++        };
++    }
++    vkCmdCopyImageToBuffer(e->cmd, hi->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, e->arena,
++                           gi->mips - first, r);
++    return off;
++}
++
++/* after the readback's submission completed: levels first.. from the arena to guest memory */
++static void write_levels(PVGExec *e, const GuestImage *gi, uint64_t off, uint32_t first)
++{
++    for (uint32_t l = first; l < gi->mips; l++) {
++        uint64_t n = level_bytes(gi, l);
++
++        if (gi->span && gi->mip_off[l] + n > gi->span) {
++            n = gi->span > gi->mip_off[l] ? gi->span - gi->mip_off[l] : 0;  /* owned memory only */
++        }
++        if (n) {
++            e->host.write(e->host.opaque, gi->task, gi->va + gi->mip_off[l],
++                          e->arena_ptr + off + gi->mip_off[l], n);
++        }
++    }
++}
++
+ /*
+  * write a stale image back to guest memory (its own submission: call only while no command
+- * buffer is being recorded). Stale images are single-level 2D render targets.
++ * buffer is being recorded): render targets, and mip chains generated on the GPU.
+  */
+ static void priv_flush(PVGExec *e, HostImage *hi)
+ {
+     const GuestImage *gi = &hi->pgi;
+-    uint64_t size = (uint64_t)gi->row_bytes * gi->height, off;
+     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                     .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
+                         .pCommandBuffers = &e->cmd };
+-    VkBufferImageCopy r = {
+-        .bufferRowLength = gi->row_bytes / MAX(gi->bpp, 1),
+-        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+-        .imageExtent = { gi->width, gi->height, 1 },
+-    };
++    uint64_t off;
+ 
+     if (!hi->guest_stale) {
+         return;
+     }
+     hi->guest_stale = false;
+-    off = arena_alloc(e, size);
+-    if (off == UINT64_MAX || hi->layout == VK_IMAGE_LAYOUT_UNDEFINED) {
++    if (hi->layout == VK_IMAGE_LAYOUT_UNDEFINED) {
+         return;
+     }
+-    r.bufferOffset = off;
+     vkResetCommandBuffer(e->cmd, 0);
+     vkBeginCommandBuffer(e->cmd, &bi);
+     barrier(e, hi->image, hi->layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+     hi->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+-    vkCmdCopyImageToBuffer(e->cmd, hi->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, e->arena, 1,
+-                           &r);
++    off = record_readback(e, gi, hi, 0);
+     vkEndCommandBuffer(e->cmd);
+-    if (!submit_wait(e, &si)) {
++    if (off == UINT64_MAX || !submit_wait(e, &si)) {
+         return;
+     }
+-    e->host.write(e->host.opaque, gi->task, gi->va, e->arena_ptr + off, wb_size(gi, size));
++    write_levels(e, gi, off, 0);
+     e->stats.priv_flushes++;
+ }
+ 
+@@ -4278,15 +4340,103 @@ static void mip_store(uint8_t *p, int kind, int c, float v)
+     }
+ }
+ 
++/*
++ * GenerateMipmaps on the GPU: level 0 made current on the host image, then a chain of linear
++ * blits. Private textures keep the result resident (written back only when the guest needs it);
++ * others get levels 1.. written back to guest memory. false: not possible here (CPU fallback).
++ */
++static bool generate_mipmaps_gpu(PVGExec *e, uint32_t task, uint32_t ref, const GuestImage *all)
++{
++    const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_BLIT_SRC_BIT |
++                                      VK_FORMAT_FEATURE_BLIT_DST_BIT |
++                                      VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
++    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
++    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
++                        .pCommandBuffers = &e->cmd };
++    bool priv = e->private_resident && all->storage == 2;
++    uint64_t mark = e->arena_used, off = UINT64_MAX;
++    VkFormatProperties fp;
++    HostImage *hi;
++
++    gint64 key = key_of(task, ref);
++    HostImage *old = g_hash_table_lookup(e->images, &key);
++
++    vkGetPhysicalDeviceFormatProperties(e->gpu->phys, all->format, &fp);
++    if ((fp.optimalTilingFeatures & need) != need || all->samples > 1) {
++        return false;
++    }
++    if (old && old->guest_stale && !priv_same(old, all)) {
++        priv_flush(e, old);     /* e.g. level 0 rendered as a single-level target: keep it */
++    }
++    if (!(hi = host_image(e, task, ref, all, false))) {
++        return false;
++    }
++    vkResetCommandBuffer(e->cmd, 0);
++    vkBeginCommandBuffer(e->cmd, &bi);
++    /* the whole chain in TRANSFER_DST: level 0 as the guest (or the resident copy) has it */
++    texture_prepare(e, all, hi, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++    for (uint32_t l = 1; l < all->mips; l++) {
++        VkImageBlit b = {
++            .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, l - 1, 0, all->layers },
++            .srcOffsets = { { 0, 0, 0 }, { MAX(all->width >> (l - 1), 1),
++                                           MAX(all->height >> (l - 1), 1),
++                                           MAX(all->depth >> (l - 1), 1) } },
++            .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, l, 0, all->layers },
++            .dstOffsets = { { 0, 0, 0 }, { MAX(all->width >> l, 1), MAX(all->height >> l, 1),
++                                           MAX(all->depth >> l, 1) } },
++        };
++
++        barrier_levels(e, hi->image, l - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++        vkCmdBlitImage(e->cmd, hi->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, hi->image,
++                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
++    }
++    /* levels 0..n-2 are TRANSFER_SRC now, the last one TRANSFER_DST */
++    barrier_levels(e, hi->image, all->mips - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++    hi->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    if (!priv) {
++        off = record_readback(e, all, hi, 1);
++    }
++    vkEndCommandBuffer(e->cmd);
++    if ((!priv && off == UINT64_MAX) || !submit_wait(e, &si)) {
++        e->arena_used = mark;
++        return e->disabled;     /* arena full or dry run: CPU path; GPU lost: give up */
++    }
++    if (priv) {
++        /* the levels exist only on the GPU until the guest needs the memory */
++        priv_track(e, hi, all);
++        hi->resident = true;
++        hi->guest_stale = true;
++    } else {
++        write_levels(e, all, off, 1);
++        cache_drop(e, hi);
++        e->cache_writer = hi;
++        note_write(e, all->task, all->va + all->mip_off[1],
++                   guest_image_size(all) - all->mip_off[1], 'M');
++        e->cache_writer = NULL;
++    }
++    e->arena_used = mark;
++    e->stats.blits++;
++    e->stats.gpu_mipmaps++;
++    return true;
++}
++
+ /* 3D textures: slice argument of guest_image_ex selects the depth plane */
+ static void generate_mipmaps(PVGExec *e, uint32_t task, uint32_t ref)
+ {
+     GuestImage all, src0, src1, dst;
+     int kind, nc;
+ 
+-    if (!guest_image_ex(e, task, ref, -1, 0, &all) || all.mips < 2) {
++    if (!guest_image_ex(e, task, ref, -1, 0, &all) || all.mips < 2 ||
++        generate_mipmaps_gpu(e, task, ref, &all)) {
+         return;
+     }
++    if (e->private_resident) {
++        /* the CPU path works on the guest copy: GPU-only contents first */
++        priv_flush_range(e, all.task, all.va, guest_image_size(&all), NULL);
++    }
+     nc = mip_channels(all.format, &kind);
+     if (!nc) {
+         elog(e, "task %u texture %u: generateMipmaps for format %d not supported", task, ref,
+@@ -4351,8 +4501,20 @@ static void generate_mipmaps(PVGExec *e, uint32_t task, uint32_t ref)
+ 
+ static void exec_blit_segment(PVGExec *e, uint32_t task, const uint8_t *p, uint32_t len)
+ {
+-    if (e->private_resident) {
+-        pvg_exec_flush_range(e, task, 0, 0);    /* blits copy through guest memory */
++    bool through_guest = false;
++
++    /* blits copy through guest memory; mipmaps (GPU, or flushed themselves) and hints do not */
++    for (uint32_t off = 0; off + 8 <= len;) {
++        uint32_t id = ldl(p + off), clen = ldl(p + off + 4);
++
++        if (clen < 8 || off + clen > len) {
++            break;
++        }
++        through_guest |= id != 0x133 && id != 0x134 && id != 0x135;
++        off += clen;
++    }
++    if (e->private_resident && through_guest) {
++        pvg_exec_flush_range(e, task, 0, 0);
+     }
+     for (uint32_t off = 0; off + 8 <= len;) {
+         uint32_t id = ldl(p + off), clen = ldl(p + off + 4);
+diff --git a/hw/display/pvg/pvg-exec.h b/hw/display/pvg/pvg-exec.h
+index d3ad58f..2c92aad 100644
+--- a/hw/display/pvg/pvg-exec.h
++++ b/hw/display/pvg/pvg-exec.h
+@@ -49,6 +49,7 @@ typedef struct PVGExecStats {
+     /* upload cache: textures reused, bytes not uploaded, entries dropped, time syncing */
+     uint64_t cache_hits, cache_saved, cache_invalidated, cache_sync_us;
+     uint64_t priv_skipped, priv_flushes;    /* private residency: bytes not copied, flushes */
++    uint64_t gpu_mipmaps;       /* GenerateMipmaps done on the GPU (the rest: CPU fallback) */
+ } PVGExecStats;
+ 
+ typedef struct PVGExec PVGExec;
+diff --git a/hw/display/trace-events b/hw/display/trace-events
+index e543c5a..3095d3d 100644
+--- a/hw/display/trace-events
++++ b/hw/display/trace-events
+@@ -257,7 +257,7 @@ pvg_linux_exec_stats(uint64_t cmdbufs, uint64_t passes, uint64_t draws, uint64_t
+ pvg_linux_exec_time(uint64_t cmdbufs, int64_t exec_ms, int64_t wall_ms, int64_t max_us, int64_t read_ms, uint64_t read_mb, int64_t write_ms, uint64_t write_mb, uint64_t wait_ms) "cmdbufs=%"PRIu64" exec %"PRId64" ms of %"PRId64" ms wall, slowest %"PRId64" us; guest read %"PRId64" ms %"PRIu64" MiB, write %"PRId64" ms %"PRIu64" MiB, gpu wait %"PRIu64" ms"
+ pvg_linux_exec_pipelines(uint64_t pipe_ms, uint64_t spv_hits, uint64_t damage_mb) "building pipelines %"PRIu64" ms, translations reused %"PRIu64", damage rectangles saved %"PRIu64" MiB"
+ pvg_linux_exec_cache(uint64_t hits, uint64_t saved_mb, uint64_t dropped, uint64_t sync_ms, int64_t kvm_ms) "upload cache: %"PRIu64" hits, %"PRIu64" MiB not uploaded, %"PRIu64" dropped, sync %"PRIu64" ms (KVM log %"PRId64" ms)"
+-pvg_linux_exec_private(uint64_t skipped_mb, uint64_t flushes) "private textures: %"PRIu64" MiB not copied, %"PRIu64" flushes"
++pvg_linux_exec_private(uint64_t skipped_mb, uint64_t flushes, uint64_t gpu_mipmaps) "private textures: %"PRIu64" MiB not copied, %"PRIu64" flushes; %"PRIu64" GPU mipmaps"
+ pvg_linux_child_poke(uint32_t index, uint32_t written, uint32_t read, uint32_t length) "child FIFO %u written=0x%x read=0x%x length=0x%x"
+ pvg_linux_cmd_stub(uint32_t op) "op=0x%02x not implemented, completed"
+ pvg_linux_signal_stamp(uint32_t index, uint32_t value) "stamps[%u]=%u"
+-- 
+2.43.0
+

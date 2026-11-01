@@ -1,0 +1,2579 @@
+From 1b5d5672f0e6c0ebbc4014788f523efcf4c91fc2 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 11:11:39 +0200
+Subject: [PATCH 07/54] hw/display/pvg: air2spv translator in tree, Vulkan GPU
+ context linked into QEMU
+
+Moves the AIR->SPIR-V translator next to the device and links Vulkan and
+LLVM 19 (found via meson; the device builds without them). pvg-linux-pci
+gains gpu= and gpu-validation= properties and opens a Vulkan device at
+realize; failures fall back to the non-executing path.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/meson.build     |   10 +-
+ hw/display/pvg-linux-pci.c |   23 +
+ hw/display/pvg/air2spv.c   | 1729 ++++++++++++++++++++++++++++++++++++
+ hw/display/pvg/air2spv.h   |   47 +
+ hw/display/pvg/pvg-gpu.c   |  182 ++++
+ hw/display/pvg/pvg-gpu.h   |   33 +
+ hw/display/pvg/spv.c       |  253 ++++++
+ hw/display/pvg/spv.h       |  164 ++++
+ hw/display/trace-events    |    1 +
+ 9 files changed, 2441 insertions(+), 1 deletion(-)
+ create mode 100644 hw/display/pvg/air2spv.c
+ create mode 100644 hw/display/pvg/air2spv.h
+ create mode 100644 hw/display/pvg/pvg-gpu.c
+ create mode 100644 hw/display/pvg/pvg-gpu.h
+ create mode 100644 hw/display/pvg/spv.c
+ create mode 100644 hw/display/pvg/spv.h
+
+diff --git a/hw/display/meson.build b/hw/display/meson.build
+index 6fe9784..efa0f72 100644
+--- a/hw/display/meson.build
++++ b/hw/display/meson.build
+@@ -64,7 +64,15 @@ system_ss.add(when: 'CONFIG_ATI_VGA', if_true: [files('ati.c', 'ati_2d.c', 'ati_
+ 
+ system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_PCI'],     if_true: [files('apple-gfx.m', 'apple-gfx-pci.m')])
+ system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_MMIO'],    if_true: [files('apple-gfx.m', 'apple-gfx-mmio.m')])
+-system_ss.add(when: 'CONFIG_PVG_LINUX_PCI', if_true: files('pvg-linux-pci.c'))
++pvg_vulkan = dependency('vulkan', required: false)
++pvg_llvm = dependency('llvm', version: '>=19', method: 'config-tool', required: false)
++if pvg_vulkan.found() and pvg_llvm.found()
++  system_ss.add(when: 'CONFIG_PVG_LINUX_PCI',
++                if_true: [files('pvg-linux-pci.c', 'pvg/pvg-gpu.c', 'pvg/air2spv.c', 'pvg/spv.c'),
++                          pvg_vulkan, pvg_llvm])
++else
++  system_ss.add(when: 'CONFIG_PVG_LINUX_PCI', if_true: files('pvg-linux-pci.c'))
++endif
+ 
+ if config_all_devices.has_key('CONFIG_VIRTIO_GPU')
+   virtio_gpu_ss = ss.source_set()
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index 546ecd0..9f8cb8c 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -17,6 +17,7 @@
+ #include "qemu/log.h"
+ #include "qemu/units.h"
+ #include "qapi/error.h"
++#include "qemu/error-report.h"
+ #include "hw/pci/pci_device.h"
+ #include "hw/pci/msi.h"
+ #include "hw/core/qdev-properties.h"
+@@ -27,6 +28,7 @@
+ #include "qom/object.h"
+ #include "trace.h"
+ #include "pvg-linux-cmds.h"
++#include "pvg/pvg-gpu.h"
+ 
+ #define TYPE_PVG_LINUX_PCI "pvg-linux-pci"
+ OBJECT_DECLARE_SIMPLE_TYPE(PVGLinuxPCIState, PVG_LINUX_PCI)
+@@ -241,6 +243,10 @@ struct PVGLinuxPCIState {
+     uint32_t mmio_size;
+     uint32_t msi_vectors;
+     uint32_t display_ports;
++    bool gpu_enable;
++    bool gpu_validation;
++    PVGGpu gpu;
++    bool gpu_ok;
+     char *dump_dir;         /* raw ExecIndirect2 command buffers, for RE */
+     uint32_t dump_max;
+     uint32_t dumped;
+@@ -1357,6 +1363,17 @@ static void pvg_linux_realize(PCIDevice *dev, Error **errp)
+         s->con = qemu_graphic_console_create(DEVICE(dev), 0, &pvg_display_ops,
+                                              s);
+     }
++    if (s->gpu_enable) {
++        char err[256];
++
++        if (pvg_gpu_init(&s->gpu, s->gpu_validation, err, sizeof(err))) {
++            warn_report("pvg-linux-pci: no host GPU, Metal commands are not executed: %s",
++                        err);
++        } else {
++            s->gpu_ok = true;
++            trace_pvg_linux_gpu(s->gpu.name, s->gpu_validation);
++        }
++    }
+ }
+ 
+ static void pvg_linux_exit(PCIDevice *dev)
+@@ -1364,6 +1381,10 @@ static void pvg_linux_exit(PCIDevice *dev)
+     PVGLinuxPCIState *s = PVG_LINUX_PCI(dev);
+ 
+     msi_uninit(dev);
++    if (s->gpu_ok) {
++        pvg_gpu_fini(&s->gpu);
++        s->gpu_ok = false;
++    }
+     if (s->con) {
+         qemu_graphic_console_close(s->con);
+     }
+@@ -1400,6 +1421,8 @@ static const Property pvg_linux_properties[] = {
+     DEFINE_PROP_UINT32("msi-vectors", PVGLinuxPCIState, msi_vectors, 1),
+     /* guestDisplayPortCount (0x122c); only port 0 is implemented */
+     DEFINE_PROP_UINT32("display-ports", PVGLinuxPCIState, display_ports, 1),
++    DEFINE_PROP_BOOL("gpu", PVGLinuxPCIState, gpu_enable, true),
++    DEFINE_PROP_BOOL("gpu-validation", PVGLinuxPCIState, gpu_validation, false),
+     DEFINE_PROP_STRING("dump-dir", PVGLinuxPCIState, dump_dir),
+     DEFINE_PROP_UINT32("dump-max", PVGLinuxPCIState, dump_max, 256),
+ };
+diff --git a/hw/display/pvg/air2spv.c b/hw/display/pvg/air2spv.c
+new file mode 100644
+index 0000000..ed405c6
+--- /dev/null
++++ b/hw/display/pvg/air2spv.c
+@@ -0,0 +1,1729 @@
++/*
++ * air2spv: Metal AIR (LLVM IR) -> Vulkan SPIR-V 1.6. See docs/air2spv-design.md.
++ *
++ * Pointers into device/constant memory are u64 buffer device addresses; loads and stores go
++ * through PhysicalStorageBuffer pointers. Textures and samplers are descriptor bindings; buffer
++ * arguments arrive in a push-constant array of u64.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include <stdarg.h>
++#include <stdbool.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <llvm-c/BitReader.h>
++#include <llvm-c/Core.h>
++#include <llvm-c/Target.h>
++#include <llvm-c/Transforms/PassBuilder.h>
++
++#include "air2spv.h"
++#include "spv.h"
++
++#define MAX_ARGS 64
++
++enum ArgKind {
++    ARG_NONE, ARG_BUFFER, ARG_TEXTURE, ARG_SAMPLER, ARG_POSITION, ARG_VARYING,
++    ARG_VERTEX_ID, ARG_INSTANCE_ID, ARG_FRONT_FACING, ARG_SAMPLE_ID, ARG_VERTEX_INPUT,
++    ARG_POINT_COORD,
++};
++
++enum Interp { INTERP_PERSPECTIVE, INTERP_NOPERSPECTIVE, INTERP_FLAT };
++
++typedef struct Arg {
++    enum ArgKind kind;
++    int index;                  /* Metal location index */
++    char name[48];              /* varying user(name) */
++    enum Interp interp;
++    char tex_type[64];          /* e.g. "texture2d<float, sample>" */
++    uint32_t var;               /* SPIR-V variable */
++} Arg;
++
++typedef struct Resource {       /* texture/sampler handle reached through an LLVM value */
++    LLVMValueRef key;
++    bool is_sampler;
++    uint32_t var, type;         /* variable and its pointee type */
++    uint32_t dim;
++    bool arrayed;
++} Resource;
++
++typedef struct Ctx {
++    SpvModule m;
++    LLVMContextRef llctx;
++    LLVMModuleRef mod;
++    LLVMTargetDataRef td;
++    LLVMValueRef fn;
++    int stage;
++    A2SResult *res;
++    char *err;
++
++    struct { LLVMValueRef k; uint32_t id; } *vmap;
++    size_t vcap, vcount;
++
++    Arg args[MAX_ARGS];
++    int nargs;
++    Resource rsrc[64];
++    int nrsrc;
++
++    uint32_t iface[128];
++    int niface;
++
++    uint32_t t_void, t_bool, t_u32, t_u64, t_f32;
++    uint32_t pc_var, pc_elem_ptr;
++    uint32_t out_vars[16];      /* fragment render targets / vertex outputs */
++    int nout;
++    LLVMTypeRef ret_ty;
++    bool ret_is_struct;
++    bool depth_replacing;
++} Ctx;
++
++static const char *vname(LLVMValueRef v, size_t *unused)
++{
++    size_t len;
++
++    (void)unused;
++    return LLVMGetValueName2(v, &len);
++}
++
++static int fail(Ctx *c, const char *fmt, ...)
++{
++    va_list ap;
++
++    if (!c->err[0]) {
++        va_start(ap, fmt);
++        vsnprintf(c->err, sizeof(c->res->error), fmt, ap);
++        va_end(ap);
++    }
++    return -1;
++}
++
++/* ---- value map ---- */
++
++static uint32_t *vslot(Ctx *c, LLVMValueRef v, bool create)
++{
++    size_t h;
++
++    if (c->vcount * 2 >= c->vcap) {
++        size_t ncap = c->vcap ? c->vcap * 2 : 1024;
++        __typeof__(c->vmap) n = calloc(ncap, sizeof(*n));
++
++        for (size_t i = 0; i < c->vcap; i++) {
++            if (c->vmap[i].k) {
++                size_t j = ((uintptr_t)c->vmap[i].k >> 4) & (ncap - 1);
++
++                while (n[j].k) {
++                    j = (j + 1) & (ncap - 1);
++                }
++                n[j] = c->vmap[i];
++            }
++        }
++        free(c->vmap);
++        c->vmap = n;
++        c->vcap = ncap;
++    }
++    h = ((uintptr_t)v >> 4) & (c->vcap - 1);
++    while (c->vmap[h].k && c->vmap[h].k != v) {
++        h = (h + 1) & (c->vcap - 1);
++    }
++    if (!c->vmap[h].k) {
++        if (!create) {
++            return NULL;
++        }
++        c->vmap[h].k = v;
++        c->vmap[h].id = 0;
++        c->vcount++;
++    }
++    return &c->vmap[h].id;
++}
++
++static void vset(Ctx *c, LLVMValueRef v, uint32_t id)
++{
++    *vslot(c, v, true) = id;
++}
++
++/* ---- types ---- */
++
++static uint32_t ty(Ctx *c, LLVMTypeRef t)
++{
++    switch (LLVMGetTypeKind(t)) {
++    case LLVMVoidTypeKind:
++        return c->t_void;
++    case LLVMIntegerTypeKind: {
++        unsigned w = LLVMGetIntTypeWidth(t);
++
++        if (w == 1) {
++            return c->t_bool;
++        }
++        if (w != 8 && w != 16 && w != 32 && w != 64) {
++            return fail(c, "unsupported int width %u", w), 0;
++        }
++        return spv_type_int(&c->m, w, false);
++    }
++    case LLVMHalfTypeKind:
++        return spv_type_float(&c->m, 16);
++    case LLVMFloatTypeKind:
++        return c->t_f32;
++    case LLVMDoubleTypeKind:
++        return spv_type_float(&c->m, 64);
++    case LLVMPointerTypeKind:
++        return c->t_u64;
++    case LLVMVectorTypeKind:
++        return spv_type_vec(&c->m, ty(c, LLVMGetElementType(t)), LLVMGetVectorSize(t));
++    case LLVMStructTypeKind: {
++        unsigned n = LLVMCountStructElementTypes(t);
++        uint32_t ops[32];
++
++        if (n > 32) {
++            return fail(c, "struct too large"), 0;
++        }
++        for (unsigned i = 0; i < n; i++) {
++            ops[i] = ty(c, LLVMStructGetTypeAtIndex(t, i));
++        }
++        return spv_type(&c->m, SpvOpTypeStruct, ops, n);
++    }
++    case LLVMArrayTypeKind: {
++        uint32_t ops[2] = { ty(c, LLVMGetElementType(t)),
++                            spv_const_u32(&c->m, (uint32_t)LLVMGetArrayLength2(t)) };
++
++        return spv_type(&c->m, SpvOpTypeArray, ops, 2);
++    }
++    default:
++        return fail(c, "unsupported LLVM type kind %d", LLVMGetTypeKind(t)), 0;
++    }
++}
++
++/* ---- constants ---- */
++
++/* IEEE binary32 -> binary16, round to nearest even */
++static uint32_t f32_to_f16(float f)
++{
++    uint32_t x, sign, exp, mant;
++
++    memcpy(&x, &f, 4);
++    sign = (x >> 16) & 0x8000;
++    exp = (x >> 23) & 0xff;
++    mant = x & 0x7fffff;
++    if (exp == 0xff) {
++        return sign | 0x7c00 | (mant ? 0x200 : 0);
++    }
++    if (exp > 142) {
++        return sign | 0x7c00;                       /* overflow -> inf */
++    }
++    if (exp < 113) {                                /* subnormal or zero */
++        if (exp < 103) {
++            return sign;
++        }
++        mant |= 0x800000;
++        {
++            uint32_t shift = 126 - exp, half = mant >> shift, rem = mant & ((1u << shift) - 1);
++            uint32_t mid = 1u << (shift - 1);
++
++            if (rem > mid || (rem == mid && (half & 1))) {
++                half++;
++            }
++            return sign | half;
++        }
++    }
++    {
++        uint32_t h = sign | ((exp - 112) << 10) | (mant >> 13), rem = mant & 0x1fff;
++
++        if (rem > 0x1000 || (rem == 0x1000 && (h & 1))) {
++            h++;
++        }
++        return h;
++    }
++}
++
++static uint32_t val(Ctx *c, LLVMValueRef v);
++
++static uint32_t const_val(Ctx *c, LLVMValueRef v)
++{
++    LLVMTypeRef t = LLVMTypeOf(v);
++    uint32_t tid = ty(c, t);
++
++    if (LLVMIsUndef(v) || LLVMIsPoison(v)) {
++        return spv_const(&c->m, SpvOpUndef, tid, NULL, 0);
++    }
++    if (LLVMIsAConstantAggregateZero(v) || LLVMIsAConstantPointerNull(v)) {
++        if (LLVMGetTypeKind(t) == LLVMPointerTypeKind) {
++            return spv_const_u64(&c->m, 0);
++        }
++        return spv_const(&c->m, SpvOpConstantNull, tid, NULL, 0);
++    }
++    if (LLVMIsAConstantInt(v)) {
++        unsigned w = LLVMGetIntTypeWidth(t);
++        uint64_t x = LLVMConstIntGetZExtValue(v);
++        uint32_t words[2] = { (uint32_t)x, (uint32_t)(x >> 32) };
++
++        if (w == 1) {
++            return spv_const(&c->m, x ? SpvOpConstantTrue : SpvOpConstantFalse, tid, NULL, 0);
++        }
++        if (w < 32) {
++            words[0] &= (1u << w) - 1;
++        }
++        return spv_const(&c->m, SpvOpConstant, tid, words, w == 64 ? 2 : 1);
++    }
++    if (LLVMIsAConstantFP(v)) {
++        LLVMBool loses;
++        double d = LLVMConstRealGetDouble(v, &loses);
++        LLVMTypeKind k = LLVMGetTypeKind(t);
++        uint32_t words[2];
++
++        if (k == LLVMFloatTypeKind) {
++            float f = (float)d;
++
++            memcpy(words, &f, 4);
++            return spv_const(&c->m, SpvOpConstant, tid, words, 1);
++        } else if (k == LLVMDoubleTypeKind) {
++            memcpy(words, &d, 8);
++            return spv_const(&c->m, SpvOpConstant, tid, words, 2);
++        } else if (k == LLVMHalfTypeKind) {
++            words[0] = f32_to_f16((float)d);
++            return spv_const(&c->m, SpvOpConstant, tid, words, 1);
++        }
++        return fail(c, "unsupported FP constant type"), 0;
++    }
++    if (LLVMIsAConstantDataVector(v) || LLVMIsAConstantVector(v) || LLVMIsAConstantStruct(v) ||
++        LLVMIsAConstantArray(v) || LLVMIsAConstantDataArray(v)) {
++        unsigned n = LLVMGetTypeKind(t) == LLVMVectorTypeKind ? LLVMGetVectorSize(t) :
++                     LLVMGetTypeKind(t) == LLVMStructTypeKind ? LLVMCountStructElementTypes(t) :
++                     (unsigned)LLVMGetArrayLength2(t);
++        uint32_t ops[64];
++
++        if (n > 64) {
++            return fail(c, "constant aggregate too large"), 0;
++        }
++        for (unsigned i = 0; i < n; i++) {
++            ops[i] = const_val(c, LLVMGetAggregateElement(v, i));
++        }
++        return spv_const(&c->m, SpvOpConstantComposite, tid, ops, n);
++    }
++    if (LLVMIsAGlobalVariable(v)) {
++        return fail(c, "global variable %s used as a value", vname(v, NULL)), 0;
++    }
++    if (LLVMIsAConstantExpr(v)) {
++        return fail(c, "unsupported constant expression (opcode %d)", LLVMGetConstOpcode(v)), 0;
++    }
++    return fail(c, "unsupported constant"), 0;
++}
++
++/* id of an SSA value; instruction results get ids lazily so forward references (phis) work */
++static uint32_t val(Ctx *c, LLVMValueRef v)
++{
++    uint32_t *slot = vslot(c, v, false);
++
++    if (slot && *slot) {
++        return *slot;
++    }
++    if (LLVMIsConstant(v) && !LLVMIsAGlobalValue(v)) {
++        uint32_t id = const_val(c, v);
++
++        vset(c, v, id);
++        return id;
++    }
++    if (LLVMIsAInstruction(v) || LLVMIsABasicBlock(v)) {
++        uint32_t id = spv_id(&c->m);
++
++        vset(c, v, id);
++        return id;
++    }
++    return fail(c, "value without a mapping (%s)", vname(v, NULL)), 0;
++}
++
++static uint32_t label(Ctx *c, LLVMBasicBlockRef bb)
++{
++    return val(c, LLVMBasicBlockAsValue(bb));
++}
++
++/* ---- metadata ---- */
++
++static const char *md_str(LLVMValueRef v)
++{
++    unsigned len;
++
++    return v ? LLVMGetMDString(v, &len) : NULL;
++}
++
++static int md_int(LLVMValueRef v)
++{
++    return v && LLVMIsAConstantInt(v) ? (int)LLVMConstIntGetSExtValue(v) : -1;
++}
++
++static int md_ops(LLVMValueRef node, LLVMValueRef *ops, int max)
++{
++    int n = (int)LLVMGetMDNodeNumOperands(node);
++
++    if (n > max) {
++        n = max;
++    }
++    LLVMGetMDNodeOperands(node, ops);
++    return n;
++}
++
++/* value of "key" followed by an int or string inside an AIR argument node */
++static int md_find(LLVMValueRef *ops, int n, const char *key)
++{
++    for (int i = 0; i < n; i++) {
++        const char *s = md_str(ops[i]);
++
++        if (s && !strcmp(s, key)) {
++            return i;
++        }
++    }
++    return -1;
++}
++
++static int parse_entry(Ctx *c)
++{
++    static const struct { const char *name; int stage; } kinds[] = {
++        { "air.vertex", A2S_STAGE_VERTEX }, { "air.fragment", A2S_STAGE_FRAGMENT },
++    };
++    LLVMValueRef node = NULL, ops[8], argnodes[MAX_ARGS];
++    int nargs;
++
++    for (size_t k = 0; k < sizeof(kinds) / sizeof(kinds[0]); k++) {
++        if (LLVMGetNamedMetadataNumOperands(c->mod, kinds[k].name) > 0) {
++            LLVMValueRef all[4];
++
++            LLVMGetNamedMetadataOperands(c->mod, kinds[k].name, all);
++            node = all[0];
++            c->stage = kinds[k].stage;
++            break;
++        }
++    }
++    if (!node) {
++        return fail(c, "no air.vertex/air.fragment entry (kernels unsupported)");
++    }
++    md_ops(node, ops, 8);
++    c->fn = ops[0];
++    if (!c->fn || !LLVMIsAFunction(c->fn)) {
++        return fail(c, "entry metadata without function");
++    }
++    snprintf(c->res->entry, sizeof(c->res->entry), "%s", vname(c->fn, NULL));
++    c->ret_ty = LLVMGetReturnType(LLVMGlobalGetValueType(c->fn));
++
++    nargs = md_ops(ops[2], argnodes, MAX_ARGS);
++    c->nargs = (int)LLVMCountParams(c->fn);
++    if (c->nargs > MAX_ARGS) {
++        return fail(c, "too many arguments");
++    }
++    for (int i = 0; i < nargs; i++) {
++        LLVMValueRef a[32];
++        int n = md_ops(argnodes[i], a, 32), idx = md_int(a[0]), p;
++        const char *kind = n > 1 ? md_str(a[1]) : NULL;
++        Arg *arg;
++
++        if (idx < 0 || idx >= c->nargs || !kind) {
++            return fail(c, "bad argument metadata");
++        }
++        arg = &c->args[idx];
++        p = md_find(a, n, "air.location_index");
++        arg->index = p >= 0 && p + 1 < n ? md_int(a[p + 1]) : 0;
++        if (!strcmp(kind, "air.buffer")) {
++            arg->kind = ARG_BUFFER;
++        } else if (!strcmp(kind, "air.texture")) {
++            arg->kind = ARG_TEXTURE;
++            p = md_find(a, n, "air.arg_type_name");
++            snprintf(arg->tex_type, sizeof(arg->tex_type), "%s",
++                     p >= 0 && p + 1 < n ? md_str(a[p + 1]) : "");
++        } else if (!strcmp(kind, "air.sampler")) {
++            arg->kind = ARG_SAMPLER;
++        } else if (!strcmp(kind, "air.position")) {
++            arg->kind = ARG_POSITION;
++        } else if (!strcmp(kind, "air.fragment_input")) {
++            const char *u = n > 2 ? md_str(a[2]) : NULL;
++
++            arg->kind = ARG_VARYING;
++            snprintf(arg->name, sizeof(arg->name), "%s", u ? u : "?");
++            arg->interp = md_find(a, n, "air.flat") >= 0 ? INTERP_FLAT :
++                          md_find(a, n, "air.no_perspective") >= 0 ? INTERP_NOPERSPECTIVE :
++                          INTERP_PERSPECTIVE;
++        } else if (!strcmp(kind, "air.vertex_input")) {
++            arg->kind = ARG_VERTEX_INPUT;
++        } else if (!strcmp(kind, "air.point_coord")) {
++            arg->kind = ARG_POINT_COORD;
++        } else if (!strcmp(kind, "air.vertex_id")) {
++            arg->kind = ARG_VERTEX_ID;
++        } else if (!strcmp(kind, "air.instance_id")) {
++            arg->kind = ARG_INSTANCE_ID;
++        } else if (!strcmp(kind, "air.front_facing")) {
++            arg->kind = ARG_FRONT_FACING;
++        } else if (!strcmp(kind, "air.sample_id")) {
++            arg->kind = ARG_SAMPLE_ID;
++        } else {
++            return fail(c, "unsupported argument kind %s", kind);
++        }
++    }
++    for (int i = 0; i < c->nargs; i++) {
++        if (c->args[i].kind == ARG_NONE &&
++            LLVMGetFirstUse(LLVMGetParam(c->fn, i)) != NULL) {
++            return fail(c, "argument %d has no AIR metadata", i);
++        }
++    }
++    return 0;
++}
++
++static int varying_location(Ctx *c, const char *name)
++{
++    A2SResult *r = c->res;
++
++    for (int i = 0; i < r->nvaryings; i++) {
++        if (!strcmp(r->varyings[i], name)) {
++            return i;
++        }
++    }
++    if (r->nvaryings == A2S_MAX_VARYINGS) {
++        return fail(c, "too many varyings");
++    }
++    snprintf(r->varyings[r->nvaryings], sizeof(r->varyings[0]), "%s", name);
++    return r->nvaryings++;
++}
++
++/* ---- interface variables ---- */
++
++static uint32_t global_var(Ctx *c, uint32_t sc, uint32_t pointee)
++{
++    uint32_t id = spv_id(&c->m), ops[3] = { spv_type_ptr(&c->m, sc, pointee), id, sc };
++
++    spv_emit(&c->m, SPV_SEC_TYPES, SpvOpVariable, ops, 3);
++    if (c->niface < 128) {
++        c->iface[c->niface++] = id;
++    }
++    return id;
++}
++
++static void decorate1(Ctx *c, uint32_t id, uint32_t dec, uint32_t v)
++{
++    spv_decorate(&c->m, id, dec, &v, 1);
++}
++
++static uint32_t builtin_var(Ctx *c, uint32_t sc, uint32_t type, uint32_t builtin)
++{
++    uint32_t v = global_var(c, sc, type);
++
++    decorate1(c, v, SpvDecorationBuiltIn, builtin);
++    return v;
++}
++
++static uint32_t image_type(Ctx *c, const char *tname, uint32_t *dim, bool *arrayed)
++{
++    uint32_t ops[8];
++    bool depth = !strncmp(tname, "depth", 5);
++
++    *arrayed = strstr(tname, "_array") != NULL;
++    if (strstr(tname, "1d")) {
++        *dim = SpvDim1D;
++        spv_capability(&c->m, SpvCapabilitySampled1D);
++    } else if (strstr(tname, "3d")) {
++        *dim = SpvDim3D;
++    } else if (strstr(tname, "cube")) {
++        *dim = SpvDimCube;
++    } else {
++        *dim = SpvDim2D;
++    }
++    ops[0] = strstr(tname, "<uint") ? spv_type_int(&c->m, 32, false) :
++             strstr(tname, "<int") ? spv_type_int(&c->m, 32, true) : c->t_f32;
++    ops[1] = *dim;
++    ops[2] = depth ? 1 : 0;
++    ops[3] = *arrayed;
++    ops[4] = strstr(tname, "_ms") ? 1 : 0;
++    ops[5] = 1;                 /* sampled */
++    ops[6] = 0;                 /* format unknown */
++    return spv_type(&c->m, SpvOpTypeImage, ops, 7);
++}
++
++static Resource *resource_for(Ctx *c, LLVMValueRef v)
++{
++    for (int i = 0; i < c->nrsrc; i++) {
++        if (c->rsrc[i].key == v) {
++            return &c->rsrc[i];
++        }
++    }
++    return NULL;
++}
++
++static int setup_interface(Ctx *c)
++{
++    int max_buf = -1, nconst = 0;
++
++    for (int i = 0; i < c->nargs; i++) {
++        if (c->args[i].kind == ARG_BUFFER && c->args[i].index > max_buf) {
++            max_buf = c->args[i].index;
++        }
++    }
++    if (max_buf >= 0) {
++        uint32_t arr_ops[2] = { c->t_u64, spv_const_u32(&c->m, max_buf + 1) };
++        uint32_t arr = spv_type(&c->m, SpvOpTypeArray, arr_ops, 2);
++        uint32_t blk = spv_type(&c->m, SpvOpTypeStruct, &arr, 1);
++
++        decorate1(c, arr, SpvDecorationArrayStride, 8);
++        spv_decorate(&c->m, blk, SpvDecorationBlock, NULL, 0);
++        spv_member_decorate(&c->m, blk, 0, SpvDecorationOffset, 0);
++        c->pc_var = global_var(c, SpvStoragePushConstant, blk);
++        c->pc_elem_ptr = spv_type_ptr(&c->m, SpvStoragePushConstant, c->t_u64);
++        c->res->push_size = 8 * (max_buf + 1);
++    }
++    for (int i = 0; i < c->nargs; i++) {
++        Arg *a = &c->args[i];
++        uint32_t v4f = spv_type_vec(&c->m, c->t_f32, 4);
++
++        switch (a->kind) {
++        case ARG_BUFFER:
++            c->res->buffer_mask |= 1u << a->index;
++            break;
++        case ARG_TEXTURE: {
++            Resource *r = &c->rsrc[c->nrsrc++];
++
++            r->key = LLVMGetParam(c->fn, i);
++            r->type = image_type(c, a->tex_type, &r->dim, &r->arrayed);
++            r->var = global_var(c, SpvStorageUniformConstant, r->type);
++            decorate1(c, r->var, SpvDecorationDescriptorSet, 0);
++            decorate1(c, r->var, SpvDecorationBinding, A2S_TEXTURE_BINDING + a->index);
++            c->res->texture_mask |= 1u << a->index;
++            break;
++        }
++        case ARG_SAMPLER: {
++            Resource *r = &c->rsrc[c->nrsrc++];
++
++            r->key = LLVMGetParam(c->fn, i);
++            r->is_sampler = true;
++            r->type = spv_type(&c->m, SpvOpTypeSampler, NULL, 0);
++            r->var = global_var(c, SpvStorageUniformConstant, r->type);
++            decorate1(c, r->var, SpvDecorationDescriptorSet, 0);
++            decorate1(c, r->var, SpvDecorationBinding, A2S_SAMPLER_BINDING + a->index);
++            c->res->sampler_mask |= 1u << a->index;
++            break;
++        }
++        case ARG_POSITION:
++            if (c->stage != A2S_STAGE_FRAGMENT) {
++                return fail(c, "air.position input outside fragment");
++            }
++            a->var = builtin_var(c, SpvStorageInput, v4f, SpvBuiltInFragCoord);
++            break;
++        case ARG_VARYING: {
++            int loc = varying_location(c, a->name);
++            uint32_t t = ty(c, LLVMTypeOf(LLVMGetParam(c->fn, i)));
++
++            if (loc < 0) {
++                return -1;
++            }
++            a->var = global_var(c, SpvStorageInput, t);
++            decorate1(c, a->var, SpvDecorationLocation, loc);
++            if (a->interp == INTERP_FLAT ||
++                LLVMGetTypeKind(LLVMTypeOf(LLVMGetParam(c->fn, i))) == LLVMIntegerTypeKind) {
++                spv_decorate(&c->m, a->var, SpvDecorationFlat, NULL, 0);
++            } else if (a->interp == INTERP_NOPERSPECTIVE) {
++                spv_decorate(&c->m, a->var, SpvDecorationNoPerspective, NULL, 0);
++            }
++            break;
++        }
++        case ARG_VERTEX_INPUT:
++            a->var = global_var(c, SpvStorageInput, ty(c, LLVMTypeOf(LLVMGetParam(c->fn, i))));
++            decorate1(c, a->var, SpvDecorationLocation, a->index);
++            break;
++        case ARG_POINT_COORD:
++            a->var = builtin_var(c, SpvStorageInput, spv_type_vec(&c->m, c->t_f32, 2),
++                                 SpvBuiltInPointCoord);
++            break;
++        case ARG_VERTEX_ID:
++            a->var = builtin_var(c, SpvStorageInput, c->t_u32, SpvBuiltInVertexIndex);
++            break;
++        case ARG_INSTANCE_ID:
++            a->var = builtin_var(c, SpvStorageInput, c->t_u32, SpvBuiltInInstanceIndex);
++            break;
++        case ARG_FRONT_FACING:
++            a->var = builtin_var(c, SpvStorageInput, c->t_bool, SpvBuiltInFrontFacing);
++            break;
++        case ARG_SAMPLE_ID:
++            a->var = builtin_var(c, SpvStorageInput, c->t_u32, SpvBuiltInSampleId);
++            break;
++        case ARG_NONE:
++            break;
++        }
++    }
++
++    /* constant samplers: globals listed in !air.sampler_states */
++    if (LLVMGetNamedMetadataNumOperands(c->mod, "air.sampler_states") > 0) {
++        unsigned n = LLVMGetNamedMetadataNumOperands(c->mod, "air.sampler_states");
++        LLVMValueRef *nodes = calloc(n, sizeof(*nodes));
++
++        LLVMGetNamedMetadataOperands(c->mod, "air.sampler_states", nodes);
++        for (unsigned i = 0; i < n && nconst < A2S_MAX_CONST_SAMP; i++) {
++            LLVMValueRef ops[4], g, init;
++            Resource *r;
++
++            md_ops(nodes[i], ops, 4);
++            g = ops[1];
++            if (!g || !LLVMIsAGlobalVariable(g)) {
++                continue;
++            }
++            r = &c->rsrc[c->nrsrc++];
++            r->key = g;
++            r->is_sampler = true;
++            r->type = spv_type(&c->m, SpvOpTypeSampler, NULL, 0);
++            r->var = global_var(c, SpvStorageUniformConstant, r->type);
++            decorate1(c, r->var, SpvDecorationDescriptorSet, 0);
++            decorate1(c, r->var, SpvDecorationBinding, A2S_CONST_SAMPLER_BINDING + nconst);
++            init = LLVMGetInitializer(g);
++            c->res->const_sampler_state[nconst] =
++                init && LLVMIsAConstantInt(init) ? LLVMConstIntGetZExtValue(init) :
++                init && LLVMIsAConstantStruct(init) &&
++                LLVMIsAConstantInt(LLVMGetAggregateElement(init, 0)) ?
++                LLVMConstIntGetZExtValue(LLVMGetAggregateElement(init, 0)) : 0;
++            nconst++;
++        }
++        free(nodes);
++        c->res->nconst_samplers = nconst;
++    }
++
++    /* outputs: one metadata node per return value / return struct member */
++    if (LLVMGetTypeKind(c->ret_ty) != LLVMVoidTypeKind) {
++        LLVMValueRef node, ops[4], outs[16];
++        bool is_struct = LLVMGetTypeKind(c->ret_ty) == LLVMStructTypeKind;
++        int n;
++
++        {
++            LLVMValueRef all[1];
++
++            LLVMGetNamedMetadataOperands(c->mod, c->stage == A2S_STAGE_FRAGMENT ?
++                                         "air.fragment" : "air.vertex", all);
++            node = all[0];
++        }
++        md_ops(node, ops, 4);
++        n = md_ops(ops[1], outs, 16);
++        if (n != (is_struct ? (int)LLVMCountStructElementTypes(c->ret_ty) : 1)) {
++            return fail(c, "output metadata does not match return type");
++        }
++        c->ret_is_struct = is_struct;
++        for (int i = 0; i < n; i++) {
++            LLVMValueRef o[16];
++            int no = md_ops(outs[i], o, 16);
++            const char *kind = no > 0 ? md_str(o[0]) : NULL;
++            LLVMTypeRef mt = is_struct ? LLVMStructGetTypeAtIndex(c->ret_ty, i) : c->ret_ty;
++            uint32_t t = ty(c, mt);
++
++            if (!kind) {
++                return fail(c, "bad output metadata");
++            } else if (!strcmp(kind, "air.position")) {
++                c->out_vars[i] = builtin_var(c, SpvStorageOutput, t, SpvBuiltInPosition);
++            } else if (!strcmp(kind, "air.vertex_output")) {
++                int loc = varying_location(c, no > 1 && md_str(o[1]) ? md_str(o[1]) : "?");
++
++                if (loc < 0) {
++                    return -1;
++                }
++                c->out_vars[i] = global_var(c, SpvStorageOutput, t);
++                decorate1(c, c->out_vars[i], SpvDecorationLocation, loc);
++            } else if (!strcmp(kind, "air.point_size")) {
++                c->out_vars[i] = builtin_var(c, SpvStorageOutput, t, SpvBuiltInPointSize);
++            } else if (!strcmp(kind, "air.render_target")) {
++                c->out_vars[i] = global_var(c, SpvStorageOutput, t);
++                decorate1(c, c->out_vars[i], SpvDecorationLocation, no > 1 ? md_int(o[1]) : 0);
++                if (no > 2 && md_int(o[2]) > 0) {
++                    decorate1(c, c->out_vars[i], SpvDecorationIndex, md_int(o[2]));
++                }
++            } else if (!strcmp(kind, "air.depth")) {
++                c->out_vars[i] = builtin_var(c, SpvStorageOutput, t, SpvBuiltInFragDepth);
++                c->depth_replacing = true;
++            } else {
++                return fail(c, "unsupported output %s", kind);
++            }
++        }
++        c->nout = n;
++    }
++    return c->err[0] ? -1 : 0;
++}
++
++/* ---- CFG helpers ---- */
++
++typedef struct Cfg {
++    int n;
++    LLVMBasicBlockRef *bb;      /* reverse postorder */
++    int *ipdom;                 /* index into bb, or -1 = function exit */
++} Cfg;
++
++static int bb_index(Cfg *g, LLVMBasicBlockRef b)
++{
++    for (int i = 0; i < g->n; i++) {
++        if (g->bb[i] == b) {
++            return i;
++        }
++    }
++    return -1;
++}
++
++static void rpo_visit(LLVMBasicBlockRef b, LLVMBasicBlockRef *seen, int *nseen,
++                      LLVMBasicBlockRef *post, int *npost, bool *loop, LLVMBasicBlockRef *stack,
++                      int depth)
++{
++    LLVMValueRef term = LLVMGetBasicBlockTerminator(b);
++    unsigned ns = term ? LLVMGetNumSuccessors(term) : 0;
++
++    seen[(*nseen)++] = b;
++    stack[depth] = b;
++    for (unsigned i = 0; i < ns; i++) {
++        LLVMBasicBlockRef s = LLVMGetSuccessor(term, i);
++        bool visited = false;
++
++        for (int d = 0; d <= depth; d++) {
++            if (stack[d] == s) {
++                *loop = true;
++            }
++        }
++        for (int k = 0; k < *nseen; k++) {
++            if (seen[k] == s) {
++                visited = true;
++                break;
++            }
++        }
++        if (!visited) {
++            rpo_visit(s, seen, nseen, post, npost, loop, stack, depth + 1);
++        }
++    }
++    post[(*npost)++] = b;
++}
++
++static int build_cfg(Ctx *c, Cfg *g)
++{
++    unsigned total = LLVMCountBasicBlocks(c->fn);
++    LLVMBasicBlockRef *seen = calloc(total, sizeof(*seen)), *post = calloc(total, sizeof(*post));
++    LLVMBasicBlockRef *stack = calloc(total + 1, sizeof(*stack));
++    int nseen = 0, npost = 0, words;
++    bool loop = false;
++    uint64_t *pd;
++
++    rpo_visit(LLVMGetEntryBasicBlock(c->fn), seen, &nseen, post, &npost, &loop, stack, 0);
++    free(seen);
++    free(stack);
++    if (loop) {
++        free(post);
++        return fail(c, "loops not supported yet");
++    }
++    g->n = npost;
++    g->bb = calloc(npost, sizeof(*g->bb));
++    for (int i = 0; i < npost; i++) {
++        g->bb[i] = post[npost - 1 - i];
++    }
++    free(post);
++
++    /* post-dominator sets over an acyclic CFG: process in postorder (successors first) */
++    words = (g->n + 63) / 64;
++    pd = calloc((size_t)g->n * words, sizeof(*pd));
++    g->ipdom = calloc(g->n, sizeof(*g->ipdom));
++    for (int i = g->n - 1; i >= 0; i--) {
++        LLVMValueRef term = LLVMGetBasicBlockTerminator(g->bb[i]);
++        unsigned ns = LLVMGetNumSuccessors(term);
++        uint64_t *set = pd + (size_t)i * words;
++
++        if (ns > 0) {
++            memset(set, 0xff, words * sizeof(*set));
++            for (unsigned s = 0; s < ns; s++) {
++                int si = bb_index(g, LLVMGetSuccessor(term, s));
++                uint64_t *ss = pd + (size_t)si * words;
++
++                for (int w = 0; w < words; w++) {
++                    set[w] &= ss[w];
++                }
++            }
++        }
++        set[i / 64] |= 1ull << (i % 64);
++    }
++    for (int i = 0; i < g->n; i++) {
++        uint64_t *set = pd + (size_t)i * words;
++        int best = -1, bestcount = -1;
++
++        /* immediate post-dominator: the strict post-dominator with the largest set */
++        for (int j = 0; j < g->n; j++) {
++            if (j != i && (set[j / 64] >> (j % 64) & 1)) {
++                int cnt = 0;
++
++                for (int w = 0; w < words; w++) {
++                    cnt += __builtin_popcountll(pd[(size_t)j * words + w]);
++                }
++                if (cnt > bestcount) {
++                    bestcount = cnt;
++                    best = j;
++                }
++            }
++        }
++        g->ipdom[i] = best;
++    }
++    free(pd);
++    return 0;
++}
++
++/* ---- instruction translation ---- */
++
++static uint32_t emit(Ctx *c, uint16_t op, uint32_t type, uint32_t result, const uint32_t *ops,
++                     size_t n)
++{
++    uint32_t w[40];
++
++    w[0] = type;
++    w[1] = result ? result : spv_id(&c->m);
++    memcpy(w + 2, ops, n * sizeof(*w));
++    spv_emit(&c->m, SPV_SEC_FUNCS, op, w, n + 2);
++    return w[1];
++}
++
++static uint32_t ext(Ctx *c, uint32_t type, uint32_t result, uint32_t inst, const uint32_t *args,
++                    size_t n)
++{
++    uint32_t w[16] = { c->m.glsl, inst };
++
++    memcpy(w + 2, args, n * sizeof(*w));
++    return emit(c, SpvOpExtInst, type, result, w, n + 2);
++}
++
++static uint32_t splat_f32(Ctx *c, LLVMTypeRef t, float f)
++{
++    uint32_t s = spv_const_f32(&c->m, f), ops[16];
++
++    if (LLVMGetTypeKind(t) != LLVMVectorTypeKind) {
++        return s;
++    }
++    for (unsigned i = 0; i < LLVMGetVectorSize(t); i++) {
++        ops[i] = s;
++    }
++    return spv_const(&c->m, SpvOpConstantComposite, ty(c, t), ops, LLVMGetVectorSize(t));
++}
++
++static uint32_t splat_int(Ctx *c, LLVMTypeRef t, uint32_t x)
++{
++    LLVMTypeRef et = LLVMGetTypeKind(t) == LLVMVectorTypeKind ? LLVMGetElementType(t) : t;
++    uint32_t s = spv_const(&c->m, SpvOpConstant, ty(c, et), &x, 1), ops[16];
++
++    if (LLVMGetTypeKind(t) != LLVMVectorTypeKind) {
++        return s;
++    }
++    for (unsigned i = 0; i < LLVMGetVectorSize(t); i++) {
++        ops[i] = s;
++    }
++    return spv_const(&c->m, SpvOpConstantComposite, ty(c, t), ops, LLVMGetVectorSize(t));
++}
++
++static bool is_bool(LLVMTypeRef t)
++{
++    if (LLVMGetTypeKind(t) == LLVMVectorTypeKind) {
++        t = LLVMGetElementType(t);
++    }
++    return LLVMGetTypeKind(t) == LLVMIntegerTypeKind && LLVMGetIntTypeWidth(t) == 1;
++}
++
++/* u64 address of a GEP: base + offsets from the data layout */
++static uint32_t gep_addr(Ctx *c, LLVMValueRef inst)
++{
++    LLVMTypeRef t = LLVMGetGEPSourceElementType(inst);
++    unsigned n = LLVMGetNumOperands(inst);
++    uint32_t addr = val(c, LLVMGetOperand(inst, 0));
++
++    for (unsigned i = 1; i < n; i++) {
++        LLVMValueRef idx = LLVMGetOperand(inst, i);
++        uint64_t elem_size;
++
++        if (i > 1 && LLVMGetTypeKind(t) == LLVMStructTypeKind) {
++            unsigned field = (unsigned)LLVMConstIntGetZExtValue(idx);
++            uint64_t off = LLVMOffsetOfElement(c->td, t, field);
++
++            if (off) {
++                uint32_t ops[2] = { addr, spv_const_u64(&c->m, off) };
++
++                addr = emit(c, SpvOpIAdd, c->t_u64, 0, ops, 2);
++            }
++            t = LLVMStructGetTypeAtIndex(t, field);
++            continue;
++        }
++        if (i > 1) {
++            t = LLVMGetElementType(t);
++        }
++        elem_size = LLVMABISizeOfType(c->td, t);
++        if (LLVMIsAConstantInt(idx)) {
++            int64_t k = LLVMConstIntGetSExtValue(idx);
++
++            if (k) {
++                uint32_t ops[2] = { addr, spv_const_u64(&c->m, (uint64_t)(k * (int64_t)elem_size)) };
++
++                addr = emit(c, SpvOpIAdd, c->t_u64, 0, ops, 2);
++            }
++        } else {
++            uint32_t iv = val(c, idx), off, ops[2];
++
++            if (LLVMGetIntTypeWidth(LLVMTypeOf(idx)) != 64) {
++                iv = emit(c, SpvOpSConvert, c->t_u64, 0, &iv, 1);
++            }
++            ops[0] = iv;
++            ops[1] = spv_const_u64(&c->m, elem_size);
++            off = emit(c, SpvOpIMul, c->t_u64, 0, ops, 2);
++            ops[0] = addr;
++            ops[1] = off;
++            addr = emit(c, SpvOpIAdd, c->t_u64, 0, ops, 2);
++        }
++    }
++    return addr;
++}
++
++static uint32_t psb_ptr(Ctx *c, uint32_t addr, uint32_t pointee)
++{
++    return emit(c, SpvOpConvertUToPtr,
++                spv_type_ptr(&c->m, SpvStoragePhysicalStorageBuffer, pointee), 0, &addr, 1);
++}
++
++static unsigned align_of(LLVMValueRef inst, LLVMTypeRef t, Ctx *c)
++{
++    unsigned a = LLVMGetAlignment(inst);
++
++    return a ? a : LLVMABIAlignmentOfType(c->td, t);
++}
++
++static uint32_t load_mem(Ctx *c, LLVMTypeRef t, uint32_t addr, unsigned align, uint32_t result)
++{
++    if (LLVMGetTypeKind(t) == LLVMStructTypeKind || LLVMGetTypeKind(t) == LLVMArrayTypeKind) {
++        bool st = LLVMGetTypeKind(t) == LLVMStructTypeKind;
++        unsigned n = st ? LLVMCountStructElementTypes(t) : (unsigned)LLVMGetArrayLength2(t);
++        uint32_t parts[32];
++
++        if (n > 32) {
++            return fail(c, "aggregate load too large"), 0;
++        }
++        for (unsigned i = 0; i < n; i++) {
++            LLVMTypeRef et = st ? LLVMStructGetTypeAtIndex(t, i) : LLVMGetElementType(t);
++            uint64_t off = st ? LLVMOffsetOfElement(c->td, t, i) :
++                                i * LLVMABISizeOfType(c->td, et);
++            uint32_t ops[2] = { addr, spv_const_u64(&c->m, off) };
++            uint32_t a = off ? emit(c, SpvOpIAdd, c->t_u64, 0, ops, 2) : addr;
++
++            parts[i] = load_mem(c, et, a, LLVMABIAlignmentOfType(c->td, et) < align ?
++                                LLVMABIAlignmentOfType(c->td, et) : align, 0);
++        }
++        return emit(c, SpvOpCompositeConstruct, ty(c, t), result, parts, n);
++    }
++    if (is_bool(t)) {
++        return fail(c, "bool load from memory"), 0;
++    }
++    {
++        uint32_t p = psb_ptr(c, addr, ty(c, t));
++        uint32_t ops[3] = { p, SpvMemoryAccessAligned, align };
++
++        return emit(c, SpvOpLoad, ty(c, t), result, ops, 3);
++    }
++}
++
++static int store_mem(Ctx *c, LLVMValueRef value, uint32_t addr, unsigned align)
++{
++    LLVMTypeRef t = LLVMTypeOf(value);
++    uint32_t p, ops[4];
++
++    if (LLVMGetTypeKind(t) == LLVMStructTypeKind || LLVMGetTypeKind(t) == LLVMArrayTypeKind ||
++        is_bool(t)) {
++        return fail(c, "aggregate/bool store to memory");
++    }
++    p = psb_ptr(c, addr, ty(c, t));
++    ops[0] = p;
++    ops[1] = val(c, value);
++    ops[2] = SpvMemoryAccessAligned;
++    ops[3] = align;
++    spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpStore, ops, 4);
++    return 0;
++}
++
++static const struct { const char *name; int glsl; int nargs; } glsl_map[] = {
++    { "fmax", GLSLstd450FMax, 2 }, { "fmin", GLSLstd450FMin, 2 }, { "clamp", GLSLstd450FClamp, 3 },
++    { "sqrt", GLSLstd450Sqrt, 1 }, { "rsqrt", GLSLstd450InverseSqrt, 1 },
++    { "fabs", GLSLstd450FAbs, 1 }, { "sign", GLSLstd450FSign, 1 }, { "floor", GLSLstd450Floor, 1 },
++    { "ceil", GLSLstd450Ceil, 1 }, { "fract", GLSLstd450Fract, 1 }, { "trunc", GLSLstd450Trunc, 1 },
++    { "round", GLSLstd450Round, 1 }, { "exp", GLSLstd450Exp, 1 }, { "exp2", GLSLstd450Exp2, 1 },
++    { "log", GLSLstd450Log, 1 }, { "log2", GLSLstd450Log2, 1 }, { "pow", GLSLstd450Pow, 2 },
++    { "powr", GLSLstd450Pow, 2 }, { "atan2", GLSLstd450Atan2, 2 }, { "sin", GLSLstd450Sin, 1 },
++    { "cos", GLSLstd450Cos, 1 }, { "tan", GLSLstd450Tan, 1 }, { "asin", GLSLstd450Asin, 1 },
++    { "acos", GLSLstd450Acos, 1 }, { "atan", GLSLstd450Atan, 1 }, { "mix", GLSLstd450FMix, 3 },
++    { "fma", GLSLstd450Fma, 3 }, { "normalize", GLSLstd450Normalize, 1 },
++    { "length", GLSLstd450Length, 1 }, { "distance", GLSLstd450Distance, 2 },
++    { "cross", GLSLstd450Cross, 3 - 1 }, { "step", GLSLstd450Step, 2 },
++    { "smoothstep", GLSLstd450SmoothStep, 3 },
++};
++
++static uint32_t load_resource(Ctx *c, Resource *r)
++{
++    return emit(c, SpvOpLoad, r->type, 0, &r->var, 1);
++}
++
++/* air.sample_texture_* / air.read_texture_*; returns {v4, i8} struct */
++static int texture_call(Ctx *c, LLVMValueRef call, const char *name, uint32_t result)
++{
++    bool read = !strncmp(name, "read_texture", 12);
++    Resource *tex = resource_for(c, LLVMGetOperand(call, 0));
++    LLVMTypeRef rty = LLVMTypeOf(call);
++    LLVMTypeRef vty = LLVMStructGetTypeAtIndex(rty, 0);
++    uint32_t v4 = ty(c, vty), image, texel, parts[2];
++    bool arrayed;
++
++    if (!tex || tex->is_sampler || LLVMGetTypeKind(rty) != LLVMStructTypeKind) {
++        return fail(c, "texture call on unknown texture");
++    }
++    arrayed = tex->arrayed;
++    image = load_resource(c, tex);
++    if (read) {
++        /* read_texture_2d(tex, int2 coord, i32 lod, i32) */
++        uint32_t ops[4] = { image, val(c, LLVMGetOperand(call, 1)), SpvImageOperandsLod,
++                            val(c, LLVMGetOperand(call, 2)) };
++
++        if (arrayed || tex->dim != SpvDim2D) {
++            return fail(c, "unsupported read_texture variant %s", name);
++        }
++        texel = emit(c, SpvOpImageFetch, v4, 0, ops, 4);
++    } else {
++        /* sample(tex, smp, coord, [array], i1, offset, i1 is_level, f32 lod_bias, f32 min_lod, i32) */
++        Resource *smp = resource_for(c, LLVMGetOperand(call, 1));
++        unsigned a = 2;
++        uint32_t coord = val(c, LLVMGetOperand(call, a++)), sampler, sampled, si_ty, ops[8];
++        LLVMValueRef lod_arg, level_flag;
++        bool explicit_lod;
++
++        if (!smp || !smp->is_sampler) {
++            return fail(c, "sample with unknown sampler");
++        }
++        if (arrayed) {
++            /* coord ++ float(array index) */
++            LLVMValueRef ai = LLVMGetOperand(call, a++);
++            uint32_t af = emit(c, SpvOpConvertUToF, c->t_f32, 0, (uint32_t[]){ val(c, ai) }, 1);
++            LLVMTypeRef ct = LLVMTypeOf(LLVMGetOperand(call, 2));
++            unsigned cn = LLVMGetTypeKind(ct) == LLVMVectorTypeKind ? LLVMGetVectorSize(ct) : 1;
++            uint32_t cops[2] = { coord, af };
++
++            coord = emit(c, SpvOpCompositeConstruct, spv_type_vec(&c->m, c->t_f32, cn + 1), 0,
++                         cops, 2);
++        }
++        a += 2;     /* i1, offset */
++        level_flag = LLVMGetOperand(call, a++);
++        lod_arg = LLVMGetOperand(call, a++);
++        explicit_lod = LLVMIsAConstantInt(level_flag) && LLVMConstIntGetZExtValue(level_flag);
++        if (!LLVMIsAConstantInt(level_flag)) {
++            return fail(c, "dynamic sample LOD mode");
++        }
++        sampler = load_resource(c, smp);
++        si_ty = spv_type(&c->m, SpvOpTypeSampledImage, &tex->type, 1);
++        ops[0] = image;
++        ops[1] = sampler;
++        sampled = emit(c, SpvOpSampledImage, si_ty, 0, ops, 2);
++        ops[0] = sampled;
++        ops[1] = coord;
++        if (explicit_lod || c->stage != A2S_STAGE_FRAGMENT) {
++            ops[2] = SpvImageOperandsLod;
++            ops[3] = explicit_lod ? val(c, lod_arg) : spv_const_f32(&c->m, 0);
++            texel = emit(c, SpvOpImageSampleExplicitLod, v4, 0, ops, 4);
++        } else if (LLVMIsAConstantFP(lod_arg) && LLVMIsNull(lod_arg)) {
++            texel = emit(c, SpvOpImageSampleImplicitLod, v4, 0, ops, 2);
++        } else {
++            ops[2] = SpvImageOperandsBias;
++            ops[3] = val(c, lod_arg);
++            texel = emit(c, SpvOpImageSampleImplicitLod, v4, 0, ops, 4);
++        }
++    }
++    parts[0] = texel;
++    parts[1] = const_val(c, LLVMConstNull(LLVMStructGetTypeAtIndex(rty, 1)));
++    emit(c, SpvOpCompositeConstruct, ty(c, rty), result, parts, 2);
++    return 0;
++}
++
++static int call_inst(Ctx *c, LLVMValueRef call, uint32_t result)
++{
++    LLVMValueRef callee = LLVMGetCalledValue(call);
++    const char *full = callee ? vname(callee, NULL) : NULL;
++    char base[64];
++    const char *dot;
++    unsigned nargs = LLVMGetNumArgOperands(call);
++    LLVMTypeRef rt = LLVMTypeOf(call);
++    uint32_t rty = ty(c, rt), args[8];
++
++    if (!full || strncmp(full, "air.", 4)) {
++        return fail(c, "call to non-AIR function %s", full ? full : "?");
++    }
++    full += 4;
++    if (!strncmp(full, "fast_", 5)) {
++        full += 5;
++    }
++    dot = strchr(full, '.');
++    snprintf(base, sizeof(base), "%.*s", dot ? (int)(dot - full) : (int)strlen(full), full);
++
++    if (!strncmp(base, "sample_texture", 14) || !strncmp(base, "read_texture", 12)) {
++        return texture_call(c, call, base, result);
++    }
++    if (!strcmp(base, "discard_fragment")) {
++        spv_capability(&c->m, SpvCapabilityDemoteToHelperInvocation);
++        spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpDemoteToHelperInvocation, NULL, 0);
++        return 0;
++    }
++    for (unsigned i = 0; i < nargs && i < 8; i++) {
++        args[i] = val(c, LLVMGetOperand(call, i));
++    }
++    if (!strcmp(base, "saturate")) {
++        uint32_t ops[3] = { args[0], splat_f32(c, rt, 0), splat_f32(c, rt, 1) };
++
++        ext(c, rty, result, GLSLstd450FClamp, ops, 3);
++        return 0;
++    }
++    if (!strcmp(base, "fmax3") || !strcmp(base, "fmin3")) {
++        int op = base[1] == 'm' && base[2] == 'a' ? GLSLstd450FMax : GLSLstd450FMin;
++        uint32_t t = ext(c, rty, 0, op, args, 2), ops[2] = { t, args[2] };
++
++        ext(c, rty, result, op, ops, 2);
++        return 0;
++    }
++    if (!strcmp(base, "dot")) {
++        emit(c, SpvOpDot, rty, result, args, 2);
++        return 0;
++    }
++    if (!strcmp(base, "any") || !strcmp(base, "all")) {
++        if (LLVMGetTypeKind(LLVMTypeOf(LLVMGetOperand(call, 0))) != LLVMVectorTypeKind) {
++            emit(c, SpvOpCopyObject, rty, result, args, 1);
++        } else {
++            emit(c, base[1] == 'n' ? SpvOpAny : SpvOpAll, rty, result, args, 1);
++        }
++        return 0;
++    }
++    if (!strcmp(base, "fwidth") || !strcmp(base, "dfdx") || !strcmp(base, "dfdy")) {
++        emit(c, base[0] == 'f' ? SpvOpFwidth : base[3] == 'x' ? SpvOpDPdx : SpvOpDPdy, rty,
++             result, args, 1);
++        return 0;
++    }
++    if (!strcmp(base, "convert")) {
++        /* air.convert.<dk>.<dty>.<sk>.<sty> */
++        char dk = 0, sk = 0;
++        const char *p = strchr(full, '.');
++        LLVMTypeRef st = LLVMTypeOf(LLVMGetOperand(call, 0));
++
++        if (p) {
++            dk = p[1];
++            p = strchr(p + 1, '.');
++            p = p ? strchr(p + 1, '.') : NULL;
++            sk = p ? p[1] : 0;
++        }
++        if (is_bool(st)) {
++            uint32_t ops[3] = { args[0],
++                                dk == 'f' ? splat_f32(c, rt, 1) : splat_int(c, rt, 1),
++                                dk == 'f' ? splat_f32(c, rt, 0) : splat_int(c, rt, 0) };
++
++            emit(c, SpvOpSelect, rty, result, ops, 3);
++        } else if (dk == 'f' && sk == 'f') {
++            emit(c, SpvOpFConvert, rty, result, args, 1);
++        } else if (dk == 'f') {
++            emit(c, sk == 's' ? SpvOpConvertSToF : SpvOpConvertUToF, rty, result, args, 1);
++        } else if (sk == 'f') {
++            emit(c, dk == 's' ? SpvOpConvertFToS : SpvOpConvertFToU, rty, result, args, 1);
++        } else {
++            emit(c, dk == 's' ? SpvOpSConvert : SpvOpUConvert, rty, result, args, 1);
++        }
++        return 0;
++    }
++    if (!strcmp(base, "unpack")) {
++        if (strstr(full, "unorm4x8")) {
++            ext(c, rty, result, GLSLstd450UnpackUnorm4x8, args, 1);
++            return 0;
++        }
++        if (strstr(full, "snorm4x8")) {
++            ext(c, rty, result, GLSLstd450UnpackSnorm4x8, args, 1);
++            return 0;
++        }
++        return fail(c, "unsupported unpack %s", full);
++    }
++    if (!strcmp(base, "max") || !strcmp(base, "min") || !strcmp(base, "abs") ||
++        !strcmp(base, "clamp") ) {
++        /* integer variants carry .s./.u. after the base name */
++        bool sgn = strstr(full, ".s.") != NULL, uns = strstr(full, ".u.") != NULL;
++
++        if (sgn || uns) {
++            int op = !strcmp(base, "max") ? (sgn ? GLSLstd450SMax : GLSLstd450UMax) :
++                     !strcmp(base, "min") ? (sgn ? GLSLstd450SMin : GLSLstd450UMin) :
++                     !strcmp(base, "abs") ? GLSLstd450SAbs :
++                     (sgn ? GLSLstd450SClamp : GLSLstd450UClamp);
++
++            ext(c, rty, result, op, args, nargs);
++            return 0;
++        }
++    }
++    for (size_t i = 0; i < sizeof(glsl_map) / sizeof(glsl_map[0]); i++) {
++        if (!strcmp(base, glsl_map[i].name)) {
++            if ((int)nargs != glsl_map[i].nargs) {
++                return fail(c, "air.%s: %u args", base, nargs);
++            }
++            ext(c, rty, result, glsl_map[i].glsl, args, nargs);
++            return 0;
++        }
++    }
++    return fail(c, "unsupported intrinsic air.%s", full);
++}
++
++static uint16_t icmp_op(LLVMIntPredicate p, bool b)
++{
++    switch (p) {
++    case LLVMIntEQ: return b ? SpvOpLogicalEqual : SpvOpIEqual;
++    case LLVMIntNE: return b ? SpvOpLogicalNotEqual : SpvOpINotEqual;
++    case LLVMIntUGT: return SpvOpUGreaterThan;
++    case LLVMIntUGE: return SpvOpUGreaterThanEqual;
++    case LLVMIntULT: return SpvOpULessThan;
++    case LLVMIntULE: return SpvOpULessThanEqual;
++    case LLVMIntSGT: return SpvOpSGreaterThan;
++    case LLVMIntSGE: return SpvOpSGreaterThanEqual;
++    case LLVMIntSLT: return SpvOpSLessThan;
++    case LLVMIntSLE: return SpvOpSLessThanEqual;
++    }
++    return 0;
++}
++
++static uint16_t fcmp_op(LLVMRealPredicate p)
++{
++    switch (p) {
++    case LLVMRealOEQ: return SpvOpFOrdEqual;
++    case LLVMRealOGT: return SpvOpFOrdGreaterThan;
++    case LLVMRealOGE: return SpvOpFOrdGreaterThanEqual;
++    case LLVMRealOLT: return SpvOpFOrdLessThan;
++    case LLVMRealOLE: return SpvOpFOrdLessThanEqual;
++    case LLVMRealONE: return SpvOpFOrdNotEqual;
++    case LLVMRealORD: return SpvOpOrdered;
++    case LLVMRealUNO: return SpvOpUnordered;
++    case LLVMRealUEQ: return SpvOpFUnordEqual;
++    case LLVMRealUGT: return SpvOpFUnordGreaterThan;
++    case LLVMRealUGE: return SpvOpFUnordGreaterThanEqual;
++    case LLVMRealULT: return SpvOpFUnordLessThan;
++    case LLVMRealULE: return SpvOpFUnordLessThanEqual;
++    case LLVMRealUNE: return SpvOpFUnordNotEqual;
++    default: return 0;
++    }
++}
++
++static int emit_return(Ctx *c, LLVMValueRef inst)
++{
++    if (LLVMGetNumOperands(inst) > 0 && c->nout) {
++        uint32_t v = val(c, LLVMGetOperand(inst, 0));
++
++        for (int i = 0; i < c->nout; i++) {
++            uint32_t m = v, ops[2];
++
++            if (c->ret_is_struct) {
++                LLVMTypeRef mt = LLVMStructGetTypeAtIndex(c->ret_ty, i);
++                uint32_t eops[2] = { v, (uint32_t)i };
++
++                m = emit(c, SpvOpCompositeExtract, ty(c, mt), 0, eops, 2);
++            }
++            ops[0] = c->out_vars[i];
++            ops[1] = m;
++            spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpStore, ops, 2);
++        }
++    }
++    spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpReturn, NULL, 0);
++    return 0;
++}
++
++static int instruction(Ctx *c, Cfg *g, int bi, LLVMValueRef inst)
++{
++    LLVMOpcode op = LLVMGetInstructionOpcode(inst);
++    LLVMTypeRef t = LLVMTypeOf(inst);
++    uint32_t r = LLVMGetTypeKind(t) != LLVMVoidTypeKind ? val(c, inst) : 0;
++    uint32_t tid = LLVMGetTypeKind(t) != LLVMVoidTypeKind ? ty(c, t) : 0;
++    uint32_t ops[64];
++
++    switch (op) {
++    case LLVMFAdd: case LLVMFSub: case LLVMFMul: case LLVMFDiv: case LLVMFRem:
++    case LLVMAdd: case LLVMSub: case LLVMMul: case LLVMUDiv: case LLVMSDiv: case LLVMURem:
++    case LLVMSRem: case LLVMShl: case LLVMLShr: case LLVMAShr: case LLVMAnd: case LLVMOr:
++    case LLVMXor: {
++        bool b = is_bool(t);
++        uint16_t sop =
++            op == LLVMFAdd ? SpvOpFAdd : op == LLVMFSub ? SpvOpFSub : op == LLVMFMul ? SpvOpFMul :
++            op == LLVMFDiv ? SpvOpFDiv : op == LLVMFRem ? SpvOpFRem : op == LLVMAdd ? SpvOpIAdd :
++            op == LLVMSub ? SpvOpISub : op == LLVMMul ? SpvOpIMul : op == LLVMUDiv ? SpvOpUDiv :
++            op == LLVMSDiv ? SpvOpSDiv : op == LLVMURem ? SpvOpUMod : op == LLVMSRem ? SpvOpSRem :
++            op == LLVMShl ? SpvOpShiftLeftLogical : op == LLVMLShr ? SpvOpShiftRightLogical :
++            op == LLVMAShr ? SpvOpShiftRightArithmetic :
++            op == LLVMAnd ? (b ? SpvOpLogicalAnd : SpvOpBitwiseAnd) :
++            op == LLVMOr ? (b ? SpvOpLogicalOr : SpvOpBitwiseOr) :
++            (b ? SpvOpLogicalNotEqual : SpvOpBitwiseXor);
++
++        ops[0] = val(c, LLVMGetOperand(inst, 0));
++        ops[1] = val(c, LLVMGetOperand(inst, 1));
++        emit(c, sop, tid, r, ops, 2);
++        return 0;
++    }
++    case LLVMFNeg:
++        ops[0] = val(c, LLVMGetOperand(inst, 0));
++        emit(c, SpvOpFNegate, tid, r, ops, 1);
++        return 0;
++    case LLVMICmp:
++        ops[0] = val(c, LLVMGetOperand(inst, 0));
++        ops[1] = val(c, LLVMGetOperand(inst, 1));
++        emit(c, icmp_op(LLVMGetICmpPredicate(inst), is_bool(LLVMTypeOf(LLVMGetOperand(inst, 0)))),
++             tid, r, ops, 2);
++        return 0;
++    case LLVMFCmp: {
++        LLVMRealPredicate p = LLVMGetFCmpPredicate(inst);
++
++        if (p == LLVMRealPredicateTrue || p == LLVMRealPredicateFalse) {
++            ops[0] = is_bool(t) && LLVMGetTypeKind(t) != LLVMVectorTypeKind ?
++                     spv_const(&c->m, p == LLVMRealPredicateTrue ? SpvOpConstantTrue :
++                               SpvOpConstantFalse, c->t_bool, NULL, 0) : 0;
++            if (!ops[0]) {
++                return fail(c, "vector fcmp true/false");
++            }
++            emit(c, SpvOpCopyObject, tid, r, ops, 1);
++            return 0;
++        }
++        ops[0] = val(c, LLVMGetOperand(inst, 0));
++        ops[1] = val(c, LLVMGetOperand(inst, 1));
++        emit(c, fcmp_op(p), tid, r, ops, 2);
++        return 0;
++    }
++    case LLVMSelect:
++        ops[0] = val(c, LLVMGetOperand(inst, 0));
++        ops[1] = val(c, LLVMGetOperand(inst, 1));
++        ops[2] = val(c, LLVMGetOperand(inst, 2));
++        emit(c, SpvOpSelect, tid, r, ops, 3);
++        return 0;
++    case LLVMZExt: case LLVMSExt: case LLVMTrunc: {
++        LLVMValueRef src = LLVMGetOperand(inst, 0);
++
++        ops[0] = val(c, src);
++        if (is_bool(LLVMTypeOf(src))) {
++            ops[1] = splat_int(c, t, op == LLVMSExt ? 0xffffffffu : 1);
++            ops[2] = splat_int(c, t, 0);
++            emit(c, SpvOpSelect, tid, r, ops, 3);
++        } else if (is_bool(t)) {
++            ops[1] = splat_int(c, LLVMTypeOf(src), 1);
++            ops[0] = emit(c, SpvOpBitwiseAnd, ty(c, LLVMTypeOf(src)), 0, ops, 2);
++            ops[1] = splat_int(c, LLVMTypeOf(src), 0);
++            emit(c, SpvOpINotEqual, tid, r, ops, 2);
++        } else {
++            emit(c, op == LLVMSExt ? SpvOpSConvert : SpvOpUConvert, tid, r, ops, 1);
++        }
++        return 0;
++    }
++    case LLVMFPTrunc: case LLVMFPExt:
++        ops[0] = val(c, LLVMGetOperand(inst, 0));
++        emit(c, SpvOpFConvert, tid, r, ops, 1);
++        return 0;
++    case LLVMFPToUI: case LLVMFPToSI: case LLVMUIToFP: case LLVMSIToFP: {
++        LLVMValueRef src = LLVMGetOperand(inst, 0);
++
++        ops[0] = val(c, src);
++        if (is_bool(LLVMTypeOf(src))) {
++            ops[1] = splat_f32(c, t, op == LLVMSIToFP ? -1.0f : 1.0f);
++            ops[2] = splat_f32(c, t, 0);
++            emit(c, SpvOpSelect, tid, r, ops, 3);
++            return 0;
++        }
++        emit(c, op == LLVMFPToUI ? SpvOpConvertFToU : op == LLVMFPToSI ? SpvOpConvertFToS :
++             op == LLVMUIToFP ? SpvOpConvertUToF : SpvOpConvertSToF, tid, r, ops, 1);
++        return 0;
++    }
++    case LLVMBitCast: case LLVMPtrToInt: case LLVMIntToPtr: case LLVMAddrSpaceCast:
++    case LLVMFreeze: {
++        LLVMValueRef src = LLVMGetOperand(inst, 0);
++        uint32_t sid = ty(c, LLVMTypeOf(src));
++
++        ops[0] = val(c, src);
++        if (sid == tid) {
++            emit(c, SpvOpCopyObject, tid, r, ops, 1);
++        } else if (op == LLVMBitCast) {
++            emit(c, SpvOpBitcast, tid, r, ops, 1);
++        } else {
++            emit(c, SpvOpUConvert, tid, r, ops, 1);
++        }
++        return 0;
++    }
++    case LLVMExtractElement: {
++        LLVMValueRef idx = LLVMGetOperand(inst, 1);
++
++        ops[0] = val(c, LLVMGetOperand(inst, 0));
++        if (LLVMIsAConstantInt(idx)) {
++            ops[1] = (uint32_t)LLVMConstIntGetZExtValue(idx);
++            emit(c, SpvOpCompositeExtract, tid, r, ops, 2);
++        } else {
++            ops[1] = val(c, idx);
++            emit(c, SpvOpVectorExtractDynamic, tid, r, ops, 2);
++        }
++        return 0;
++    }
++    case LLVMInsertElement: {
++        LLVMValueRef idx = LLVMGetOperand(inst, 2);
++
++        if (LLVMIsAConstantInt(idx)) {
++            ops[0] = val(c, LLVMGetOperand(inst, 1));
++            ops[1] = val(c, LLVMGetOperand(inst, 0));
++            ops[2] = (uint32_t)LLVMConstIntGetZExtValue(idx);
++            emit(c, SpvOpCompositeInsert, tid, r, ops, 3);
++        } else {
++            ops[0] = val(c, LLVMGetOperand(inst, 0));
++            ops[1] = val(c, LLVMGetOperand(inst, 1));
++            ops[2] = val(c, idx);
++            emit(c, SpvOpVectorInsertDynamic, tid, r, ops, 3);
++        }
++        return 0;
++    }
++    case LLVMShuffleVector: {
++        unsigned n = LLVMGetNumMaskElements(inst);
++
++        if (n > 60) {
++            return fail(c, "shuffle too wide");
++        }
++        ops[0] = val(c, LLVMGetOperand(inst, 0));
++        ops[1] = val(c, LLVMGetOperand(inst, 1));
++        for (unsigned i = 0; i < n; i++) {
++            int m = LLVMGetMaskValue(inst, i);
++
++            ops[2 + i] = m == LLVMGetUndefMaskElem() ? 0xffffffffu : (uint32_t)m;
++        }
++        emit(c, SpvOpVectorShuffle, tid, r, ops, 2 + n);
++        return 0;
++    }
++    case LLVMExtractValue: case LLVMInsertValue: {
++        unsigned n = LLVMGetNumIndices(inst);
++        const unsigned *idx = LLVMGetIndices(inst);
++        bool ins = op == LLVMInsertValue;
++        size_t k = 0;
++
++        if (ins) {
++            ops[k++] = val(c, LLVMGetOperand(inst, 1));
++        }
++        ops[k++] = val(c, LLVMGetOperand(inst, 0));
++        for (unsigned i = 0; i < n; i++) {
++            ops[k++] = idx[i];
++        }
++        emit(c, ins ? SpvOpCompositeInsert : SpvOpCompositeExtract, tid, r, ops, k);
++        return 0;
++    }
++    case LLVMGetElementPtr: {
++        uint32_t a = gep_addr(c, inst);
++
++        emit(c, SpvOpCopyObject, c->t_u64, r, &a, 1);
++        return 0;
++    }
++    case LLVMLoad: {
++        LLVMValueRef p = LLVMGetOperand(inst, 0);
++
++        if (LLVMGetPointerAddressSpace(LLVMTypeOf(p)) == 0) {
++            return fail(c, "load from private/stack memory");
++        }
++        load_mem(c, t, val(c, p), align_of(inst, t, c), r);
++        return 0;
++    }
++    case LLVMStore: {
++        LLVMValueRef v = LLVMGetOperand(inst, 0), p = LLVMGetOperand(inst, 1);
++
++        if (LLVMGetPointerAddressSpace(LLVMTypeOf(p)) == 0) {
++            return fail(c, "store to private/stack memory");
++        }
++        return store_mem(c, v, val(c, p), align_of(inst, LLVMTypeOf(v), c));
++    }
++    case LLVMCall:
++        return call_inst(c, inst, r);
++    case LLVMPHI: {
++        unsigned n = LLVMCountIncoming(inst);
++
++        if (n > 30) {
++            return fail(c, "phi too wide");
++        }
++        for (unsigned i = 0; i < n; i++) {
++            ops[2 * i] = val(c, LLVMGetIncomingValue(inst, i));
++            ops[2 * i + 1] = label(c, LLVMGetIncomingBlock(inst, i));
++        }
++        emit(c, SpvOpPhi, tid, r, ops, 2 * n);
++        return 0;
++    }
++    case LLVMBr:
++        if (LLVMIsConditional(inst)) {
++            int m = g->ipdom[bi];
++
++            if (m < 0) {
++                return fail(c, "conditional branch without a merge block");
++            }
++            ops[0] = label(c, g->bb[m]);
++            ops[1] = 0;
++            spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpSelectionMerge, ops, 2);
++            ops[0] = val(c, LLVMGetCondition(inst));
++            ops[1] = label(c, LLVMGetSuccessor(inst, 0));
++            ops[2] = label(c, LLVMGetSuccessor(inst, 1));
++            spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpBranchConditional, ops, 3);
++        } else {
++            ops[0] = label(c, LLVMGetSuccessor(inst, 0));
++            spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpBranch, ops, 1);
++        }
++        return 0;
++    case LLVMRet:
++        return emit_return(c, inst);
++    case LLVMUnreachable:
++        spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpUnreachable, NULL, 0);
++        return 0;
++    default:
++        return fail(c, "unsupported instruction opcode %d", op);
++    }
++}
++
++static int translate_function(Ctx *c)
++{
++    Cfg g = { 0 };
++    uint32_t fn_ty, fn_id = spv_id(&c->m), ops[8];
++
++    if (build_cfg(c, &g)) {
++        return -1;
++    }
++    fn_ty = spv_type(&c->m, SpvOpTypeFunction, &c->t_void, 1);
++    ops[0] = c->t_void;
++    ops[1] = fn_id;
++    ops[2] = 0;
++    ops[3] = fn_ty;
++    spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpFunction, ops, 4);
++
++    for (int i = 0; i < g.n && !c->err[0]; i++) {
++        uint32_t l = label(c, g.bb[i]);
++
++        spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpLabel, &l, 1);
++        if (i == 0) {
++            /* arguments: loads of interface variables / push constants */
++            for (int a = 0; a < c->nargs; a++) {
++                Arg *arg = &c->args[a];
++                LLVMValueRef p = LLVMGetParam(c->fn, a);
++
++                if (arg->kind == ARG_BUFFER) {
++                    uint32_t aops[2] = { c->pc_var, spv_const_u32(&c->m, 0) };
++                    uint32_t idx[3] = { c->pc_var, spv_const_u32(&c->m, 0),
++                                        spv_const_u32(&c->m, arg->index) };
++                    uint32_t ptr = emit(c, SpvOpAccessChain, c->pc_elem_ptr, 0, idx, 3);
++
++                    (void)aops;
++                    vset(c, p, emit(c, SpvOpLoad, c->t_u64, 0, &ptr, 1));
++                } else if (arg->var) {
++                    uint32_t t = ty(c, LLVMTypeOf(p));
++
++                    if (arg->kind == ARG_VERTEX_ID || arg->kind == ARG_INSTANCE_ID ||
++                        arg->kind == ARG_SAMPLE_ID) {
++                        t = c->t_u32;
++                    }
++                    vset(c, p, emit(c, SpvOpLoad, t, 0, &arg->var, 1));
++                }
++            }
++        }
++        for (LLVMValueRef in = LLVMGetFirstInstruction(g.bb[i]); in && !c->err[0];
++             in = LLVMGetNextInstruction(in)) {
++            if (instruction(c, &g, i, in)) {
++                break;
++            }
++        }
++    }
++    spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpFunctionEnd, NULL, 0);
++
++    /* entry point */
++    {
++        uint32_t pre[2] = { c->stage == A2S_STAGE_FRAGMENT ? SpvExecutionModelFragment :
++                            SpvExecutionModelVertex, fn_id };
++
++        spv_emit_str(&c->m, SPV_SEC_ENTRY, SpvOpEntryPoint, pre, 2, "main",
++                     c->iface, c->niface);
++        if (c->stage == A2S_STAGE_FRAGMENT) {
++            uint32_t em[2] = { fn_id, SpvExecutionModeOriginUpperLeft };
++
++            spv_emit(&c->m, SPV_SEC_EXECMODE, SpvOpExecutionMode, em, 2);
++            if (c->depth_replacing) {
++                em[1] = SpvExecutionModeDepthReplacing;
++                spv_emit(&c->m, SPV_SEC_EXECMODE, SpvOpExecutionMode, em, 2);
++            }
++        }
++    }
++    free(g.bb);
++    free(g.ipdom);
++    return c->err[0] ? -1 : 0;
++}
++
++const void *air2spv_metallib_bitcode(const void *lib, size_t liblen, size_t *bclen)
++{
++    const uint8_t *d = lib;
++
++    if (liblen < 64 || memcmp(d, "MTLB", 4)) {
++        return NULL;
++    }
++    for (size_t i = 0; i + 20 <= liblen; i++) {
++        if (d[i] == 0xde && d[i + 1] == 0xc0 && d[i + 2] == 0x17 && d[i + 3] == 0x0b) {
++            uint32_t off, size;
++
++            memcpy(&off, d + i + 8, 4);
++            memcpy(&size, d + i + 12, 4);
++            if (i + off + size > liblen) {
++                return NULL;
++            }
++            *bclen = size;
++            return d + i + off;
++        }
++    }
++    return NULL;
++}
++
++int air2spv_translate(const void *bitcode, size_t len, A2SResult *io)
++{
++    Ctx c = { 0 };
++    LLVMMemoryBufferRef buf;
++    LLVMPassBuilderOptionsRef pbo;
++    LLVMErrorRef perr;
++    int ret = -1;
++
++    io->error[0] = 0;
++    io->spirv = NULL;
++    io->buffer_mask = io->texture_mask = io->sampler_mask = 0;
++    io->push_size = 0;
++    io->nconst_samplers = 0;
++    c.res = io;
++    c.err = io->error;
++    c.llctx = LLVMContextCreate();
++    buf = LLVMCreateMemoryBufferWithMemoryRangeCopy(bitcode, len, "air");
++    if (LLVMParseBitcodeInContext2(c.llctx, buf, &c.mod)) {
++        LLVMDisposeMemoryBuffer(buf);
++        fail(&c, "bitcode parse failed");
++        goto out_ctx;
++    }
++    LLVMDisposeMemoryBuffer(buf);
++
++    /* structured control flow before emission (target-independent passes) */
++    LLVMSetTarget(c.mod, "");
++    pbo = LLVMCreatePassBuilderOptions();
++    perr = LLVMRunPasses(c.mod, "cgscc(inline),function(lower-switch,mergereturn,"
++                         "fix-irreducible,unify-loop-exits,structurizecfg)", NULL, pbo);
++    LLVMDisposePassBuilderOptions(pbo);
++    if (perr) {
++        char *msg = LLVMGetErrorMessage(perr);
++
++        fail(&c, "LLVM passes: %s", msg);
++        LLVMDisposeErrorMessage(msg);
++        goto out_mod;
++    }
++    c.td = LLVMGetModuleDataLayout(c.mod);
++
++    spv_init(&c.m);
++    spv_capability(&c.m, SpvCapabilityShader);
++    spv_capability(&c.m, SpvCapabilityPhysicalStorageBufferAddresses);
++    c.m.glsl = spv_id(&c.m);
++    spv_emit_str(&c.m, SPV_SEC_IMPORTS, SpvOpExtInstImport, &c.m.glsl, 1, "GLSL.std.450",
++                 NULL, 0);
++    {
++        uint32_t mm[2] = { SpvAddressingPhysicalStorageBuffer64, SpvMemoryModelGLSL450 };
++
++        spv_emit(&c.m, SPV_SEC_MEMMODEL, SpvOpMemoryModel, mm, 2);
++    }
++    c.t_void = spv_type(&c.m, SpvOpTypeVoid, NULL, 0);
++    c.t_bool = spv_type(&c.m, SpvOpTypeBool, NULL, 0);
++    c.t_u32 = spv_type_int(&c.m, 32, false);
++    c.t_u64 = spv_type_int(&c.m, 64, false);
++    c.t_f32 = spv_type_float(&c.m, 32);
++
++    if (parse_entry(&c) || setup_interface(&c) || translate_function(&c)) {
++        goto out_spv;
++    }
++    io->stage = c.stage;
++    io->spirv = spv_finish(&c.m, &io->nwords);
++    ret = 0;
++out_spv:
++    spv_free(&c.m);
++    free(c.vmap);
++out_mod:
++    LLVMDisposeModule(c.mod);
++out_ctx:
++    LLVMContextDispose(c.llctx);
++    return ret;
++}
+diff --git a/hw/display/pvg/air2spv.h b/hw/display/pvg/air2spv.h
+new file mode 100644
+index 0000000..1c88c03
+--- /dev/null
++++ b/hw/display/pvg/air2spv.h
+@@ -0,0 +1,47 @@
++/*
++ * air2spv: translate a Metal AIR function (LLVM bitcode from a metallib) to Vulkan SPIR-V.
++ * See docs/air2spv-design.md.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef PVG_AIR2SPV_H
++#define PVG_AIR2SPV_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++#define A2S_MAX_VARYINGS     32
++#define A2S_MAX_CONST_SAMP   8
++#define A2S_TEXTURE_BINDING  16     /* binding = base + Metal texture index */
++#define A2S_SAMPLER_BINDING  48
++#define A2S_CONST_SAMPLER_BINDING 64
++
++enum { A2S_STAGE_VERTEX = 0, A2S_STAGE_FRAGMENT = 4 };
++
++typedef struct A2SResult {
++    uint32_t *spirv;            /* malloc'ed, free with free() */
++    size_t nwords;
++    int stage;
++    char entry[64];
++    char error[256];
++    uint32_t buffer_mask;       /* Metal buffer indices used (push-constant u64 slots) */
++    uint32_t texture_mask;
++    uint32_t sampler_mask;
++    uint32_t push_size;         /* bytes of push constants used */
++    int nconst_samplers;
++    uint64_t const_sampler_state[A2S_MAX_CONST_SAMP];
++    /* varying names; location = index. In: names already assigned by the paired stage */
++    int nvaryings;
++    char varyings[A2S_MAX_VARYINGS][48];
++} A2SResult;
++
++/*
++ * Returns 0 on success. 'io' may carry varying names from the other stage (location = index); on
++ * return it lists every varying this function uses, with new names appended.
++ */
++int air2spv_translate(const void *bitcode, size_t len, A2SResult *io);
++
++/* Extract the bitcode module from a single-function metallib. Returns NULL if not one. */
++const void *air2spv_metallib_bitcode(const void *lib, size_t liblen, size_t *bclen);
++
++#endif
+diff --git a/hw/display/pvg/pvg-gpu.c b/hw/display/pvg/pvg-gpu.c
+new file mode 100644
+index 0000000..e6c42cd
+--- /dev/null
++++ b/hw/display/pvg/pvg-gpu.c
+@@ -0,0 +1,182 @@
++/*
++ * Host GPU (Vulkan) context for pvg-linux-pci.
++ *
++ * The device features match what air2spv emits: buffer device addresses with scalar layout,
++ * 8/16/64-bit integers, fp16 and demote-to-helper.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include <stdio.h>
++#include <string.h>
++
++#include "pvg-gpu.h"
++
++static VKAPI_ATTR VkBool32 VKAPI_CALL pvg_gpu_message(
++    VkDebugUtilsMessageSeverityFlagBitsEXT sev, VkDebugUtilsMessageTypeFlagsEXT type,
++    const VkDebugUtilsMessengerCallbackDataEXT *d, void *opaque)
++{
++    PVGGpu *g = opaque;
++
++    (void)type;
++    if (sev >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
++        g->validation_errors++;
++        fprintf(stderr, "pvg-gpu: validation: %s\n", d->pMessage);
++    }
++    return VK_FALSE;
++}
++
++int pvg_gpu_init(PVGGpu *g, bool validation, char *err, size_t errlen)
++{
++    const char *layers[] = { "VK_LAYER_KHRONOS_validation" };
++    const char *inst_exts[] = { VK_EXT_DEBUG_UTILS_EXTENSION_NAME };
++    const char *dev_exts[] = { VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME };
++    VkApplicationInfo app = {
++        .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "qemu-pvg-linux",
++        .apiVersion = VK_API_VERSION_1_3,
++    };
++    VkDebugUtilsMessengerCreateInfoEXT dbg = {
++        .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
++        .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
++        .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
++                       VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT,
++        .pfnUserCallback = pvg_gpu_message, .pUserData = g,
++    };
++    VkInstanceCreateInfo ici = {
++        .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
++        .pNext = validation ? &dbg : NULL,
++        .enabledLayerCount = validation ? 1 : 0, .ppEnabledLayerNames = layers,
++        .enabledExtensionCount = validation ? 1 : 0, .ppEnabledExtensionNames = inst_exts,
++    };
++    VkPhysicalDevice phys[8];
++    uint32_t nphys = 8, nfam = 16;
++    VkQueueFamilyProperties fams[16];
++    VkPhysicalDeviceProperties props;
++    float prio = 1.0f;
++    VkDeviceQueueCreateInfo qci = {
++        .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueCount = 1,
++        .pQueuePriorities = &prio,
++    };
++    VkPhysicalDeviceVulkan13Features f13 = {
++        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
++        .shaderDemoteToHelperInvocation = VK_TRUE, .dynamicRendering = VK_TRUE,
++        .synchronization2 = VK_TRUE,
++    };
++    VkPhysicalDeviceVulkan12Features f12 = {
++        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &f13,
++        .bufferDeviceAddress = VK_TRUE, .scalarBlockLayout = VK_TRUE, .shaderInt8 = VK_TRUE,
++        .shaderFloat16 = VK_TRUE, .storageBuffer8BitAccess = VK_TRUE,
++        .timelineSemaphore = VK_TRUE,
++    };
++    VkPhysicalDeviceFeatures2 f2 = {
++        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f12,
++        .features = {
++            .shaderInt64 = VK_TRUE, .shaderInt16 = VK_TRUE, .shaderFloat64 = VK_TRUE,
++            .fragmentStoresAndAtomics = VK_TRUE, .independentBlend = VK_TRUE,
++            .samplerAnisotropy = VK_TRUE, .fillModeNonSolid = VK_TRUE, .depthClamp = VK_TRUE,
++        },
++    };
++    VkDeviceCreateInfo dci = {
++        .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f2,
++        .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
++        .enabledExtensionCount = 1, .ppEnabledExtensionNames = dev_exts,
++    };
++    VkCommandPoolCreateInfo pci = {
++        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
++        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
++    };
++    VkResult r;
++
++    memset(g, 0, sizeof(*g));
++    g->validation = validation;
++    r = vkCreateInstance(&ici, NULL, &g->instance);
++    if (r != VK_SUCCESS) {
++        snprintf(err, errlen, "vkCreateInstance: %d", r);
++        return -1;
++    }
++    if (validation) {
++        PFN_vkCreateDebugUtilsMessengerEXT mk = (PFN_vkCreateDebugUtilsMessengerEXT)
++            vkGetInstanceProcAddr(g->instance, "vkCreateDebugUtilsMessengerEXT");
++
++        if (mk) {
++            mk(g->instance, &dbg, NULL, &g->messenger);
++        }
++    }
++    if (vkEnumeratePhysicalDevices(g->instance, &nphys, phys) != VK_SUCCESS || !nphys) {
++        snprintf(err, errlen, "no Vulkan physical device");
++        goto fail;
++    }
++    /* prefer a discrete GPU */
++    g->phys = phys[0];
++    for (uint32_t i = 0; i < nphys; i++) {
++        vkGetPhysicalDeviceProperties(phys[i], &props);
++        if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
++            g->phys = phys[i];
++            break;
++        }
++    }
++    vkGetPhysicalDeviceProperties(g->phys, &props);
++    snprintf(g->name, sizeof(g->name), "%s", props.deviceName);
++    vkGetPhysicalDeviceMemoryProperties(g->phys, &g->mem_props);
++    vkGetPhysicalDeviceQueueFamilyProperties(g->phys, &nfam, fams);
++    g->queue_family = UINT32_MAX;
++    for (uint32_t i = 0; i < nfam; i++) {
++        if (fams[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
++            g->queue_family = i;
++            break;
++        }
++    }
++    if (g->queue_family == UINT32_MAX) {
++        snprintf(err, errlen, "no graphics queue on %s", g->name);
++        goto fail;
++    }
++    qci.queueFamilyIndex = g->queue_family;
++    r = vkCreateDevice(g->phys, &dci, NULL, &g->device);
++    if (r != VK_SUCCESS) {
++        snprintf(err, errlen, "vkCreateDevice on %s: %d", g->name, r);
++        goto fail;
++    }
++    vkGetDeviceQueue(g->device, g->queue_family, 0, &g->queue);
++    pci.queueFamilyIndex = g->queue_family;
++    if (vkCreateCommandPool(g->device, &pci, NULL, &g->pool) != VK_SUCCESS) {
++        snprintf(err, errlen, "vkCreateCommandPool failed");
++        goto fail;
++    }
++    return 0;
++fail:
++    pvg_gpu_fini(g);
++    return -1;
++}
++
++void pvg_gpu_fini(PVGGpu *g)
++{
++    if (g->device) {
++        vkDeviceWaitIdle(g->device);
++        if (g->pool) {
++            vkDestroyCommandPool(g->device, g->pool, NULL);
++        }
++        vkDestroyDevice(g->device, NULL);
++    }
++    if (g->messenger) {
++        PFN_vkDestroyDebugUtilsMessengerEXT rm = (PFN_vkDestroyDebugUtilsMessengerEXT)
++            vkGetInstanceProcAddr(g->instance, "vkDestroyDebugUtilsMessengerEXT");
++
++        if (rm) {
++            rm(g->instance, g->messenger, NULL);
++        }
++    }
++    if (g->instance) {
++        vkDestroyInstance(g->instance, NULL);
++    }
++    memset(g, 0, sizeof(*g));
++}
++
++int pvg_gpu_memory_type(PVGGpu *g, uint32_t type_bits, VkMemoryPropertyFlags props)
++{
++    for (uint32_t i = 0; i < g->mem_props.memoryTypeCount; i++) {
++        if ((type_bits & (1u << i)) &&
++            (g->mem_props.memoryTypes[i].propertyFlags & props) == props) {
++            return (int)i;
++        }
++    }
++    return -1;
++}
+diff --git a/hw/display/pvg/pvg-gpu.h b/hw/display/pvg/pvg-gpu.h
+new file mode 100644
+index 0000000..31ab11c
+--- /dev/null
++++ b/hw/display/pvg/pvg-gpu.h
+@@ -0,0 +1,33 @@
++/*
++ * Host GPU (Vulkan) context for pvg-linux-pci.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef PVG_GPU_H
++#define PVG_GPU_H
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <vulkan/vulkan.h>
++
++typedef struct PVGGpu {
++    VkInstance instance;
++    VkDebugUtilsMessengerEXT messenger;
++    VkPhysicalDevice phys;
++    VkDevice device;
++    VkQueue queue;
++    uint32_t queue_family;
++    VkCommandPool pool;
++    VkPhysicalDeviceMemoryProperties mem_props;
++    char name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
++    bool validation;
++    uint32_t validation_errors;
++} PVGGpu;
++
++/* Returns 0 on success; on failure 'err' (size errlen) explains why. */
++int pvg_gpu_init(PVGGpu *g, bool validation, char *err, size_t errlen);
++void pvg_gpu_fini(PVGGpu *g);
++/* Index of a memory type with all 'props' among 'type_bits', or -1. */
++int pvg_gpu_memory_type(PVGGpu *g, uint32_t type_bits, VkMemoryPropertyFlags props);
++
++#endif
+diff --git a/hw/display/pvg/spv.c b/hw/display/pvg/spv.c
+new file mode 100644
+index 0000000..16e167c
+--- /dev/null
++++ b/hw/display/pvg/spv.c
+@@ -0,0 +1,253 @@
++/*
++ * Minimal SPIR-V module builder for air2spv.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include <stdlib.h>
++#include <string.h>
++
++#include "spv.h"
++
++static void buf_push(SpvBuf *b, uint32_t w)
++{
++    if (b->len == b->cap) {
++        b->cap = b->cap ? b->cap * 2 : 256;
++        b->w = realloc(b->w, b->cap * sizeof(*b->w));
++    }
++    b->w[b->len++] = w;
++}
++
++void spv_init(SpvModule *m)
++{
++    memset(m, 0, sizeof(*m));
++    m->next_id = 1;
++}
++
++void spv_free(SpvModule *m)
++{
++    for (int i = 0; i < SPV_SEC_COUNT; i++) {
++        free(m->sec[i].w);
++    }
++    for (size_t i = 0; i < m->ncache; i++) {
++        free(m->cache[i].key);
++    }
++    free(m->cache);
++}
++
++uint32_t spv_id(SpvModule *m)
++{
++    return m->next_id++;
++}
++
++void spv_emit(SpvModule *m, int sec, uint16_t op, const uint32_t *ops, size_t n)
++{
++    SpvBuf *b = &m->sec[sec];
++
++    buf_push(b, ((uint32_t)(n + 1) << 16) | op);
++    for (size_t i = 0; i < n; i++) {
++        buf_push(b, ops[i]);
++    }
++}
++
++void spv_emit_str(SpvModule *m, int sec, uint16_t op, const uint32_t *pre, size_t npre,
++                  const char *s, const uint32_t *post, size_t npost)
++{
++    size_t slen = strlen(s), swords = slen / 4 + 1;
++    uint32_t *w = calloc(npre + swords + npost, sizeof(*w));
++
++    if (npre) {
++        memcpy(w, pre, npre * sizeof(*w));
++    }
++    memcpy(w + npre, s, slen);          /* little-endian packing, NUL padded */
++    if (npost) {
++        memcpy(w + npre + swords, post, npost * sizeof(*w));
++    }
++    spv_emit(m, sec, op, w, npre + swords + npost);
++    free(w);
++}
++
++void spv_capability(SpvModule *m, uint32_t cap)
++{
++    if (cap < 128) {
++        if (m->caps_seen[cap / 64] & (1ull << (cap % 64))) {
++            return;
++        }
++        m->caps_seen[cap / 64] |= 1ull << (cap % 64);
++    } else {
++        for (size_t i = 0; i < m->nbig_caps; i++) {
++            if (m->big_caps[i] == cap) {
++                return;
++            }
++        }
++        if (m->nbig_caps < 8) {
++            m->big_caps[m->nbig_caps++] = cap;
++        }
++    }
++    spv_emit(m, SPV_SEC_CAPS, SpvOpCapability, &cap, 1);
++}
++
++void spv_extension(SpvModule *m, const char *name)
++{
++    /* callers emit each extension once */
++    spv_emit_str(m, SPV_SEC_EXTS, SpvOpExtension, NULL, 0, name, NULL, 0);
++}
++
++static uint32_t cached(SpvModule *m, int sec, uint16_t op, uint32_t type, bool has_type,
++                       const uint32_t *ops, size_t n)
++{
++    size_t klen = n + 2;
++    uint32_t *key = malloc(klen * sizeof(*key));
++    uint32_t id, *words;
++
++    key[0] = op;
++    key[1] = has_type ? type : 0;
++    if (n) {
++        memcpy(key + 2, ops, n * sizeof(*key));
++    }
++    for (size_t i = 0; i < m->ncache; i++) {
++        if (m->cache[i].n == klen && !memcmp(m->cache[i].key, key, klen * sizeof(*key))) {
++            free(key);
++            return m->cache[i].id;
++        }
++    }
++    id = spv_id(m);
++    words = malloc((n + 2) * sizeof(*words));
++    if (has_type) {
++        words[0] = type;
++        words[1] = id;
++        if (n) {
++            memcpy(words + 2, ops, n * sizeof(*words));
++        }
++        spv_emit(m, sec, op, words, n + 2);
++    } else {
++        words[0] = id;
++        if (n) {
++            memcpy(words + 1, ops, n * sizeof(*words));
++        }
++        spv_emit(m, sec, op, words, n + 1);
++    }
++    free(words);
++    if (m->ncache == m->capcache) {
++        m->capcache = m->capcache ? m->capcache * 2 : 64;
++        m->cache = realloc(m->cache, m->capcache * sizeof(*m->cache));
++    }
++    m->cache[m->ncache].key = key;
++    m->cache[m->ncache].n = klen;
++    m->cache[m->ncache].id = id;
++    m->ncache++;
++    return id;
++}
++
++uint32_t spv_type(SpvModule *m, uint16_t op, const uint32_t *ops, size_t n)
++{
++    return cached(m, SPV_SEC_TYPES, op, 0, false, ops, n);
++}
++
++uint32_t spv_const(SpvModule *m, uint16_t op, uint32_t type, const uint32_t *ops, size_t n)
++{
++    return cached(m, SPV_SEC_TYPES, op, type, true, ops, n);
++}
++
++uint32_t spv_type_int(SpvModule *m, uint32_t bits, bool sign)
++{
++    uint32_t ops[2] = { bits, sign };
++
++    if (bits == 64) {
++        spv_capability(m, SpvCapabilityInt64);
++    } else if (bits == 16) {
++        spv_capability(m, SpvCapabilityInt16);
++    } else if (bits == 8) {
++        spv_capability(m, SpvCapabilityInt8);
++    }
++    return spv_type(m, SpvOpTypeInt, ops, 2);
++}
++
++uint32_t spv_type_float(SpvModule *m, uint32_t bits)
++{
++    if (bits == 16) {
++        spv_capability(m, SpvCapabilityFloat16);
++    } else if (bits == 64) {
++        spv_capability(m, SpvCapabilityFloat64);
++    }
++    return spv_type(m, SpvOpTypeFloat, &bits, 1);
++}
++
++uint32_t spv_type_vec(SpvModule *m, uint32_t elem, uint32_t n)
++{
++    uint32_t ops[2] = { elem, n };
++
++    return spv_type(m, SpvOpTypeVector, ops, 2);
++}
++
++uint32_t spv_type_ptr(SpvModule *m, uint32_t sc, uint32_t elem)
++{
++    uint32_t ops[2] = { sc, elem };
++
++    return spv_type(m, SpvOpTypePointer, ops, 2);
++}
++
++uint32_t spv_const_u32(SpvModule *m, uint32_t v)
++{
++    return spv_const(m, SpvOpConstant, spv_type_int(m, 32, false), &v, 1);
++}
++
++uint32_t spv_const_u64(SpvModule *m, uint64_t v)
++{
++    uint32_t w[2] = { (uint32_t)v, (uint32_t)(v >> 32) };
++
++    return spv_const(m, SpvOpConstant, spv_type_int(m, 64, false), w, 2);
++}
++
++uint32_t spv_const_f32(SpvModule *m, float v)
++{
++    uint32_t w;
++
++    memcpy(&w, &v, 4);
++    return spv_const(m, SpvOpConstant, spv_type_float(m, 32), &w, 1);
++}
++
++void spv_decorate(SpvModule *m, uint32_t id, uint32_t dec, const uint32_t *ops, size_t n)
++{
++    uint32_t w[8] = { id, dec };
++
++    if (n) {
++        memcpy(w + 2, ops, n * sizeof(*w));
++    }
++    spv_emit(m, SPV_SEC_ANNOT, SpvOpDecorate, w, n + 2);
++}
++
++void spv_member_decorate(SpvModule *m, uint32_t id, uint32_t member, uint32_t dec, uint32_t v)
++{
++    uint32_t w[4] = { id, member, dec, v };
++
++    spv_emit(m, SPV_SEC_ANNOT, SpvOpMemberDecorate, w, 4);
++}
++
++void spv_name(SpvModule *m, uint32_t id, const char *name)
++{
++    spv_emit_str(m, SPV_SEC_DEBUG, SpvOpName, &id, 1, name, NULL, 0);
++}
++
++uint32_t *spv_finish(SpvModule *m, size_t *nwords)
++{
++    size_t total = 5;
++    uint32_t *out, *p;
++
++    for (int i = 0; i < SPV_SEC_COUNT; i++) {
++        total += m->sec[i].len;
++    }
++    out = p = malloc(total * sizeof(*out));
++    *p++ = SPV_MAGIC;
++    *p++ = SPV_VERSION;
++    *p++ = 0x50564700;      /* generator: "PVG" */
++    *p++ = m->next_id;      /* bound */
++    *p++ = 0;
++    for (int i = 0; i < SPV_SEC_COUNT; i++) {
++        if (m->sec[i].len) {
++            memcpy(p, m->sec[i].w, m->sec[i].len * sizeof(*p));
++            p += m->sec[i].len;
++        }
++    }
++    *nwords = total;
++    return out;
++}
+diff --git a/hw/display/pvg/spv.h b/hw/display/pvg/spv.h
+new file mode 100644
+index 0000000..8039175
+--- /dev/null
++++ b/hw/display/pvg/spv.h
+@@ -0,0 +1,164 @@
++/*
++ * Minimal SPIR-V constants and module builder for air2spv.
++ * Values follow the SPIR-V 1.6 unified specification and GLSL.std.450 (no system spirv headers).
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef PVG_SPV_H
++#define PVG_SPV_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#define SPV_MAGIC   0x07230203u
++#define SPV_VERSION 0x00010600u     /* 1.6 */
++
++enum {
++    SpvCapabilityShader = 1, SpvCapabilityFloat16 = 9, SpvCapabilityFloat64 = 10,
++    SpvCapabilityInt64 = 11, SpvCapabilityInt16 = 22, SpvCapabilityInt8 = 39,
++    SpvCapabilitySampled1D = 43, SpvCapabilityImage1D = 44, SpvCapabilityImageQuery = 50,
++    SpvCapabilityDerivativeControl = 51,
++    SpvCapabilityStorageImageReadWithoutFormat = 55,
++    SpvCapabilityStorageImageWriteWithoutFormat = 56,
++    SpvCapabilityPhysicalStorageBufferAddresses = 5347,
++    SpvCapabilityDemoteToHelperInvocation = 5379,
++};
++
++enum { SpvAddressingPhysicalStorageBuffer64 = 5348 };
++enum { SpvMemoryModelGLSL450 = 1 };
++enum { SpvExecutionModelVertex = 0, SpvExecutionModelFragment = 4, SpvExecutionModelGLCompute = 5 };
++enum { SpvExecutionModeOriginUpperLeft = 7, SpvExecutionModeDepthReplacing = 12 };
++
++enum {
++    SpvStorageUniformConstant = 0, SpvStorageInput = 1, SpvStorageUniform = 2, SpvStorageOutput = 3,
++    SpvStorageWorkgroup = 4, SpvStoragePrivate = 6, SpvStorageFunction = 7, SpvStoragePushConstant = 9,
++    SpvStorageStorageBuffer = 12, SpvStoragePhysicalStorageBuffer = 5349,
++};
++
++enum { SpvDim1D = 0, SpvDim2D = 1, SpvDim3D = 2, SpvDimCube = 3, SpvDimBuffer = 5 };
++
++enum {
++    SpvDecorationBlock = 2, SpvDecorationArrayStride = 6, SpvDecorationBuiltIn = 11,
++    SpvDecorationNoPerspective = 13, SpvDecorationFlat = 14, SpvDecorationCentroid = 16,
++    SpvDecorationSample = 17, SpvDecorationNonWritable = 24, SpvDecorationLocation = 30,
++    SpvDecorationIndex = 32, SpvDecorationBinding = 33, SpvDecorationDescriptorSet = 34,
++    SpvDecorationOffset = 35,
++};
++
++enum {
++    SpvBuiltInPosition = 0, SpvBuiltInPointSize = 1, SpvBuiltInFragCoord = 15,
++    SpvBuiltInPointCoord = 16, SpvBuiltInFrontFacing = 17, SpvBuiltInSampleId = 18,
++    SpvBuiltInSampleMask = 20, SpvBuiltInFragDepth = 22, SpvBuiltInVertexIndex = 42,
++    SpvBuiltInInstanceIndex = 43,
++};
++
++enum { SpvMemoryAccessAligned = 2 };
++enum { SpvImageOperandsBias = 1, SpvImageOperandsLod = 2, SpvImageOperandsConstOffset = 8 };
++
++enum {
++    SpvOpUndef = 1, SpvOpName = 5, SpvOpMemberName = 6, SpvOpExtension = 10, SpvOpExtInstImport = 11,
++    SpvOpExtInst = 12, SpvOpMemoryModel = 14, SpvOpEntryPoint = 15, SpvOpExecutionMode = 16,
++    SpvOpCapability = 17, SpvOpTypeVoid = 19, SpvOpTypeBool = 20, SpvOpTypeInt = 21,
++    SpvOpTypeFloat = 22, SpvOpTypeVector = 23, SpvOpTypeMatrix = 24, SpvOpTypeImage = 25,
++    SpvOpTypeSampler = 26, SpvOpTypeSampledImage = 27, SpvOpTypeArray = 28,
++    SpvOpTypeRuntimeArray = 29, SpvOpTypeStruct = 30, SpvOpTypePointer = 32,
++    SpvOpTypeFunction = 33, SpvOpConstantTrue = 41, SpvOpConstantFalse = 42, SpvOpConstant = 43,
++    SpvOpConstantComposite = 44, SpvOpConstantNull = 46, SpvOpFunction = 54,
++    SpvOpFunctionEnd = 56, SpvOpVariable = 59, SpvOpLoad = 61, SpvOpStore = 62,
++    SpvOpAccessChain = 65, SpvOpDecorate = 71, SpvOpMemberDecorate = 72,
++    SpvOpVectorExtractDynamic = 77, SpvOpVectorInsertDynamic = 78, SpvOpVectorShuffle = 79,
++    SpvOpCompositeConstruct = 80, SpvOpCompositeExtract = 81, SpvOpCompositeInsert = 82,
++    SpvOpCopyObject = 83, SpvOpSampledImage = 86, SpvOpImageSampleImplicitLod = 87,
++    SpvOpImageSampleExplicitLod = 88, SpvOpImageFetch = 95, SpvOpImageRead = 98,
++    SpvOpImageWrite = 99, SpvOpImageQuerySizeLod = 103, SpvOpConvertFToU = 109,
++    SpvOpConvertFToS = 110, SpvOpConvertSToF = 111, SpvOpConvertUToF = 112, SpvOpUConvert = 113,
++    SpvOpSConvert = 114, SpvOpFConvert = 115, SpvOpConvertPtrToU = 117, SpvOpConvertUToPtr = 120,
++    SpvOpBitcast = 124, SpvOpSNegate = 126, SpvOpFNegate = 127, SpvOpIAdd = 128, SpvOpFAdd = 129,
++    SpvOpISub = 130, SpvOpFSub = 131, SpvOpIMul = 132, SpvOpFMul = 133, SpvOpUDiv = 134,
++    SpvOpSDiv = 135, SpvOpFDiv = 136, SpvOpUMod = 137, SpvOpSRem = 138, SpvOpFRem = 140,
++    SpvOpVectorTimesScalar = 142, SpvOpDot = 148, SpvOpAny = 154, SpvOpAll = 155,
++    SpvOpIsNan = 156, SpvOpIsInf = 157, SpvOpOrdered = 162, SpvOpUnordered = 163,
++    SpvOpLogicalEqual = 164, SpvOpLogicalNotEqual = 165, SpvOpLogicalOr = 166,
++    SpvOpLogicalAnd = 167, SpvOpLogicalNot = 168, SpvOpSelect = 169, SpvOpIEqual = 170,
++    SpvOpINotEqual = 171, SpvOpUGreaterThan = 172, SpvOpSGreaterThan = 173,
++    SpvOpUGreaterThanEqual = 174, SpvOpSGreaterThanEqual = 175, SpvOpULessThan = 176,
++    SpvOpSLessThan = 177, SpvOpULessThanEqual = 178, SpvOpSLessThanEqual = 179,
++    SpvOpFOrdEqual = 180, SpvOpFUnordEqual = 181, SpvOpFOrdNotEqual = 182,
++    SpvOpFUnordNotEqual = 183, SpvOpFOrdLessThan = 184, SpvOpFUnordLessThan = 185,
++    SpvOpFOrdGreaterThan = 186, SpvOpFUnordGreaterThan = 187, SpvOpFOrdLessThanEqual = 188,
++    SpvOpFUnordLessThanEqual = 189, SpvOpFOrdGreaterThanEqual = 190,
++    SpvOpFUnordGreaterThanEqual = 191, SpvOpShiftRightLogical = 194,
++    SpvOpShiftRightArithmetic = 195, SpvOpShiftLeftLogical = 196, SpvOpBitwiseOr = 197,
++    SpvOpBitwiseXor = 198, SpvOpBitwiseAnd = 199, SpvOpNot = 200, SpvOpDPdx = 207,
++    SpvOpDPdy = 208, SpvOpFwidth = 209, SpvOpPhi = 245, SpvOpLoopMerge = 246,
++    SpvOpSelectionMerge = 247, SpvOpLabel = 248, SpvOpBranch = 249, SpvOpBranchConditional = 250,
++    SpvOpKill = 252, SpvOpReturn = 253, SpvOpReturnValue = 254, SpvOpUnreachable = 255,
++    SpvOpDemoteToHelperInvocation = 5380,
++};
++
++/* GLSL.std.450 extended instructions */
++enum {
++    GLSLstd450Round = 1, GLSLstd450Trunc = 3, GLSLstd450FAbs = 4, GLSLstd450SAbs = 5,
++    GLSLstd450FSign = 6, GLSLstd450SSign = 7, GLSLstd450Floor = 8, GLSLstd450Ceil = 9,
++    GLSLstd450Fract = 10, GLSLstd450Sin = 13, GLSLstd450Cos = 14, GLSLstd450Tan = 15,
++    GLSLstd450Asin = 16, GLSLstd450Acos = 17, GLSLstd450Atan = 18, GLSLstd450Atan2 = 25,
++    GLSLstd450Pow = 26, GLSLstd450Exp = 27, GLSLstd450Log = 28, GLSLstd450Exp2 = 29,
++    GLSLstd450Log2 = 30, GLSLstd450Sqrt = 31, GLSLstd450InverseSqrt = 32, GLSLstd450FMin = 37,
++    GLSLstd450UMin = 38, GLSLstd450SMin = 39, GLSLstd450FMax = 40, GLSLstd450UMax = 41,
++    GLSLstd450SMax = 42, GLSLstd450FClamp = 43, GLSLstd450UClamp = 44, GLSLstd450SClamp = 45,
++    GLSLstd450FMix = 46, GLSLstd450Step = 48, GLSLstd450SmoothStep = 49, GLSLstd450Fma = 50,
++    GLSLstd450UnpackSnorm4x8 = 63, GLSLstd450UnpackUnorm4x8 = 64, GLSLstd450Length = 66,
++    GLSLstd450Distance = 67, GLSLstd450Cross = 68, GLSLstd450Normalize = 69,
++    GLSLstd450NMin = 79, GLSLstd450NMax = 80, GLSLstd450NClamp = 81,
++};
++
++/* ---- builder ---- */
++
++typedef struct SpvBuf {
++    uint32_t *w;
++    size_t len, cap;
++} SpvBuf;
++
++enum {
++    SPV_SEC_CAPS, SPV_SEC_EXTS, SPV_SEC_IMPORTS, SPV_SEC_MEMMODEL, SPV_SEC_ENTRY, SPV_SEC_EXECMODE,
++    SPV_SEC_DEBUG, SPV_SEC_ANNOT, SPV_SEC_TYPES, SPV_SEC_FUNCS, SPV_SEC_COUNT,
++};
++
++typedef struct SpvModule {
++    SpvBuf sec[SPV_SEC_COUNT];
++    uint32_t next_id;
++    /* dedup cache for types and constants: instruction words without the result id */
++    struct { uint32_t *key; size_t n; uint32_t id; } *cache;
++    size_t ncache, capcache;
++    uint64_t caps_seen[2];      /* small capabilities bitmap (< 128) */
++    uint32_t big_caps[8];
++    size_t nbig_caps;
++    uint32_t glsl;              /* GLSL.std.450 import id */
++} SpvModule;
++
++void spv_init(SpvModule *m);
++void spv_free(SpvModule *m);
++uint32_t spv_id(SpvModule *m);
++void spv_emit(SpvModule *m, int sec, uint16_t op, const uint32_t *ops, size_t n);
++void spv_emit_str(SpvModule *m, int sec, uint16_t op, const uint32_t *pre, size_t npre,
++                  const char *s, const uint32_t *post, size_t npost);
++void spv_capability(SpvModule *m, uint32_t cap);
++void spv_extension(SpvModule *m, const char *name);
++/* type/constant with dedup: ops[0] is NOT the result id, the builder inserts it */
++uint32_t spv_type(SpvModule *m, uint16_t op, const uint32_t *ops, size_t n);
++uint32_t spv_const(SpvModule *m, uint16_t op, uint32_t type, const uint32_t *ops, size_t n);
++uint32_t spv_type_int(SpvModule *m, uint32_t bits, bool sign);
++uint32_t spv_type_float(SpvModule *m, uint32_t bits);
++uint32_t spv_type_vec(SpvModule *m, uint32_t elem, uint32_t n);
++uint32_t spv_type_ptr(SpvModule *m, uint32_t sc, uint32_t elem);
++uint32_t spv_const_u32(SpvModule *m, uint32_t v);
++uint32_t spv_const_u64(SpvModule *m, uint64_t v);
++uint32_t spv_const_f32(SpvModule *m, float v);
++void spv_decorate(SpvModule *m, uint32_t id, uint32_t dec, const uint32_t *ops, size_t n);
++void spv_member_decorate(SpvModule *m, uint32_t id, uint32_t member, uint32_t dec, uint32_t v);
++void spv_name(SpvModule *m, uint32_t id, const char *name);
++/* final binary; caller frees */
++uint32_t *spv_finish(SpvModule *m, size_t *nwords);
++
++#endif
+diff --git a/hw/display/trace-events b/hw/display/trace-events
+index be5b352..a2d2f99 100644
+--- a/hw/display/trace-events
++++ b/hw/display/trace-events
+@@ -246,6 +246,7 @@ pvg_linux_scanout_skip(uint32_t surface, const char *why) "surface %u: %s"
+ pvg_linux_cmdbuf(uint32_t task, uint32_t nres, uint64_t va, uint64_t len) "task %u resources=%u cmdbuf va=0x%"PRIx64" len=0x%"PRIx64
+ pvg_linux_segment(uint32_t task, uint64_t off, uint32_t len, const char *enc, uint32_t cont, uint32_t end) "task %u +0x%"PRIx64" len=0x%x %s cont=%u end=%u"
+ pvg_linux_segment_bad(uint32_t task, uint64_t off, uint32_t seglen, uint64_t len) "task %u +0x%"PRIx64" bad segment length 0x%x (buffer 0x%"PRIx64")"
++pvg_linux_gpu(const char *name, bool validation) "host GPU %s (validation %d)"
+ pvg_linux_child_poke(uint32_t index, uint32_t written, uint32_t read, uint32_t length) "child FIFO %u written=0x%x read=0x%x length=0x%x"
+ pvg_linux_cmd_stub(uint32_t op) "op=0x%02x not implemented, completed"
+ pvg_linux_signal_stamp(uint32_t index, uint32_t value) "stamps[%u]=%u"
+-- 
+2.43.0
+

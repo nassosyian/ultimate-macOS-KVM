@@ -1,0 +1,722 @@
+From 72955ee7f5de67412f6f52b8a14969a6529bb96a Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 10:30:51 +0200
+Subject: [PATCH 05/54] hw/display/pvg-linux-pci: display port 0, task address
+ spaces, cursor
+
+DefineTask2 task roots and the 1024-entry page table walk; the per-port
+shared display state page with a port of the nub state machine (settings,
+mode list, generation/ack, event bits + poke interrupt); doorbell cursor
+show/position; CursorGlyph read from the kernel task; a QEMU console that
+draws the cursor in software. Presented surfaces are traced only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-pci.c | 596 ++++++++++++++++++++++++++++++++++++-
+ hw/display/trace-events    |   7 +
+ 2 files changed, 601 insertions(+), 2 deletions(-)
+
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index 5d9dbd2..bb97941 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -20,6 +20,8 @@
+ #include "hw/pci/pci_device.h"
+ #include "hw/pci/msi.h"
+ #include "hw/core/qdev-properties.h"
++#include "ui/console.h"
++#include "ui/surface.h"
+ #include "system/address-spaces.h"
+ #include "system/dma.h"
+ #include "qom/object.h"
+@@ -45,6 +47,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(PVGLinuxPCIState, PVG_LINUX_PCI)
+ #define PVG_REG_WAKE_FIFO       0x1020  /* child FIFO index */
+ #define PVG_REG_RESUME_CHILD    0x1028  /* child FIFO index */
+ #define PVG_REG_FIFO_BASE_PAGE  0x1030
++#define PVG_REG_DISPLAY_DOORBELL 0x1220 /* port */
+ #define PVG_REG_DISPLAY_PORTS   0x122c
+ 
+ #define PVG_CMD_HDR_SIZE        12
+@@ -52,12 +55,75 @@ OBJECT_DECLARE_SIMPLE_TYPE(PVGLinuxPCIState, PVG_LINUX_PCI)
+ #define PVG_CMD_MAX_PAYLOAD     (64 * KiB)
+ #define PVG_CMD_TRACE_WORDS     8
+ 
++#define PVG_CMD_DISPLAY_SET_SHARED_STATE_PAGE 0x01
++#define PVG_CMD_DISPLAY_ACK         0x02
++#define PVG_CMD_DISPLAY_CURSOR_GLYPH 0x04
++#define PVG_CMD_DISPLAY_CURSOR_SHOW 0x05
++#define PVG_CMD_DISPLAY_TRANSACTION3 0x07
+ #define PVG_CMD_DEFINE_CHILD_FIFO   0x30
+ #define PVG_CMD_SET_OBJECT_LIST     0x33
+ #define PVG_CMD_DEFINE_TASK2        0x38
+ #define PVG_CMD_GET_DEVICE_INFO     0x3a
+ 
+ #define PVG_ROOT_STAMP_INDEX    0
++#define PVG_MAX_TASKS           0x100
++#define PVG_ROOT_DISPLAY_PAGES  0x900   /* root page: u32 shared state PFN per port */
++
++/*
++ * Per-port shared display state page (_PGDisplayNub sharedState). Offsets from
++ * -[_PGDisplayNub testUpdateSettings:], testUpdateModeList:, stateMachineWithCaller:.
++ */
++#define DS_SERIAL               0x000   /* u32 */
++#define DS_NAME                 0x004   /* char[14] */
++#define DS_PORT                 0x012   /* u16 */
++#define DS_SIZE_MM_W16          0x014   /* u16 */
++#define DS_SIZE_MM_H16          0x016   /* u16 */
++#define DS_CURSOR_MAX_W         0x018   /* u16 */
++#define DS_CURSOR_MAX_H         0x01a   /* u16 */
++#define DS_INIT_1C              0x01c   /* u32, host writes 0x400 */
++#define DS_CURSOR_CAPS          0x020   /* u32: 1 show, 2 move */
++#define DS_SIZE_MM_W            0x024   /* float */
++#define DS_SIZE_MM_H            0x028   /* float */
++#define DS_COLORSPACE           0x02c   /* 8 x f32: R, G, B, W chromaticities */
++#define DS_SCALE_FACTOR         0x050   /* u8 */
++#define DS_CONFIG_EPOCH         0x058   /* u64 */
++#define DS_EVENTS               0x100   /* u32, host ORs event bits */
++#define DS_EVENT_MASK           0x104   /* u32, guest */
++#define DS_GENERATION           0x200   /* u32 */
++#define DS_MODE_COUNT           0x208   /* u16 */
++#define DS_MODES                0x210   /* 16-byte entries */
++#define DS_COLOR_MATRIX         0xa10   /* 2 x 3x4 f32 */
++#define DS_COLOR_MATRIX_INDEX   0xa72   /* u8 */
++#define DS_COLOR_MATRIX_DIRTY   0xa73   /* u8 */
++#define DS_UUID                 0xa74   /* char[39] */
++#define DS_CURSOR_POSITION      0xe00   /* s16 x, s16 y */
++#define DS_CURSOR_SHOW          0xe04   /* u8, guest */
++#define DS_CURSOR_SHOW_SEEN     0xf20   /* u8, host */
++#define DS_ACK_PENDING          0xfa9   /* u8 */
++#define DS_ACKED_GENERATION     0xfbc   /* u32 */
++#define DS_STATE                0xfc0   /* u32: 0 idle, 1 wait ack, 2 configured */
++
++#define DS_EVENT_CONFIG         0x4
++#define DS_EVENT_DONE           0x8
++
++typedef struct PVGDisplayMode {
++    uint16_t width;
++    uint16_t height;
++    uint16_t refresh_hz;
++} PVGDisplayMode;
++
++static const PVGDisplayMode pvg_display_modes[] = {
++    { 1920, 1080, 60 },
++    { 1680, 1050, 60 },
++    { 1440, 900, 60 },
++    { 1280, 800, 60 },
++    { 1024, 768, 60 },
++};
++
++/* sRGB primaries and D65 white point */
++static const float pvg_srgb_chromaticities[8] = {
++    0.64f, 0.33f, 0.30f, 0.60f, 0.15f, 0.06f, 0.3127f, 0.3290f,
++};
+ #define PVG_MAX_FIFOS           0x40
+ 
+ /*
+@@ -128,6 +194,16 @@ struct PVGLinuxPCIState {
+     uint32_t stamp_status;
+     uint8_t *payload;
+     PVGFifoView *view;
++    uint32_t task_root[PVG_MAX_TASKS];  /* PFN of each task's root, 0 = none */
++
++    /* display port 0 */
++    QemuConsole *con;
++    DisplaySurface *surface;
++    QEMUCursor *cursor;
++    uint64_t ds_gpa;                    /* shared state page, 0 = not attached */
++    bool modes_pending;
++    bool cursor_show;
++    int16_t cursor_x, cursor_y;     /* signed: the guest parks it off-screen */
+ 
+     /* properties */
+     uint16_t vendor_id;
+@@ -239,6 +315,482 @@ static void pvg_cmd_get_device_info(PVGLinuxPCIState *s, const uint32_t *p,
+     trace_pvg_linux_device_info(version, n, dst);
+ }
+ 
++/* ---- guest task address spaces (PGLocalTask, PGPageTableIterator) ---- */
++
++/*
++ * A task root page holds {u32 page table root PFN, u32 depth (1..4)}. Each
++ * page table level is a page of 1024 u32 entries: PFN in bits 0..30, bit 31
++ * a flag, 0 = hole.
++ */
++static bool pvg_task_translate(PVGLinuxPCIState *s, uint32_t task,
++                               uint64_t va, uint64_t *gpa)
++{
++    PCIDevice *d = PCI_DEVICE(s);
++    uint32_t table, depth, entry;
++    uint64_t vpn = va >> 12;
++
++    if (task >= PVG_MAX_TASKS || !s->task_root[task]) {
++        return false;
++    }
++    ldl_le_pci_dma(d, (uint64_t)s->task_root[task] << 12, &table,
++                   MEMTXATTRS_UNSPECIFIED);
++    ldl_le_pci_dma(d, ((uint64_t)s->task_root[task] << 12) + 4, &depth,
++                   MEMTXATTRS_UNSPECIFIED);
++    if (depth < 1 || depth > 4) {
++        return false;
++    }
++    for (int level = depth - 1; level >= 0; level--) {
++        uint32_t index = (vpn >> (10 * level)) & 0x3ff;
++
++        ldl_le_pci_dma(d, ((uint64_t)table << 12) + index * 4, &entry,
++                       MEMTXATTRS_UNSPECIFIED);
++        table = entry & 0x7fffffff;
++        if (!table) {
++            return false;
++        }
++    }
++    *gpa = ((uint64_t)table << 12) | (va & 0xfff);
++    return true;
++}
++
++static bool pvg_task_read(PVGLinuxPCIState *s, uint32_t task, uint64_t va,
++                          void *buf, uint64_t len)
++{
++    uint8_t *p = buf;
++
++    while (len) {
++        uint64_t chunk = MIN(len, 0x1000 - (va & 0xfff));
++        uint64_t gpa;
++
++        if (!pvg_task_translate(s, task, va, &gpa) ||
++            pci_dma_read(PCI_DEVICE(s), gpa, p, chunk) != MEMTX_OK) {
++            return false;
++        }
++        p += chunk;
++        va += chunk;
++        len -= chunk;
++    }
++    return true;
++}
++
++/* CmdDefineTask2: {u32 id << 1 | flag, u64 length, u32 task root PFN} */
++static void pvg_cmd_define_task2(PVGLinuxPCIState *s, const uint8_t *p,
++                                 uint32_t len)
++{
++    uint32_t id, root;
++
++    if (len < 16) {
++        return;
++    }
++    id = ldl_le_p(p) >> 1;
++    root = ldl_le_p(p + 12);
++    if (id >= PVG_MAX_TASKS) {
++        qemu_log_mask(LOG_GUEST_ERROR, "pvg: task id %u out of range\n", id);
++        return;
++    }
++    s->task_root[id] = root;
++    /* -[_PGDevice createTaskID:...] mirrors the root into the root page */
++    if (pvg_reg(s, PVG_REG_ROOT_PAGE)) {
++        stl_le_pci_dma(PCI_DEVICE(s),
++                       ((uint64_t)pvg_reg(s, PVG_REG_ROOT_PAGE) << 12) + id * 4,
++                       root, MEMTXATTRS_UNSPECIFIED);
++    }
++    trace_pvg_linux_define_task(id, root, ldq_le_p(p + 4));
++}
++
++/* ---- display port 0 (_PGDisplayNub) ---- */
++
++static uint32_t ds_ld32(PVGLinuxPCIState *s, uint32_t off)
++{
++    uint32_t v = 0;
++
++    ldl_le_pci_dma(PCI_DEVICE(s), s->ds_gpa + off, &v, MEMTXATTRS_UNSPECIFIED);
++    return v;
++}
++
++static void ds_st32(PVGLinuxPCIState *s, uint32_t off, uint32_t v)
++{
++    stl_le_pci_dma(PCI_DEVICE(s), s->ds_gpa + off, v, MEMTXATTRS_UNSPECIFIED);
++}
++
++static uint8_t ds_ld8(PVGLinuxPCIState *s, uint32_t off)
++{
++    uint8_t v = 0;
++
++    pci_dma_read(PCI_DEVICE(s), s->ds_gpa + off, &v, 1);
++    return v;
++}
++
++static void ds_st8(PVGLinuxPCIState *s, uint32_t off, uint8_t v)
++{
++    pci_dma_write(PCI_DEVICE(s), s->ds_gpa + off, &v, 1);
++}
++
++/* Write a field, report whether it changed (the testUpdate* pattern) */
++static bool ds_update(PVGLinuxPCIState *s, uint32_t off, const void *val,
++                      uint32_t len)
++{
++    uint8_t cur[64];
++
++    assert(len <= sizeof(cur));
++    pci_dma_read(PCI_DEVICE(s), s->ds_gpa + off, cur, len);
++    if (!memcmp(cur, val, len)) {
++        return false;
++    }
++    pci_dma_write(PCI_DEVICE(s), s->ds_gpa + off, val, len);
++    return true;
++}
++
++static bool ds_update32(PVGLinuxPCIState *s, uint32_t off, uint32_t v)
++{
++    uint32_t le = cpu_to_le32(v);
++
++    return ds_update(s, off, &le, 4);
++}
++
++static bool ds_update16(PVGLinuxPCIState *s, uint32_t off, uint16_t v)
++{
++    uint16_t le = cpu_to_le16(v);
++
++    return ds_update(s, off, &le, 2);
++}
++
++static bool ds_updatef(PVGLinuxPCIState *s, uint32_t off, float f)
++{
++    uint32_t v;
++
++    memcpy(&v, &f, 4);
++    return ds_update32(s, off, v);
++}
++
++/* -[_PGDisplayNub testUpdateSettings:] */
++static bool pvg_display_update_settings(PVGLinuxPCIState *s)
++{
++    static const char name[14] = "QEMU PVG";
++    static const char uuid[39] = "5056474c-494e-5558-0000-000000000001";
++    uint64_t epoch = cpu_to_le64(1);
++    uint8_t scale = 1;
++    bool changed = false;
++
++    changed |= ds_update32(s, DS_SERIAL, 0x50564731);
++    changed |= ds_updatef(s, DS_SIZE_MM_W, 400.0f);
++    changed |= ds_updatef(s, DS_SIZE_MM_H, 300.0f);
++    changed |= ds_update16(s, DS_SIZE_MM_W16, 400);
++    changed |= ds_update16(s, DS_SIZE_MM_H16, 300);
++    for (int i = 0; i < 8; i++) {
++        changed |= ds_updatef(s, DS_COLORSPACE + 4 * i,
++                              pvg_srgb_chromaticities[i]);
++    }
++    changed |= ds_update(s, DS_SCALE_FACTOR, &scale, 1);
++    changed |= ds_update(s, DS_CONFIG_EPOCH, &epoch, 8);
++    changed |= ds_update(s, DS_NAME, name, sizeof(name));
++    changed |= ds_update(s, DS_UUID, uuid, sizeof(uuid));
++    changed |= ds_update16(s, DS_CURSOR_MAX_W, 0x100);
++    changed |= ds_update16(s, DS_CURSOR_MAX_H, 0x100);
++    changed |= ds_update32(s, DS_CURSOR_CAPS, 3);
++    return changed;
++}
++
++/* -[_PGDisplayNub testUpdateModeList:]: consumes the pending host mode list */
++static bool pvg_display_update_modes(PVGLinuxPCIState *s)
++{
++    bool changed = ds_update16(s, DS_MODE_COUNT, ARRAY_SIZE(pvg_display_modes));
++
++    for (size_t i = 0; i < ARRAY_SIZE(pvg_display_modes); i++) {
++        const PVGDisplayMode *m = &pvg_display_modes[i];
++        uint32_t off = DS_MODES + 16 * i;
++        uint8_t flags = 0;
++
++        changed |= ds_update16(s, off, m->width);
++        changed |= ds_update16(s, off + 2, m->height);
++        changed |= ds_update32(s, off + 4, m->refresh_hz << 16);
++        changed |= ds_update(s, off + 8, &flags, 1);
++    }
++    s->modes_pending = false;
++    return changed;
++}
++
++static void pvg_display_poke(PVGLinuxPCIState *s, uint32_t port)
++{
++    s->irq_status |= 1u << port;
++    if (msi_enabled(PCI_DEVICE(s))) {
++        msi_notify(PCI_DEVICE(s), 0);
++    }
++}
++
++/*
++ * Port of -[_PGDisplayNub stateMachineWithCaller:] for a host side whose
++ * display client always exists. State 0 publishes settings and modes and
++ * waits for the guest's ack (state 1); once acked the display is configured
++ * (state 2) and only republishes on changes.
++ */
++static void pvg_display_state_machine(PVGLinuxPCIState *s)
++{
++    uint32_t state, events = 0;
++
++    for (;;) {
++        state = ds_ld32(s, DS_STATE);
++        if (state != 1) {
++            break;
++        }
++        if (ds_ld8(s, DS_ACK_PENDING)) {
++            return;     /* still waiting for the guest's ack */
++        }
++        ds_st32(s, DS_STATE, 2);
++    }
++
++    if (state == 0) {
++        if (s->modes_pending) {
++            pvg_display_update_settings(s);
++            pvg_display_update_modes(s);
++            ds_st32(s, DS_GENERATION, ds_ld32(s, DS_GENERATION) + 1);
++            ds_st8(s, DS_ACK_PENDING, 1);
++            state = 1;
++            events = DS_EVENT_CONFIG;
++        }
++    } else {
++        bool modes_present = ds_ld32(s, DS_MODE_COUNT) & 0xffff;
++
++        if (s->modes_pending) {
++            bool changed = pvg_display_update_settings(s);
++
++            changed |= pvg_display_update_modes(s);
++            if (changed) {
++                ds_st32(s, DS_GENERATION, ds_ld32(s, DS_GENERATION) + 1);
++                ds_st8(s, DS_ACK_PENDING, 1);
++                state = 1;
++                events = DS_EVENT_CONFIG | DS_EVENT_DONE;
++            }
++            modes_present = ds_ld32(s, DS_MODE_COUNT) & 0xffff;
++        }
++        if (!modes_present) {
++            ds_st32(s, DS_MODE_COUNT, ds_ld32(s, DS_MODE_COUNT) & ~0xffffu);
++            state = 0;
++            events = DS_EVENT_DONE;
++        }
++    }
++    if (events) {
++        uint32_t mask = ds_ld32(s, DS_EVENT_MASK);
++
++        ds_st32(s, DS_EVENTS, ds_ld32(s, DS_EVENTS) | events);
++        if (mask & events) {
++            pvg_display_poke(s, 0);
++        }
++    }
++    ds_st32(s, DS_STATE, state);
++    trace_pvg_linux_display_state(state, events, ds_ld32(s, DS_GENERATION));
++}
++
++/* CmdDisplaySetSharedStatePage {u32 port, u32 pfn} */
++static void pvg_cmd_display_set_state_page(PVGLinuxPCIState *s,
++                                           const uint8_t *p, uint32_t len)
++{
++    uint32_t port, pfn;
++
++    if (len < 8) {
++        return;
++    }
++    port = ldl_le_p(p);
++    pfn = ldl_le_p(p + 4);
++    if (port >= s->display_ports) {
++        qemu_log_mask(LOG_GUEST_ERROR, "pvg: display port %u out of range\n",
++                      port);
++        return;
++    }
++    trace_pvg_linux_display_page(port, pfn);
++    if (!pfn) {
++        s->ds_gpa = 0;
++        return;
++    }
++    if (pvg_reg(s, PVG_REG_ROOT_PAGE)) {
++        stl_le_pci_dma(PCI_DEVICE(s),
++                       ((uint64_t)pvg_reg(s, PVG_REG_ROOT_PAGE) << 12) +
++                       PVG_ROOT_DISPLAY_PAGES + port * 4, pfn,
++                       MEMTXATTRS_UNSPECIFIED);
++    }
++    s->ds_gpa = (uint64_t)pfn << 12;
++    /* -[_PGDisplayNub initWithDevice:port:sharedStatePage:] */
++    {
++        uint16_t port16 = cpu_to_le16(port);
++        uint32_t one = cpu_to_le32(0x3f800000);   /* 1.0f */
++        uint32_t m = DS_COLOR_MATRIX + ds_ld8(s, DS_COLOR_MATRIX_INDEX) * 0x30;
++
++        pci_dma_write(PCI_DEVICE(s), s->ds_gpa + DS_PORT, &port16, 2);
++        ds_st32(s, DS_INIT_1C, 0x400);
++        pci_dma_write(PCI_DEVICE(s), s->ds_gpa + m, &one, 4);
++        pci_dma_write(PCI_DEVICE(s), s->ds_gpa + m + 0x14, &one, 4);
++        pci_dma_write(PCI_DEVICE(s), s->ds_gpa + m + 0x28, &one, 4);
++        ds_st8(s, DS_COLOR_MATRIX_DIRTY, 1);
++    }
++    s->modes_pending = true;
++    pvg_display_state_machine(s);
++}
++
++/* CmdDisplayAck {u32 port, u32 generation} -> -[_PGDisplayNub ack:] */
++static void pvg_cmd_display_ack(PVGLinuxPCIState *s, const uint8_t *p,
++                                uint32_t len)
++{
++    uint32_t gen;
++
++    if (len < 8 || !s->ds_gpa) {
++        return;
++    }
++    gen = ldl_le_p(p + 4);
++    if (!ds_ld8(s, DS_ACK_PENDING) || gen != ds_ld32(s, DS_GENERATION)) {
++        qemu_log_mask(LOG_GUEST_ERROR, "pvg: unexpected display ack %u\n", gen);
++        return;
++    }
++    ds_st32(s, DS_ACKED_GENERATION, gen);
++    ds_st8(s, DS_ACK_PENDING, 0);
++    pvg_display_state_machine(s);
++}
++
++/* ---- console ---- */
++
++#define PVG_BACKGROUND 0xff1c2a3a   /* "attached, nothing rendered yet" */
++
++static void pvg_display_ensure_surface(PVGLinuxPCIState *s, int w, int h)
++{
++    if (s->surface && surface_width(s->surface) == w &&
++        surface_height(s->surface) == h) {
++        return;
++    }
++    s->surface = qemu_create_displaysurface(w, h);
++    qemu_console_set_surface(s->con, s->surface);
++}
++
++/* No GPU rendering yet: background plus a software copy of the cursor */
++static void pvg_display_redraw(PVGLinuxPCIState *s)
++{
++    uint32_t *fb;
++    int w, h, stride;
++
++    if (!s->con) {
++        return;
++    }
++    pvg_display_ensure_surface(s, pvg_display_modes[0].width,
++                               pvg_display_modes[0].height);
++    fb = surface_data(s->surface);
++    w = surface_width(s->surface);
++    h = surface_height(s->surface);
++    stride = surface_stride(s->surface) / 4;
++    for (int y = 0; y < h; y++) {
++        for (int x = 0; x < w; x++) {
++            fb[y * stride + x] = PVG_BACKGROUND;
++        }
++    }
++    if (s->cursor && s->cursor_show) {
++        QEMUCursor *c = s->cursor;
++
++        for (int cy = 0; cy < c->height; cy++) {
++            int y = s->cursor_y - c->hot_y + cy;
++
++            for (int cx = 0; cx < c->width && y >= 0 && y < h; cx++) {
++                int x = s->cursor_x - c->hot_x + cx;
++                uint32_t px = c->data[cy * c->width + cx];
++                uint32_t a = px >> 24, *dst;
++
++                if (x < 0 || x >= w || !a) {
++                    continue;
++                }
++                dst = &fb[y * stride + x];
++                /* premultiplied BGRA from the guest */
++                *dst = 0xff000000 |
++                    ((((*dst >> 16) & 0xff) * (255 - a) / 255 + ((px >> 16) & 0xff)) << 16) |
++                    ((((*dst >> 8) & 0xff) * (255 - a) / 255 + ((px >> 8) & 0xff)) << 8) |
++                    (((*dst & 0xff) * (255 - a) / 255 + (px & 0xff)));
++            }
++        }
++    }
++    qemu_console_update_full(s->con);
++}
++
++static bool pvg_display_gfx_update(void *opaque)
++{
++    pvg_display_redraw(opaque);
++    return true;
++}
++
++static const GraphicHwOps pvg_display_ops = {
++    .gfx_update = pvg_display_gfx_update,
++};
++
++static void pvg_display_cursor_changed(PVGLinuxPCIState *s)
++{
++    if (s->con) {
++        qemu_console_set_mouse(s->con, s->cursor_x, s->cursor_y,
++                               s->cursor_show);
++    }
++}
++
++/*
++ * CmdDisplayCursorGlyph {u32 port, u32 task (0), u64 vaddr, u64 mapped_len,
++ * u64 stride, u16 w, u16 h, u16 hot_x, u16 hot_y, u32 sum}; pixels are BGRA
++ * in the kernel task's address space.
++ */
++static void pvg_cmd_display_cursor_glyph(PVGLinuxPCIState *s,
++                                         const uint8_t *p, uint32_t len)
++{
++    uint64_t va, stride;
++    uint16_t w, h;
++    QEMUCursor *c;
++
++    if (len < 0x2c || ldl_le_p(p + 4) != 0) {
++        return;
++    }
++    va = ldq_le_p(p + 8);
++    stride = ldq_le_p(p + 24);
++    w = lduw_le_p(p + 32);
++    h = lduw_le_p(p + 34);
++    trace_pvg_linux_cursor_glyph(va, stride, w, h, lduw_le_p(p + 36),
++                                 lduw_le_p(p + 38));
++    if (!w || !h || w > 256 || h > 256 || stride < w * 4u) {
++        return;
++    }
++    c = cursor_alloc(w, h);
++    c->hot_x = lduw_le_p(p + 36);
++    c->hot_y = lduw_le_p(p + 38);
++    for (int y = 0; y < h; y++) {
++        if (!pvg_task_read(s, 0, va + y * stride, &c->data[y * w], w * 4u)) {
++            trace_pvg_linux_task_fault(0, va + y * stride);
++            cursor_unref(c);
++            return;
++        }
++        for (int x = 0; x < w; x++) {
++            c->data[y * w + x] = le32_to_cpu(c->data[y * w + x]);
++        }
++    }
++    if (s->cursor) {
++        cursor_unref(s->cursor);
++    }
++    s->cursor = c;
++    if (s->con) {
++        qemu_console_set_cursor(s->con, c);
++    }
++    pvg_display_cursor_changed(s);
++}
++
++/* -[_PGDisplayNub doorbell]: cursor show / move published in the shared page */
++static void pvg_display_doorbell(PVGLinuxPCIState *s, uint32_t port)
++{
++    uint8_t show;
++    uint32_t pos;
++
++    if (port != 0 || !s->ds_gpa) {
++        return;
++    }
++    show = ds_ld8(s, DS_CURSOR_SHOW);
++    if (show != ds_ld8(s, DS_CURSOR_SHOW_SEEN)) {
++        ds_st8(s, DS_CURSOR_SHOW_SEEN, show);
++        s->cursor_show = show;
++    }
++    pos = ds_ld32(s, DS_CURSOR_POSITION);
++    s->cursor_x = (int16_t)(pos & 0xffff);
++    s->cursor_y = (int16_t)(pos >> 16);
++    trace_pvg_linux_doorbell(port, show, s->cursor_x, s->cursor_y);
++    pvg_display_cursor_changed(s);
++}
++
+ /* CmdDefineChildFIFO, non-restoring path of -[PGChildFIFO initWithDevice:...] */
+ static void pvg_cmd_define_child_fifo(PVGLinuxPCIState *s, const uint8_t *p,
+                                       uint32_t len)
+@@ -262,6 +814,30 @@ static void pvg_dispatch(PVGLinuxPCIState *s, const PVGCmdHeader *h,
+                          const uint8_t *payload, uint32_t len)
+ {
+     switch (h->opcode) {
++    case PVG_CMD_DISPLAY_SET_SHARED_STATE_PAGE:
++        pvg_cmd_display_set_state_page(s, payload, len);
++        break;
++    case PVG_CMD_DISPLAY_ACK:
++        pvg_cmd_display_ack(s, payload, len);
++        break;
++    case PVG_CMD_DISPLAY_CURSOR_GLYPH:
++        pvg_cmd_display_cursor_glyph(s, payload, len);
++        break;
++    case PVG_CMD_DISPLAY_CURSOR_SHOW:
++        if (len >= 8) {
++            s->cursor_show = payload[4];
++            pvg_display_cursor_changed(s);
++        }
++        break;
++    case PVG_CMD_DISPLAY_TRANSACTION3:
++        if (len >= 0x24) {
++            trace_pvg_linux_present(ldl_le_p(payload), ldl_le_p(payload + 4),
++                                    ldl_le_p(payload + 8));
++        }
++        break;
++    case PVG_CMD_DEFINE_TASK2:
++        pvg_cmd_define_task2(s, payload, len);
++        break;
+     case PVG_CMD_DEFINE_CHILD_FIFO:
+         pvg_cmd_define_child_fifo(s, payload, len);
+         break;
+@@ -425,6 +1001,9 @@ static void pvg_linux_mmio_write(void *opaque, hwaddr addr, uint64_t val,
+     case PVG_REG_RESUME_CHILD:
+         pvg_child_fifo_process(s, val);
+         break;
++    case PVG_REG_DISPLAY_DOORBELL:
++        pvg_display_doorbell(s, val);
++        break;
+     }
+ }
+ 
+@@ -468,6 +1047,10 @@ static void pvg_linux_realize(PCIDevice *dev, Error **errp)
+     if (msi_init(dev, 0, s->msi_vectors, true, false, errp)) {
+         return;
+     }
++    if (s->display_ports) {
++        s->con = qemu_graphic_console_create(DEVICE(dev), 0, &pvg_display_ops,
++                                             s);
++    }
+ }
+ 
+ static void pvg_linux_exit(PCIDevice *dev)
+@@ -475,6 +1058,12 @@ static void pvg_linux_exit(PCIDevice *dev)
+     PVGLinuxPCIState *s = PVG_LINUX_PCI(dev);
+ 
+     msi_uninit(dev);
++    if (s->con) {
++        qemu_graphic_console_close(s->con);
++    }
++    if (s->cursor) {
++        cursor_unref(s->cursor);
++    }
+     g_free(s->regs);
+     g_free(s->payload);
+     g_free(s->view);
+@@ -487,6 +1076,9 @@ static void pvg_linux_reset(DeviceState *dev)
+     memset(s->regs, 0, s->mmio_size);
+     s->irq_status = 0;
+     s->stamp_status = 0;
++    memset(s->task_root, 0, sizeof(s->task_root));
++    s->ds_gpa = 0;
++    s->cursor_show = false;
+ }
+ 
+ static const Property pvg_linux_properties[] = {
+@@ -494,8 +1086,8 @@ static const Property pvg_linux_properties[] = {
+     DEFINE_PROP_UINT16("device-id", PVGLinuxPCIState, device_id, 0xeeee),
+     DEFINE_PROP_UINT32("mmio-size", PVGLinuxPCIState, mmio_size, 16 * KiB),
+     DEFINE_PROP_UINT32("msi-vectors", PVGLinuxPCIState, msi_vectors, 1),
+-    /* reported via guestDisplayPortCount (0x122c); no scanout yet, so 0 */
+-    DEFINE_PROP_UINT32("display-ports", PVGLinuxPCIState, display_ports, 0),
++    /* guestDisplayPortCount (0x122c); only port 0 is implemented */
++    DEFINE_PROP_UINT32("display-ports", PVGLinuxPCIState, display_ports, 1),
+ };
+ 
+ static void pvg_linux_class_init(ObjectClass *klass, const void *data)
+diff --git a/hw/display/trace-events b/hw/display/trace-events
+index 080fa6f..904e660 100644
+--- a/hw/display/trace-events
++++ b/hw/display/trace-events
+@@ -233,6 +233,13 @@ pvg_linux_mmio_read(uint64_t offset, unsigned size, uint64_t val) "offset=0x%"PR
+ pvg_linux_mmio_write(uint64_t offset, unsigned size, uint64_t val) "offset=0x%"PRIx64" size=%u val=0x%"PRIx64
+ pvg_linux_cmd(uint32_t fifo, uint32_t off, uint32_t op, uint32_t barriers, uint32_t len, uint32_t stamp, const char *payload) "fifo=%u @0x%04x op=0x%02x barriers=%u len=0x%x stamp=%u |%s"
+ pvg_linux_define_child(uint32_t index, uint64_t node) "child FIFO %u node=0x%"PRIx64
++pvg_linux_define_task(uint32_t id, uint32_t root, uint64_t length) "task %u root_pfn=0x%x length=0x%"PRIx64
++pvg_linux_task_fault(uint32_t task, uint64_t va) "task %u va=0x%"PRIx64" not mapped"
++pvg_linux_display_page(uint32_t port, uint32_t pfn) "port %u shared state pfn=0x%x"
++pvg_linux_display_state(uint32_t state, uint32_t events, uint32_t gen) "state=%u events=0x%x generation=%u"
++pvg_linux_cursor_glyph(uint64_t va, uint64_t stride, uint32_t w, uint32_t h, uint32_t hx, uint32_t hy) "va=0x%"PRIx64" stride=%"PRIu64" %ux%u hot=%u,%u"
++pvg_linux_doorbell(uint32_t port, uint32_t show, int x, int y) "port %u show=%u pos=%d,%d"
++pvg_linux_present(uint32_t port, uint32_t task, uint32_t surface) "port %u task %u surface %u"
+ pvg_linux_child_poke(uint32_t index, uint32_t written, uint32_t read, uint32_t length) "child FIFO %u written=0x%x read=0x%x length=0x%x"
+ pvg_linux_cmd_stub(uint32_t op) "op=0x%02x not implemented, completed"
+ pvg_linux_signal_stamp(uint32_t index, uint32_t value) "stamps[%u]=%u"
+-- 
+2.43.0
+

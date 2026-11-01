@@ -1,0 +1,110 @@
+From 8dd69c0b3e91fb52273b39dd9a9da33e8f062019 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 14:08:34 +0200
+Subject: [PATCH 21/54] hw/display/pvg/pvg-exec: primitive restart for indexed
+ strips; depth/stencil and blend diagnostics
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/pvg-exec.c | 46 +++++++++++++++++++++++++++++++++++----
+ 1 file changed, 42 insertions(+), 4 deletions(-)
+
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index 4a3807c..553a283 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -136,7 +136,7 @@ struct PVGExec {
+     GHashTable *pipelines;      /* key: task << 32 | id → Pipeline* */
+     GHashTable *uploaded;       /* per command buffer: task << 32 | id → arena offset + 1 */
+     GHashTable *samplers;       /* task << 32 | id → VkSampler (as pointer) */
+-    uint32_t upload_failures, ds_kind_logged;
++    uint32_t upload_failures, ds_kind_logged, ds_states_logged, ds_dumps, blends_logged;
+     DSAttachmentSave last_ds;
+     HostImage dummy[7];         /* 1x1 placeholders per VkImageViewType */
+     GHashTable *written;
+@@ -1092,6 +1092,7 @@ static Pipeline *pipeline_get(PVGExec *e, uint32_t task, uint32_t ref, const VkF
+             .attachmentCount = npass, .pAttachments = blends };
+         VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                                  VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
++                                 VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
+                                  VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+                                  VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
+                                  VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
+@@ -1128,6 +1129,13 @@ static Pipeline *pipeline_get(PVGExec *e, uint32_t task, uint32_t ref, const VkF
+     p->ok = true;
+     elog(e, "task %u pipeline %u: vertex %s / fragment %s (bufs %#x/%#x tex %#x)", task, ref,
+          vs.entry, fs.entry, p->vs_buffers, p->fs_buffers, p->fs_textures);
++    for (uint32_t i = 0; i < npass && e->blends_logged < 400; i++, e->blends_logged++) {
++        elog(e, "  pipeline %u att %u fmt %d: blend %u src %d/%d dst %d/%d op %d/%d mask %#x",
++             ref, i, pass_formats[i], blends[i].blendEnable, blends[i].srcColorBlendFactor,
++             blends[i].srcAlphaBlendFactor, blends[i].dstColorBlendFactor,
++             blends[i].dstAlphaBlendFactor, blends[i].colorBlendOp, blends[i].alphaBlendOp,
++             blends[i].colorWriteMask);
++    }
+     return p;
+ fail:
+     if (vsm) {
+@@ -1429,13 +1437,23 @@ static void ds_state_decode(PVGExec *e, uint32_t task, uint32_t ref, RenderState
+     uint8_t obj[MAX_OBJ];
+     uint32_t len;
+ 
++    uint8_t type;
++
+     st->ds_w0 = 7;      /* no state: compare Always, no write, no stencil */
+     memset(st->ds_face, 0, sizeof(st->ds_face));
+-    if (!ref || object(e, task, ref, obj, &len) != OBJ_SERIALIZED || len < 12 + 28) {
++    if (!ref) {
+         return;
+     }
+-    if (ldl(obj) != 4 && e->ds_kind_logged++ < 5) {
+-        elog(e, "task %u depth/stencil state %u: unexpected kind %u", task, ref, ldl(obj));
++    type = object(e, task, ref, obj, &len);
++    if (e->ds_states_logged < 40) {
++        e->ds_states_logged++;
++        elog(e, "task %u depth/stencil state %u: type 0x%x len 0x%x words %08x %08x %08x %08x "
++             "%08x %08x %08x %08x %08x %08x", task, ref, type, len, ldl(obj), ldl(obj + 4),
++             ldl(obj + 8), ldl(obj + 12), ldl(obj + 16), ldl(obj + 20), ldl(obj + 24),
++             ldl(obj + 28), ldl(obj + 32), ldl(obj + 36));
++    }
++    if (type != OBJ_SERIALIZED || len < 12 + 28) {
++        return;
+     }
+     st->ds_w0 = ldl(obj + 12);
+     for (int f = 0; f < 2; f++) {
+@@ -1950,6 +1968,8 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+             vkCmdSetViewport(e->cmd, 0, 1, &st.viewport);
+             vkCmdSetScissor(e->cmd, 0, 1, &st.scissor);
+             vkCmdSetPrimitiveTopology(e->cmd, mtl_topology(prim));
++            /* Metal always restarts indexed strips at 0xffff / 0xffffffff */
++            vkCmdSetPrimitiveRestartEnable(e->cmd, indexed && (prim == 2 || prim == 4));
+             ds_apply(e, &st, has_depth, has_stencil);
+             if (indexed) {
+                 uint64_t size, io = buffer_upload(e, task, ib, &size);
+@@ -2006,6 +2026,24 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+     if (!submit_wait(e, &si)) {
+         return;
+     }
++    /* diagnostics: what passes with depth/stencil attachments produce */
++    if (e->dump_dir && (has_depth || has_stencil) && e->ds_dumps < 30) {
++        e->ds_dumps++;
++        for (uint32_t i = 0; i < natt; i++) {
++            if (att[i].wb_off != UINT64_MAX) {
++                g_autofree char *path = g_strdup_printf(
++                    "%s/ds-%05u-t%u-r%u-att%u-fmt%d-%ux%u-s%u.raw", e->dump_dir, e->ds_dumps,
++                    task, att[i].ref, i, att[i].gi.format, att[i].gi.width, att[i].gi.height,
++                    att[i].gi.row_bytes);
++
++                g_file_set_contents(path, (const char *)(e->arena_ptr + att[i].wb_off),
++                                    (gssize)att[i].gi.row_bytes * att[i].gi.height, NULL);
++            }
++        }
++        elog(e, "ds pass %u: task %u %ux%u x%u depth %u stencil %u (load %u/%u) draws %u",
++             e->ds_dumps, task, rw, rh, natt, ds.depth_ref, ds.stencil_ref, ds.depth_load,
++             ds.stencil_load, seg_draws);
++    }
+     for (uint32_t i = 0; i < natt; i++) {
+         if (att[i].wb_off != UINT64_MAX && att[i].gi.task == 0 && e->stats.writebacks < 400 &&
+             e->stats.writebacks % 20 == 0) {
+-- 
+2.43.0
+

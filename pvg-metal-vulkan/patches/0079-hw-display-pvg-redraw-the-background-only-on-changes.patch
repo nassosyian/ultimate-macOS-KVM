@@ -1,0 +1,76 @@
+From c07f4f589aa8b395e870a02c9ab9a1fb6298dc29 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Sat, 31 Oct 2026 19:39:14 +0200
+Subject: [PATCH] hw/display/pvg: redraw the background only on changes
+
+gfx_update runs at the host monitor's refresh rate (QEMU's GTK UI: 6 ms at
+165 Hz) under the BQL. pvg_display_redraw() refilled the whole surface and
+forced a full update every time, which starved the vCPUs: the guest firmware
+stalled before the GOP came up (blank window). Redraw only after a cursor
+change, a reset, a new surface, or when the firmware framebuffer / a scanout
+gave the surface back.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-pci.c | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index 578e49b..5a83cfd 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -265,6 +265,8 @@ struct PVGLinuxPCIState {
+     bool cursor_show;
+     int16_t cursor_x, cursor_y;     /* signed: the guest parks it off-screen */
+     bool scanout_valid;             /* console holds a presented frame */
++    bool redraw_dirty;              /* background/cursor surface needs a redraw */
++    DisplaySurface *redraw_surface; /* surface the background was last drawn into */
+     uint8_t gamma_lut[3][256];      /* Transaction3 gamma table, 8-bit per channel */
+     bool gamma_active;              /* table set and not the identity */
+     /*
+@@ -1088,15 +1090,26 @@ static void pvg_display_redraw(PVGLinuxPCIState *s)
+     }
+     if (s->scanout_valid) {
+         /* frames come from Transaction3; the UI draws the cursor itself */
++        s->redraw_dirty = true;
+         return;
+     }
+     if (s->regs[PVG_REG_EFI_DISPLAY / 4] && s->regs[PVG_REG_EFI_FB_START / 4] &&
+         s->regs[PVG_REG_EFI_FB_MODE / 4]) {
+         /* firmware framebuffer: pvg_efi_scanout() owns the surface */
++        s->redraw_dirty = true;
+         return;
+     }
+     pvg_display_ensure_surface(s, pvg_display_modes[0].width,
+                                pvg_display_modes[0].height);
++    /*
++     * gfx_update runs at the host monitor's refresh rate (6 ms at 165 Hz) under the BQL:
++     * a full redraw each time starves the vCPUs (firmware stalls). Only redraw on changes.
++     */
++    if (!s->redraw_dirty && s->redraw_surface == s->surface) {
++        return;
++    }
++    s->redraw_dirty = false;
++    s->redraw_surface = s->surface;
+     fb = surface_data(s->surface);
+     w = surface_width(s->surface);
+     h = surface_height(s->surface);
+@@ -1155,6 +1168,7 @@ static const GraphicHwOps pvg_display_gl_ops = {
+ 
+ static void pvg_display_cursor_changed(PVGLinuxPCIState *s)
+ {
++    s->redraw_dirty = true;
+     if (s->con) {
+         qemu_console_set_mouse(s->con, s->cursor_x, s->cursor_y,
+                                s->cursor_show);
+@@ -2950,6 +2964,7 @@ static void pvg_linux_reset(DeviceState *dev)
+         s->scan_shown = false;
+     }
+     s->cursor_show = false;
++    s->redraw_dirty = true;
+ }
+ 
+ static const Property pvg_linux_properties[] = {
+-- 
+2.56.0
+

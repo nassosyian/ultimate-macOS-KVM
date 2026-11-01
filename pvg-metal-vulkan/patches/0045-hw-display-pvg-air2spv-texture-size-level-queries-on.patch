@@ -1,0 +1,135 @@
+From f494ee1cb82b708ac50b2de862e45a9df64a748d Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Fri, 30 Oct 2026 00:16:37 +0200
+Subject: [PATCH 45/54] hw/display/pvg/air2spv: texture size/level queries; one
+ input variable per builtin
+
+air.get_{width,height,depth,array_size,num_mip_levels}_texture_* map to
+OpImageQuerySize(Lod)/OpImageQueryLevels (brim_outline_lpf and RenderBox
+shaders failed with 'entry argument has no supported binding'). Kernels that
+take thread_position_in_grid twice declared GlobalInvocationId twice
+(invalid SPIR-V). Corpus 405/405 translate + spirv-val.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/air2spv.c | 65 +++++++++++++++++++++++++++++++++++++++-
+ hw/display/pvg/spv.h     |  2 +-
+ 2 files changed, 65 insertions(+), 2 deletions(-)
+
+diff --git a/hw/display/pvg/air2spv.c b/hw/display/pvg/air2spv.c
+index e70e955..f398af4 100644
+--- a/hw/display/pvg/air2spv.c
++++ b/hw/display/pvg/air2spv.c
+@@ -63,6 +63,7 @@ typedef struct Ctx {
+     LLVMModuleRef mod;
+     LLVMTargetDataRef td;
+     LLVMValueRef fn;
++    uint32_t builtin_in[64];    /* input builtin variables by SpvBuiltIn */
+     int stage;
+     A2SResult *res;
+     char *err;
+@@ -548,11 +549,20 @@ static void decorate1(Ctx *c, uint32_t id, uint32_t dec, uint32_t v)
+     spv_decorate(&c->m, id, dec, &v, 1);
+ }
+ 
++/* one variable per input builtin: an entry point may not list the same builtin twice */
+ static uint32_t builtin_var(Ctx *c, uint32_t sc, uint32_t type, uint32_t builtin)
+ {
+-    uint32_t v = global_var(c, sc, type);
++    bool memo = sc == SpvStorageInput && builtin < sizeof(c->builtin_in) / sizeof(c->builtin_in[0]);
++    uint32_t v;
+ 
++    if (memo && c->builtin_in[builtin]) {
++        return c->builtin_in[builtin];
++    }
++    v = global_var(c, sc, type);
+     decorate1(c, v, SpvDecorationBuiltIn, builtin);
++    if (memo) {
++        c->builtin_in[builtin] = v;
++    }
+     return v;
+ }
+ 
+@@ -1457,6 +1467,54 @@ static uint32_t load_resource(Ctx *c, Resource *r)
+     return emit(c, SpvOpLoad, r->type, 0, &r->var, 1);
+ }
+ 
++/*
++ * air.get_{width,height,depth,array_size,num_mip_levels}_texture_*(tex[, i32 lod]) -> i32:
++ * OpImageQuerySize(Lod) / OpImageQueryLevels (storage images have no levels: size only)
++ */
++static int texture_query(Ctx *c, LLVMValueRef call, const char *name, uint32_t result)
++{
++    Resource *tex = resource_for(c, LLVMGetOperand(call, 0));
++    uint32_t rty = ty(c, LLVMTypeOf(call)), image, size, n, comp;
++
++    if (!tex || tex->is_sampler) {
++        return fail(c, "texture query on unknown texture");
++    }
++    spv_capability(&c->m, SpvCapabilityImageQuery);
++    image = load_resource(c, tex);
++    if (!strncmp(name, "get_num_mip_levels", 18)) {
++        if (tex->storage) {
++            emit(c, SpvOpCopyObject, rty, result, (uint32_t[]){ spv_const_u32(&c->m, 1) }, 1);
++            return 0;
++        }
++        emit(c, SpvOpImageQueryLevels, rty, result, &image, 1);
++        return 0;
++    }
++    n = tex->dim == SpvDim1D ? 1 : tex->dim == SpvDim3D ? 3 : 2;
++    n += tex->arrayed;
++    if (tex->storage) {
++        size = emit(c, SpvOpImageQuerySize, n > 1 ? spv_type_vec(&c->m, rty, n) : rty, 0,
++                    &image, 1);
++    } else {
++        uint32_t ops[2] = { image, LLVMGetNumArgOperands(call) > 1 ?
++                            val(c, LLVMGetOperand(call, 1)) : spv_const_u32(&c->m, 0) };
++
++        size = emit(c, SpvOpImageQuerySizeLod, n > 1 ? spv_type_vec(&c->m, rty, n) : rty, 0,
++                    ops, 2);
++    }
++    comp = !strncmp(name, "get_width", 9) ? 0 : !strncmp(name, "get_height", 10) ? 1 :
++           !strncmp(name, "get_depth", 9) ? 2 : n - 1;
++    if (n == 1) {
++        emit(c, SpvOpCopyObject, rty, result, (uint32_t[]){ size }, 1);
++        return 0;
++    }
++    if (comp >= n) {
++        emit(c, SpvOpCopyObject, rty, result, (uint32_t[]){ spv_const_u32(&c->m, 1) }, 1);
++        return 0;
++    }
++    emit(c, SpvOpCompositeExtract, rty, result, (uint32_t[]){ size, comp }, 2);
++    return 0;
++}
++
+ /* air.sample_texture_* / air.read_texture_*; returns {v4, i8} struct */
+ static int texture_call(Ctx *c, LLVMValueRef call, const char *name, uint32_t result)
+ {
+@@ -1725,6 +1783,11 @@ static int call_inst(Ctx *c, LLVMValueRef call, uint32_t result)
+     if (!strncmp(base, "sample_texture", 14) || !strncmp(base, "read_texture", 12)) {
+         return texture_call(c, call, base, result);
+     }
++    if (!strncmp(base, "get_width_texture", 17) || !strncmp(base, "get_height_texture", 18) ||
++        !strncmp(base, "get_depth_texture", 17) || !strncmp(base, "get_array_size_texture", 22) ||
++        !strncmp(base, "get_num_mip_levels_texture", 26)) {
++        return texture_query(c, call, base, result);
++    }
+     if (!strcmp(base, "discard_fragment")) {
+         spv_capability(&c->m, SpvCapabilityDemoteToHelperInvocation);
+         spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpDemoteToHelperInvocation, NULL, 0);
+diff --git a/hw/display/pvg/spv.h b/hw/display/pvg/spv.h
+index b34e692..04107c7 100644
+--- a/hw/display/pvg/spv.h
++++ b/hw/display/pvg/spv.h
+@@ -75,7 +75,7 @@ enum {
+     SpvOpCopyObject = 83, SpvOpSampledImage = 86, SpvOpImageSampleImplicitLod = 87,
+     SpvOpImageSampleExplicitLod = 88, SpvOpImageFetch = 95, SpvOpImageRead = 98,
+     SpvOpImageWrite = 99, SpvOpControlBarrier = 224, SpvOpMemoryBarrier = 225,
+-    SpvOpExecutionModeId = 331, SpvOpImageQuerySizeLod = 103, SpvOpConvertFToU = 109,
++    SpvOpExecutionModeId = 331, SpvOpImageQuerySizeLod = 103, SpvOpImageQuerySize = 104, SpvOpImageQueryLevels = 106, SpvOpConvertFToU = 109,
+     SpvOpConvertFToS = 110, SpvOpConvertSToF = 111, SpvOpConvertUToF = 112, SpvOpUConvert = 113,
+     SpvOpSConvert = 114, SpvOpFConvert = 115, SpvOpConvertPtrToU = 117, SpvOpConvertUToPtr = 120,
+     SpvOpBitcast = 124, SpvOpSNegate = 126, SpvOpFNegate = 127, SpvOpIAdd = 128, SpvOpFAdd = 129,
+-- 
+2.43.0
+

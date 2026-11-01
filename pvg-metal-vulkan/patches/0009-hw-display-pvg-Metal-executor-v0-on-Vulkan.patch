@@ -1,0 +1,2072 @@
+From 2567682f131aae6e7504beea6e7c96eab18e4779 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 12:07:42 +0200
+Subject: [PATCH 09/54] hw/display/pvg: Metal executor v0 on Vulkan
+
+Executes render segments of ExecIndirect2 command buffers on the host GPU:
+render passes as dynamic rendering, pipelines from the serialized
+descriptor + air2spv-translated functions, buffers via a host-visible
+arena with device addresses, textures uploaded from their linear guest
+copies, render targets stored back to guest memory (so presented
+backings show the result). Fence per submit; the first failed or timed
+out submit disables the executor (the host GPU drives the host desktop).
+Bounds checks on buffer offsets and index ranges. exec=, exec-dry-run=
+properties; dump-dir also saves translated metallibs.
+
+Translator: per-stage push-constant base, typed splat constants, float to
+bool conversions, 32-bit sampled image types with half results, narrow
+vertex_id parameters, per-binding texture view kinds.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/meson.build     |    3 +-
+ hw/display/pvg-linux-pci.c |  145 +++-
+ hw/display/pvg/air2spv.c   |   77 +-
+ hw/display/pvg/air2spv.h   |    8 +-
+ hw/display/pvg/pvg-exec.c  | 1490 ++++++++++++++++++++++++++++++++++++
+ hw/display/pvg/pvg-exec.h  |   44 ++
+ hw/display/trace-events    |    2 +
+ 7 files changed, 1736 insertions(+), 33 deletions(-)
+ create mode 100644 hw/display/pvg/pvg-exec.c
+ create mode 100644 hw/display/pvg/pvg-exec.h
+
+diff --git a/hw/display/meson.build b/hw/display/meson.build
+index efa0f72..aafcb82 100644
+--- a/hw/display/meson.build
++++ b/hw/display/meson.build
+@@ -68,7 +68,8 @@ pvg_vulkan = dependency('vulkan', required: false)
+ pvg_llvm = dependency('llvm', version: '>=19', method: 'config-tool', required: false)
+ if pvg_vulkan.found() and pvg_llvm.found()
+   system_ss.add(when: 'CONFIG_PVG_LINUX_PCI',
+-                if_true: [files('pvg-linux-pci.c', 'pvg/pvg-gpu.c', 'pvg/air2spv.c', 'pvg/spv.c'),
++                if_true: [files('pvg-linux-pci.c', 'pvg/pvg-gpu.c', 'pvg/pvg-exec.c', 'pvg/air2spv.c',
++                                'pvg/spv.c'),
+                           pvg_vulkan, pvg_llvm])
+ else
+   system_ss.add(when: 'CONFIG_PVG_LINUX_PCI', if_true: files('pvg-linux-pci.c'))
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index c70a844..5316822 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -29,6 +29,7 @@
+ #include "trace.h"
+ #include "pvg-linux-cmds.h"
+ #include "pvg/pvg-gpu.h"
++#include "pvg/pvg-exec.h"
+ 
+ #define TYPE_PVG_LINUX_PCI "pvg-linux-pci"
+ OBJECT_DECLARE_SIMPLE_TYPE(PVGLinuxPCIState, PVG_LINUX_PCI)
+@@ -247,6 +248,10 @@ struct PVGLinuxPCIState {
+     bool gpu_validation;
+     PVGGpu gpu;
+     bool gpu_ok;
++    bool exec_enable;
++    bool exec_dry_run;
++    PVGExec *exec;
++    uint64_t exec_cmdbufs;
+     char *dump_dir;         /* raw ExecIndirect2 command buffers, for RE */
+     uint32_t dump_max;
+     uint32_t dumped;
+@@ -390,7 +395,10 @@ static bool pvg_task_walk(PVGLinuxPCIState *s, uint32_t task, uint64_t va,
+     return true;
+ }
+ 
+-/* Host mappings first (the guest may drop PTEs after MapMemory2), then a walk */
++/*
++ * The guest page tables are authoritative while they hold the page; the
++ * MapMemory2 snapshot only covers pages whose PTEs the guest dropped later.
++ */
+ static bool pvg_task_translate(PVGLinuxPCIState *s, uint32_t task,
+                                uint64_t va, uint64_t *gpa)
+ {
+@@ -399,6 +407,9 @@ static bool pvg_task_translate(PVGLinuxPCIState *s, uint32_t task,
+     if (task >= PVG_MAX_TASKS || !s->tasks[task].root) {
+         return false;
+     }
++    if (pvg_task_walk(s, task, va, gpa)) {
++        return true;
++    }
+     t = &s->tasks[task];
+     for (guint i = 0; t->mappings && i < t->mappings->len; i++) {
+         PVGTaskMapping *m = &g_array_index(t->mappings, PVGTaskMapping, i);
+@@ -413,7 +424,7 @@ static bool pvg_task_translate(PVGLinuxPCIState *s, uint32_t task,
+             break;
+         }
+     }
+-    return pvg_task_walk(s, task, va, gpa);
++    return false;
+ }
+ 
+ static void pvg_task_mapping_free(gpointer p)
+@@ -499,6 +510,26 @@ static bool pvg_task_read(PVGLinuxPCIState *s, uint32_t task, uint64_t va,
+     return true;
+ }
+ 
++static bool pvg_task_write(PVGLinuxPCIState *s, uint32_t task, uint64_t va,
++                           const void *buf, uint64_t len)
++{
++    const uint8_t *p = buf;
++
++    while (len) {
++        uint64_t chunk = MIN(len, 0x1000 - (va & 0xfff));
++        uint64_t gpa;
++
++        if (!pvg_task_translate(s, task, va, &gpa) ||
++            pci_dma_write(PCI_DEVICE(s), gpa, p, chunk) != MEMTX_OK) {
++            return false;
++        }
++        p += chunk;
++        va += chunk;
++        len -= chunk;
++    }
++    return true;
++}
++
+ /* CmdDefineTask2: {u32 id << 1 | flag, u64 length, u32 task root PFN} */
+ static void pvg_cmd_define_task2(PVGLinuxPCIState *s, const uint8_t *p,
+                                  uint32_t len)
+@@ -515,6 +546,9 @@ static void pvg_cmd_define_task2(PVGLinuxPCIState *s, const uint8_t *p,
+         return;
+     }
+     s->tasks[id].root = root;
++    if (s->exec) {
++        pvg_exec_task_reset(s->exec, id);
++    }
+     if (s->tasks[id].mappings) {
+         g_array_set_size(s->tasks[id].mappings, 0);
+     }
+@@ -943,7 +977,9 @@ static void pvg_cmd_set_object_list(PVGLinuxPCIState *s, const uint8_t *p,
+                                 s->tasks[task].object_list_len);
+ }
+ 
+-/* Read object 'id' of a task into buf; returns its type (0 = invalid) */
++#define PVG_OBJ_UNREADABLE      0xff
++
++/* Read object 'id' of a task into buf; returns its type (0 = invalid, 0xff = unreadable) */
+ static uint8_t pvg_task_object(PVGLinuxPCIState *s, uint32_t task, uint32_t id,
+                                void *buf, uint32_t bufsize, uint32_t *objlen)
+ {
+@@ -952,17 +988,22 @@ static uint8_t pvg_task_object(PVGLinuxPCIState *s, uint32_t task, uint32_t id,
+     uint32_t head;
+ 
+     if (!t->object_list_va ||
+-        (uint64_t)(id + 1) * PVG_OBJ_ENTRY_SIZE > t->object_list_len ||
+-        !pvg_task_read(s, task, t->object_list_va + id * PVG_OBJ_ENTRY_SIZE,
+-                       entry, sizeof(entry))) {
++        (uint64_t)(id + 1) * PVG_OBJ_ENTRY_SIZE > t->object_list_len) {
+         return 0;
+     }
++    if (!pvg_task_read(s, task, t->object_list_va + id * PVG_OBJ_ENTRY_SIZE,
++                       entry, sizeof(entry))) {
++        return PVG_OBJ_UNREADABLE;
++    }
+     head = ldl_le_p(entry);
+     *objlen = head >> 8;
+-    if (!(head & 0xff) || *objlen > bufsize ||
+-        !pvg_task_read(s, task, ldq_le_p(entry + 4), buf, *objlen)) {
++    if (!(head & 0xff)) {
+         return 0;
+     }
++    /* bodies larger than the caller's buffer: report the type, read the prefix */
++    if (!pvg_task_read(s, task, ldq_le_p(entry + 4), buf, MIN(*objlen, bufsize))) {
++        return PVG_OBJ_UNREADABLE;
++    }
+     return head & 0xff;
+ }
+ 
+@@ -1016,6 +1057,37 @@ static void pvg_display_scanout(PVGLinuxPCIState *s, uint32_t surface_id)
+     qemu_console_update_full(s->con);
+ }
+ 
++/* ---- executor glue ---- */
++
++static bool pvg_exec_read(void *opaque, uint32_t task, uint64_t va, void *buf, uint64_t len)
++{
++    return pvg_task_read(opaque, task, va, buf, len);
++}
++
++static bool pvg_exec_write(void *opaque, uint32_t task, uint64_t va, const void *buf,
++                           uint64_t len)
++{
++    return pvg_task_write(opaque, task, va, buf, len);
++}
++
++static uint8_t pvg_exec_object(void *opaque, uint32_t task, uint32_t id, void *buf,
++                               uint32_t size, uint32_t *len)
++{
++    PVGLinuxPCIState *s = opaque;
++    uint8_t type;
++
++    if (task >= PVG_MAX_TASKS) {
++        return 0;
++    }
++    type = pvg_task_object(s, task, id, buf, size, len);
++    return type == PVG_OBJ_UNREADABLE ? 0 : type;
++}
++
++static void pvg_exec_log(void *opaque, const char *msg)
++{
++    trace_pvg_linux_exec(msg);
++}
++
+ /* ---- Metal command stream (ExecIndirect2 -> _PGDeserializer) ---- */
+ 
+ #define PVG_MAX_CMDBUF          (4 * MiB)
+@@ -1029,13 +1101,29 @@ static const char *const pvg_encoder_names[] = {
+ static void pvg_trace_ref(PVGLinuxPCIState *s, uint32_t task, const char *cmd,
+                           uint32_t slot, uint32_t ref)
+ {
+-    uint8_t obj[0x100];
++    uint8_t obj[0x1000];
+     uint32_t objlen = 0;
+     uint8_t type = ref ? pvg_task_object(s, task, ref, obj, sizeof(obj), &objlen) : 0;
+ 
+     trace_pvg_linux_ref(task, cmd, slot, ref, type, objlen,
+                         type == 7 && objlen >= 4 ? ldl_le_p(obj) : 0,
+                         objlen >= 4 ? ldl_le_p(obj) : 0, objlen >= 8 ? ldl_le_p(obj + 4) : 0);
++    if (type == 0 && !strcmp(cmd, "pipeline")) {
++        for (uint32_t t = 0; t < 8; t++) {
++            uint8_t ty;
++
++            if (t == task || !s->tasks[t].root) {
++                continue;
++            }
++            ty = pvg_task_object(s, t, ref, obj, sizeof(obj), &objlen);
++            if (ty) {
++                trace_pvg_linux_ref(t, "pipeline-elsewhere", 0, ref, ty, objlen,
++                                    ty == 7 && objlen >= 4 ? ldl_le_p(obj) : 0,
++                                    objlen >= 4 ? ldl_le_p(obj) : 0,
++                                    objlen >= 8 ? ldl_le_p(obj + 4) : 0);
++            }
++        }
++    }
+ }
+ 
+ /* Resolve and trace the object references of one render segment's commands */
+@@ -1144,6 +1232,12 @@ static void pvg_cmd_exec_indirect2(PVGLinuxPCIState *s, const uint8_t *p,
+         return;
+     }
+     cbs = p + 12 + 24 * nres;
++    if (trace_event_get_state_backends(TRACE_PVG_LINUX_REF)) {
++        for (uint32_t i = 0; i < nres; i++) {
++            pvg_trace_ref(s, task, "resource", ldl_le_p(p + 12 + 24 * i + 4),
++                          ldl_le_p(p + 12 + 24 * i));
++        }
++    }
+     for (uint32_t i = 0; i < ncb; i++) {
+         uint64_t va = ldq_le_p(cbs + 16 * i), cblen = ldq_le_p(cbs + 16 * i + 8);
+         g_autofree uint8_t *buf = NULL;
+@@ -1164,6 +1258,16 @@ static void pvg_cmd_exec_indirect2(PVGLinuxPCIState *s, const uint8_t *p,
+             g_file_set_contents(path, (const char *)buf, cblen, NULL);
+         }
+         pvg_parse_cmdbuf(s, task, buf, cblen);
++        if (s->exec) {
++            pvg_exec_cmdbuf(s->exec, task, buf, cblen);
++            if (++s->exec_cmdbufs % 500 == 0) {
++                const PVGExecStats *st = pvg_exec_stats(s->exec);
++
++                trace_pvg_linux_exec_stats(s->exec_cmdbufs, st->render_passes, st->draws,
++                                           st->skipped_draws, st->pipelines,
++                                           st->pipeline_failures, st->writebacks);
++            }
++        }
+     }
+ }
+ 
+@@ -1448,6 +1552,23 @@ static void pvg_linux_realize(PCIDevice *dev, Error **errp)
+         } else {
+             s->gpu_ok = true;
+             trace_pvg_linux_gpu(s->gpu.name, s->gpu_validation);
++            if (s->exec_enable) {
++                PVGExecHost host = {
++                    .opaque = s, .read = pvg_exec_read, .write = pvg_exec_write,
++                    .object = pvg_exec_object, .log = pvg_exec_log,
++                };
++
++                s->exec = pvg_exec_new(&s->gpu, &host);
++                if (s->exec && s->dump_dir) {
++                    pvg_exec_set_dump_dir(s->exec, s->dump_dir);
++                }
++                if (s->exec) {
++                    pvg_exec_set_dry_run(s->exec, s->exec_dry_run);
++                }
++                if (!s->exec) {
++                    warn_report("pvg-linux-pci: Metal executor initialisation failed");
++                }
++            }
+         }
+     }
+ }
+@@ -1457,6 +1578,10 @@ static void pvg_linux_exit(PCIDevice *dev)
+     PVGLinuxPCIState *s = PVG_LINUX_PCI(dev);
+ 
+     msi_uninit(dev);
++    if (s->exec) {
++        pvg_exec_free(s->exec);
++        s->exec = NULL;
++    }
+     if (s->gpu_ok) {
+         pvg_gpu_fini(&s->gpu);
+         s->gpu_ok = false;
+@@ -1499,6 +1624,8 @@ static const Property pvg_linux_properties[] = {
+     DEFINE_PROP_UINT32("display-ports", PVGLinuxPCIState, display_ports, 1),
+     DEFINE_PROP_BOOL("gpu", PVGLinuxPCIState, gpu_enable, true),
+     DEFINE_PROP_BOOL("gpu-validation", PVGLinuxPCIState, gpu_validation, false),
++    DEFINE_PROP_BOOL("exec", PVGLinuxPCIState, exec_enable, true),
++    DEFINE_PROP_BOOL("exec-dry-run", PVGLinuxPCIState, exec_dry_run, false),
+     DEFINE_PROP_STRING("dump-dir", PVGLinuxPCIState, dump_dir),
+     DEFINE_PROP_UINT32("dump-max", PVGLinuxPCIState, dump_max, 256),
+ };
+diff --git a/hw/display/pvg/air2spv.c b/hw/display/pvg/air2spv.c
+index ed405c6..da43047 100644
+--- a/hw/display/pvg/air2spv.c
++++ b/hw/display/pvg/air2spv.c
+@@ -552,6 +552,9 @@ static int setup_interface(Ctx *c)
+             max_buf = c->args[i].index;
+         }
+     }
++    if (max_buf >= A2S_MAX_BUFFERS) {
++        return fail(c, "buffer index %d beyond the push table", max_buf);
++    }
+     if (max_buf >= 0) {
+         uint32_t arr_ops[2] = { c->t_u64, spv_const_u32(&c->m, max_buf + 1) };
+         uint32_t arr = spv_type(&c->m, SpvOpTypeArray, arr_ops, 2);
+@@ -559,10 +562,10 @@ static int setup_interface(Ctx *c)
+ 
+         decorate1(c, arr, SpvDecorationArrayStride, 8);
+         spv_decorate(&c->m, blk, SpvDecorationBlock, NULL, 0);
+-        spv_member_decorate(&c->m, blk, 0, SpvDecorationOffset, 0);
++        spv_member_decorate(&c->m, blk, 0, SpvDecorationOffset, c->res->push_base);
+         c->pc_var = global_var(c, SpvStoragePushConstant, blk);
+         c->pc_elem_ptr = spv_type_ptr(&c->m, SpvStoragePushConstant, c->t_u64);
+-        c->res->push_size = 8 * (max_buf + 1);
++        c->res->push_size = c->res->push_base + 8 * (max_buf + 1);
+     }
+     for (int i = 0; i < c->nargs; i++) {
+         Arg *a = &c->args[i];
+@@ -581,6 +584,13 @@ static int setup_interface(Ctx *c)
+             decorate1(c, r->var, SpvDecorationDescriptorSet, 0);
+             decorate1(c, r->var, SpvDecorationBinding, A2S_TEXTURE_BINDING + a->index);
+             c->res->texture_mask |= 1u << a->index;
++            if (a->index < 32) {
++                c->res->texture_view[a->index] =
++                    r->dim == SpvDim1D ? (r->arrayed ? A2S_VIEW_1D_ARRAY : A2S_VIEW_1D) :
++                    r->dim == SpvDim3D ? A2S_VIEW_3D :
++                    r->dim == SpvDimCube ? (r->arrayed ? A2S_VIEW_CUBE_ARRAY : A2S_VIEW_CUBE) :
++                    (r->arrayed ? A2S_VIEW_2D_ARRAY : A2S_VIEW_2D);
++            }
+             break;
+         }
+         case ARG_SAMPLER: {
+@@ -876,31 +886,31 @@ static uint32_t ext(Ctx *c, uint32_t type, uint32_t result, uint32_t inst, const
+     return emit(c, SpvOpExtInst, type, result, w, n + 2);
+ }
+ 
+-static uint32_t splat_f32(Ctx *c, LLVMTypeRef t, float f)
++/* constant of LLVM type t (scalar or vector) with every element = v; types follow t exactly */
++static LLVMValueRef llvm_splat(LLVMTypeRef t, double fv, uint64_t iv)
+ {
+-    uint32_t s = spv_const_f32(&c->m, f), ops[16];
++    LLVMTypeRef et = LLVMGetTypeKind(t) == LLVMVectorTypeKind ? LLVMGetElementType(t) : t;
++    LLVMValueRef e = LLVMGetTypeKind(et) == LLVMIntegerTypeKind ? LLVMConstInt(et, iv, 0) :
++                     LLVMConstReal(et, fv);
++    LLVMValueRef elems[16];
+ 
+     if (LLVMGetTypeKind(t) != LLVMVectorTypeKind) {
+-        return s;
++        return e;
+     }
+-    for (unsigned i = 0; i < LLVMGetVectorSize(t); i++) {
+-        ops[i] = s;
++    for (unsigned i = 0; i < LLVMGetVectorSize(t) && i < 16; i++) {
++        elems[i] = e;
+     }
+-    return spv_const(&c->m, SpvOpConstantComposite, ty(c, t), ops, LLVMGetVectorSize(t));
++    return LLVMConstVector(elems, LLVMGetVectorSize(t));
+ }
+ 
+-static uint32_t splat_int(Ctx *c, LLVMTypeRef t, uint32_t x)
++static uint32_t splat_f32(Ctx *c, LLVMTypeRef t, float f)
+ {
+-    LLVMTypeRef et = LLVMGetTypeKind(t) == LLVMVectorTypeKind ? LLVMGetElementType(t) : t;
+-    uint32_t s = spv_const(&c->m, SpvOpConstant, ty(c, et), &x, 1), ops[16];
++    return const_val(c, llvm_splat(t, f, 0));
++}
+ 
+-    if (LLVMGetTypeKind(t) != LLVMVectorTypeKind) {
+-        return s;
+-    }
+-    for (unsigned i = 0; i < LLVMGetVectorSize(t); i++) {
+-        ops[i] = s;
+-    }
+-    return spv_const(&c->m, SpvOpConstantComposite, ty(c, t), ops, LLVMGetVectorSize(t));
++static uint32_t splat_int(Ctx *c, LLVMTypeRef t, uint32_t x)
++{
++    return const_val(c, llvm_splat(t, 0, x));
+ }
+ 
+ static bool is_bool(LLVMTypeRef t)
+@@ -1055,7 +1065,10 @@ static int texture_call(Ctx *c, LLVMValueRef call, const char *name, uint32_t re
+     Resource *tex = resource_for(c, LLVMGetOperand(call, 0));
+     LLVMTypeRef rty = LLVMTypeOf(call);
+     LLVMTypeRef vty = LLVMStructGetTypeAtIndex(rty, 0);
+-    uint32_t v4 = ty(c, vty), image, texel, parts[2];
++    /* images are declared with 32-bit sampled types; narrower results are converted after */
++    bool narrow = LLVMGetTypeKind(LLVMGetElementType(vty)) == LLVMHalfTypeKind;
++    uint32_t v4 = narrow ? spv_type_vec(&c->m, c->t_f32, LLVMGetVectorSize(vty)) : ty(c, vty);
++    uint32_t image, texel, parts[2];
+     bool arrayed;
+ 
+     if (!tex || tex->is_sampler || LLVMGetTypeKind(rty) != LLVMStructTypeKind) {
+@@ -1120,6 +1133,9 @@ static int texture_call(Ctx *c, LLVMValueRef call, const char *name, uint32_t re
+             texel = emit(c, SpvOpImageSampleImplicitLod, v4, 0, ops, 4);
+         }
+     }
++    if (narrow) {
++        texel = emit(c, SpvOpFConvert, ty(c, vty), 0, &texel, 1);
++    }
+     parts[0] = texel;
+     parts[1] = const_val(c, LLVMConstNull(LLVMStructGetTypeAtIndex(rty, 1)));
+     emit(c, SpvOpCompositeConstruct, ty(c, rty), result, parts, 2);
+@@ -1199,7 +1215,11 @@ static int call_inst(Ctx *c, LLVMValueRef call, uint32_t result)
+             p = p ? strchr(p + 1, '.') : NULL;
+             sk = p ? p[1] : 0;
+         }
+-        if (is_bool(st)) {
++        if (is_bool(rt) && !is_bool(st)) {
++            uint32_t ops[2] = { args[0], sk == 'f' ? splat_f32(c, st, 0) : splat_int(c, st, 0) };
++
++            emit(c, sk == 'f' ? SpvOpFOrdNotEqual : SpvOpINotEqual, rty, result, ops, 2);
++        } else if (is_bool(st)) {
+             uint32_t ops[3] = { args[0],
+                                 dk == 'f' ? splat_f32(c, rt, 1) : splat_int(c, rt, 1),
+                                 dk == 'f' ? splat_f32(c, rt, 0) : splat_int(c, rt, 0) };
+@@ -1405,6 +1425,12 @@ static int instruction(Ctx *c, Cfg *g, int bi, LLVMValueRef inst)
+         LLVMValueRef src = LLVMGetOperand(inst, 0);
+ 
+         ops[0] = val(c, src);
++        if (is_bool(t)) {
++            /* fpto[us]i to i1: only 0 and 1/-1 are defined, i.e. x != 0 */
++            ops[1] = splat_f32(c, LLVMTypeOf(src), 0);
++            emit(c, SpvOpFOrdNotEqual, tid, r, ops, 2);
++            return 0;
++        }
+         if (is_bool(LLVMTypeOf(src))) {
+             ops[1] = splat_f32(c, t, op == LLVMSIToFP ? -1.0f : 1.0f);
+             ops[2] = splat_f32(c, t, 0);
+@@ -1596,7 +1622,14 @@ static int translate_function(Ctx *c)
+ 
+                     if (arg->kind == ARG_VERTEX_ID || arg->kind == ARG_INSTANCE_ID ||
+                         arg->kind == ARG_SAMPLE_ID) {
+-                        t = c->t_u32;
++                        uint32_t v = emit(c, SpvOpLoad, c->t_u32, 0, &arg->var, 1);
++
++                        /* the AIR parameter may be narrower than the 32-bit builtin */
++                        if (t != c->t_u32) {
++                            v = emit(c, SpvOpUConvert, t, 0, &v, 1);
++                        }
++                        vset(c, p, v);
++                        continue;
+                     }
+                     vset(c, p, emit(c, SpvOpLoad, t, 0, &arg->var, 1));
+                 }
+@@ -1667,7 +1700,7 @@ int air2spv_translate(const void *bitcode, size_t len, A2SResult *io)
+     io->error[0] = 0;
+     io->spirv = NULL;
+     io->buffer_mask = io->texture_mask = io->sampler_mask = 0;
+-    io->push_size = 0;
++    io->push_size = io->push_base;
+     io->nconst_samplers = 0;
+     c.res = io;
+     c.err = io->error;
+diff --git a/hw/display/pvg/air2spv.h b/hw/display/pvg/air2spv.h
+index 1c88c03..4e19d11 100644
+--- a/hw/display/pvg/air2spv.h
++++ b/hw/display/pvg/air2spv.h
+@@ -15,8 +15,12 @@
+ #define A2S_TEXTURE_BINDING  16     /* binding = base + Metal texture index */
+ #define A2S_SAMPLER_BINDING  48
+ #define A2S_CONST_SAMPLER_BINDING 64
++#define A2S_MAX_BUFFERS      16     /* Metal buffer indices per stage in the push table */
+ 
+ enum { A2S_STAGE_VERTEX = 0, A2S_STAGE_FRAGMENT = 4 };
++/* image view kinds expected by a texture binding (values = VkImageViewType) */
++enum { A2S_VIEW_1D = 0, A2S_VIEW_2D = 1, A2S_VIEW_3D = 2, A2S_VIEW_CUBE = 3,
++       A2S_VIEW_1D_ARRAY = 4, A2S_VIEW_2D_ARRAY = 5, A2S_VIEW_CUBE_ARRAY = 6 };
+ 
+ typedef struct A2SResult {
+     uint32_t *spirv;            /* malloc'ed, free with free() */
+@@ -26,8 +30,10 @@ typedef struct A2SResult {
+     char error[256];
+     uint32_t buffer_mask;       /* Metal buffer indices used (push-constant u64 slots) */
+     uint32_t texture_mask;
++    uint8_t texture_view[32];   /* per Metal texture index: A2S_VIEW_* */
+     uint32_t sampler_mask;
+-    uint32_t push_size;         /* bytes of push constants used */
++    uint32_t push_base;         /* in: byte offset of this stage's buffer table */
++    uint32_t push_size;         /* out: end offset of the push constants used */
+     int nconst_samplers;
+     uint64_t const_sampler_state[A2S_MAX_CONST_SAMP];
+     /* varying names; location = index. In: names already assigned by the paired stage */
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+new file mode 100644
+index 0000000..7b72eb0
+--- /dev/null
++++ b/hw/display/pvg/pvg-exec.c
+@@ -0,0 +1,1490 @@
++/*
++ * Metal command buffer executor for pvg-linux-pci (Vulkan backend), v0.
++ *
++ * Executes render segments of ExecIndirect2 command buffers (docs/pvg-protocol.md §5):
++ * render pass → Vulkan dynamic rendering, pipelines from translated AIR (air2spv), buffers through
++ * a host-visible arena with device addresses, textures uploaded from their linear guest copies,
++ * render targets loaded/stored from/to guest memory so later passes and the display see them.
++ * Everything is synchronous: one submit + wait per render segment.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include <glib.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "air2spv.h"
++#include "pvg-exec.h"
++
++#define ARENA_SIZE          (256u << 20)
++#define MAX_SLOTS           16
++#define MAX_OBJ             0x1000
++#define PUSH_FRAGMENT_BASE  128
++
++/* PVG object types (docs/pvg-protocol.md §4d) */
++#define OBJ_BUFFER          0x01
++#define OBJ_TEXTURE_2       0x02
++#define OBJ_TEXTURE_3       0x03
++#define OBJ_BACKING         0x04
++#define OBJ_BACKING_REF_TEX 0x05
++#define OBJ_FUNCTION        0x06
++#define OBJ_SERIALIZED      0x07
++#define SER_RENDER_PIPELINE 0x0e
++
++static inline uint32_t ldl(const uint8_t *p)
++{
++    uint32_t v;
++
++    memcpy(&v, p, 4);
++    return GUINT32_FROM_LE(v);
++}
++
++static inline uint16_t lduw(const uint8_t *p)
++{
++    uint16_t v;
++
++    memcpy(&v, p, 2);
++    return GUINT16_FROM_LE(v);
++}
++
++static inline uint64_t ldq(const uint8_t *p)
++{
++    uint64_t v;
++
++    memcpy(&v, p, 8);
++    return GUINT64_FROM_LE(v);
++}
++
++static inline void stq(uint8_t *p, uint64_t v)
++{
++    v = GUINT64_TO_LE(v);
++    memcpy(p, &v, 8);
++}
++
++typedef struct HostImage {
++    VkImage image;
++    VkDeviceMemory mem;
++    VkImageView view;
++    VkFormat format;
++    uint32_t width, height;
++} HostImage;
++
++/* A texture's linear copy in guest memory */
++typedef struct GuestImage {
++    uint32_t task;
++    uint64_t va;
++    uint32_t row_bytes, width, height, bpp;
++    VkFormat format;
++    VkComponentMapping swizzle;
++} GuestImage;
++
++typedef struct Pipeline {
++    bool ok;
++    VkPipeline pipe;
++    VkPipelineLayout layout;
++    VkDescriptorSetLayout dsl;
++    uint32_t vs_buffers, fs_buffers, vs_textures, fs_textures, fs_samplers, vs_samplers;
++    uint8_t texture_view[32];
++    int fs_const_samplers, vs_const_samplers;
++    uint32_t vertex_bindings;           /* Metal buffer indices fetched as vertex buffers */
++    VkFormat color_format;
++    uint32_t push_size;
++    uint32_t draws_logged;
++} Pipeline;
++
++typedef struct Binding {
++    uint32_t ref;
++    uint64_t offset;
++} Binding;
++
++struct PVGExec {
++    PVGGpu *gpu;
++    PVGExecHost host;
++    PVGExecStats stats;
++
++    VkBuffer arena;
++    VkDeviceMemory arena_mem;
++    uint8_t *arena_ptr;
++    VkDeviceAddress arena_addr;
++    uint64_t arena_used;
++
++    VkSampler sampler;
++    VkCommandBuffer cmd;
++    VkFence fence;
++    bool disabled;              /* a submit failed or hung: stop using the host GPU */
++    char *dump_dir;
++    bool dry_run;
++    PFN_vkCmdPushDescriptorSetKHR push_descriptor;
++
++    GHashTable *images;         /* key: task << 32 | id → HostImage* */
++    GHashTable *pipelines;      /* key: task << 32 | id → Pipeline* */
++    GHashTable *uploaded;       /* per command buffer: task << 32 | id → arena offset + 1 */
++    HostImage dummy[7];         /* 1x1 placeholders per VkImageViewType */
++    bool creating_dummies;
++};
++
++static void elog(PVGExec *e, const char *fmt, ...) G_GNUC_PRINTF(2, 3);
++
++static void elog(PVGExec *e, const char *fmt, ...)
++{
++    char buf[512];
++    va_list ap;
++
++    va_start(ap, fmt);
++    vsnprintf(buf, sizeof(buf), fmt, ap);
++    va_end(ap);
++    if (e->host.log) {
++        e->host.log(e->host.opaque, buf);
++    }
++}
++
++static gint64 *key_new(uint32_t task, uint32_t id)
++{
++    gint64 *k = g_new(gint64, 1);
++
++    *k = (gint64)task << 32 | id;
++    return k;
++}
++
++static gint64 key_of(uint32_t task, uint32_t id)
++{
++    return (gint64)task << 32 | id;
++}
++
++/* ---- formats ---- */
++
++static VkFormat mtl_pixel_format(uint32_t f, uint32_t *bpp, VkComponentMapping *swz)
++{
++    static const VkComponentMapping identity = { 0 };
++
++    *swz = identity;
++    switch (f) {
++    case 1:     /* A8Unorm */
++        *bpp = 1;
++        swz->r = swz->g = swz->b = VK_COMPONENT_SWIZZLE_ZERO;
++        swz->a = VK_COMPONENT_SWIZZLE_R;
++        return VK_FORMAT_R8_UNORM;
++    case 10: *bpp = 1; return VK_FORMAT_R8_UNORM;
++    case 11: *bpp = 1; return VK_FORMAT_R8_SRGB;
++    case 20: *bpp = 2; return VK_FORMAT_R16_UNORM;
++    case 25: *bpp = 2; return VK_FORMAT_R16_SFLOAT;
++    case 30: *bpp = 2; return VK_FORMAT_R8G8_UNORM;
++    case 55: *bpp = 4; return VK_FORMAT_R32_SFLOAT;
++    case 60: *bpp = 4; return VK_FORMAT_R16G16_UNORM;
++    case 65: *bpp = 4; return VK_FORMAT_R16G16_SFLOAT;
++    case 70: *bpp = 4; return VK_FORMAT_R8G8B8A8_UNORM;
++    case 71: *bpp = 4; return VK_FORMAT_R8G8B8A8_SRGB;
++    case 80: *bpp = 4; return VK_FORMAT_B8G8R8A8_UNORM;
++    case 81: *bpp = 4; return VK_FORMAT_B8G8R8A8_SRGB;
++    case 90: *bpp = 4; return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
++    case 92: *bpp = 4; return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
++    case 94: *bpp = 4; return VK_FORMAT_A2R10G10B10_UNORM_PACK32;
++    case 105: *bpp = 8; return VK_FORMAT_R32G32_SFLOAT;
++    case 110: *bpp = 8; return VK_FORMAT_R16G16B16A16_UNORM;
++    case 115: *bpp = 8; return VK_FORMAT_R16G16B16A16_SFLOAT;
++    case 125: *bpp = 16; return VK_FORMAT_R32G32B32A32_SFLOAT;
++    default: *bpp = 0; return VK_FORMAT_UNDEFINED;
++    }
++}
++
++static VkFormat mtl_vertex_format(uint32_t f)
++{
++    switch (f) {
++    case 3: return VK_FORMAT_R8G8B8A8_UINT;
++    case 9: return VK_FORMAT_R8G8B8A8_UNORM;
++    case 15: return VK_FORMAT_R16G16B16A16_UINT;
++    case 21: return VK_FORMAT_R16G16B16A16_UNORM;
++    case 25: return VK_FORMAT_R16G16_SFLOAT;
++    case 27: return VK_FORMAT_R16G16B16A16_SFLOAT;
++    case 28: return VK_FORMAT_R32_SFLOAT;
++    case 29: return VK_FORMAT_R32G32_SFLOAT;
++    case 30: return VK_FORMAT_R32G32B32_SFLOAT;
++    case 31: return VK_FORMAT_R32G32B32A32_SFLOAT;
++    case 32: return VK_FORMAT_R32_SINT;
++    case 36: return VK_FORMAT_R32_UINT;
++    case 39: return VK_FORMAT_R32G32B32A32_UINT;
++    default: return VK_FORMAT_UNDEFINED;
++    }
++}
++
++static VkBlendFactor mtl_blend_factor(uint32_t f)
++{
++    static const VkBlendFactor map[] = {
++        VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_SRC_COLOR,
++        VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR, VK_BLEND_FACTOR_SRC_ALPHA,
++        VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_FACTOR_DST_COLOR,
++        VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR, VK_BLEND_FACTOR_DST_ALPHA,
++        VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA, VK_BLEND_FACTOR_SRC_ALPHA_SATURATE,
++        VK_BLEND_FACTOR_CONSTANT_COLOR, VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR,
++        VK_BLEND_FACTOR_CONSTANT_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA,
++    };
++
++    return f < G_N_ELEMENTS(map) ? map[f] : VK_BLEND_FACTOR_ONE;
++}
++
++static VkPrimitiveTopology mtl_topology(uint32_t t)
++{
++    switch (t) {
++    case 0: return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
++    case 1: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
++    case 2: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
++    case 4: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
++    default: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++    }
++}
++
++/* ---- arena ---- */
++
++static int arena_init(PVGExec *e)
++{
++    PVGGpu *g = e->gpu;
++    VkBufferCreateInfo bci = {
++        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = ARENA_SIZE,
++        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
++                 VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
++                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
++                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
++    };
++    VkMemoryRequirements req;
++    VkMemoryAllocateFlagsInfo flags = {
++        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
++        .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT,
++    };
++    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &flags };
++    VkBufferDeviceAddressInfo bdai = { .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
++    int mt;
++
++    if (vkCreateBuffer(g->device, &bci, NULL, &e->arena) != VK_SUCCESS) {
++        return -1;
++    }
++    vkGetBufferMemoryRequirements(g->device, e->arena, &req);
++    mt = pvg_gpu_memory_type(g, req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++    if (mt < 0) {
++        return -1;
++    }
++    mai.allocationSize = req.size;
++    mai.memoryTypeIndex = mt;
++    if (vkAllocateMemory(g->device, &mai, NULL, &e->arena_mem) != VK_SUCCESS ||
++        vkBindBufferMemory(g->device, e->arena, e->arena_mem, 0) != VK_SUCCESS ||
++        vkMapMemory(g->device, e->arena_mem, 0, ARENA_SIZE, 0, (void **)&e->arena_ptr) !=
++        VK_SUCCESS) {
++        return -1;
++    }
++    bdai.buffer = e->arena;
++    e->arena_addr = vkGetBufferDeviceAddress(g->device, &bdai);
++    return 0;
++}
++
++/* bump-allocate 'len' bytes (256-byte aligned); returns offset or UINT64_MAX */
++static uint64_t arena_alloc(PVGExec *e, uint64_t len)
++{
++    uint64_t off = (e->arena_used + 255) & ~255ull;
++
++    if (off + len > ARENA_SIZE - (1u << 20)) {     /* keep a guard zone at the end */
++        return UINT64_MAX;
++    }
++    e->arena_used = off + len;
++    return off;
++}
++
++/* ---- objects ---- */
++
++static uint8_t object(PVGExec *e, uint32_t task, uint32_t id, uint8_t *buf, uint32_t *len)
++{
++    *len = 0;
++    if (!id) {
++        return 0;
++    }
++    return e->host.object(e->host.opaque, task, id, buf, MAX_OBJ, len);
++}
++
++/* Upload a Metal buffer object into the arena once per command buffer; returns arena offset */
++static uint64_t buffer_upload(PVGExec *e, uint32_t task, uint32_t ref, uint64_t *size)
++{
++    uint8_t obj[MAX_OBJ];
++    uint32_t len;
++    gint64 key = key_of(task, ref);
++    gpointer v = g_hash_table_lookup(e->uploaded, &key);
++    uint64_t blen, off;
++
++    if (object(e, task, ref, obj, &len) != OBJ_BUFFER || len < 0x10) {
++        return UINT64_MAX;
++    }
++    blen = ldq(obj);
++    *size = blen;
++    if (v) {
++        return (uint64_t)(uintptr_t)v - 1;
++    }
++    if (blen > (64u << 20)) {
++        elog(e, "buffer %u too large (%" G_GUINT64_FORMAT ")", ref, blen);
++        return UINT64_MAX;
++    }
++    off = arena_alloc(e, blen);
++    if (off == UINT64_MAX ||
++        !e->host.read(e->host.opaque, task, (uint64_t)ldl(obj + 8) << 12, e->arena_ptr + off,
++                      blen)) {
++        return UINT64_MAX;
++    }
++    g_hash_table_insert(e->uploaded, key_new(task, ref), (gpointer)(uintptr_t)(off + 1));
++    e->stats.uploads++;
++    return off;
++}
++
++/* Resolve a texture object to its linear guest image */
++static bool guest_image(PVGExec *e, uint32_t task, uint32_t ref, GuestImage *gi)
++{
++    uint8_t obj[MAX_OBJ], bobj[MAX_OBJ];
++    uint32_t len, blen;
++    uint8_t type = object(e, task, ref, obj, &len);
++    const uint8_t *desc;
++
++    memset(gi, 0, sizeof(*gi));
++    if ((type == OBJ_TEXTURE_2 || type == OBJ_TEXTURE_3) && len >= 0x74) {
++        desc = obj + 0x54;
++        gi->task = task;
++        gi->va = ((uint64_t)ldl(obj + 8) << 12) + ldq(obj + 0x10);
++        gi->row_bytes = (uint32_t)ldq(obj + 0x34);
++        gi->width = ldl(obj + 0x3c);
++        gi->height = ldl(obj + 0x40);
++    } else if (type == OBJ_BACKING_REF_TEX && len >= 0x34) {
++        uint32_t bid = ldl(obj);
++
++        desc = obj + 0x14;
++        /* the backing lives in the kernel task (task 0) */
++        if (object(e, 0, bid, bobj, &blen) != OBJ_BACKING || blen < 0x24 || !ldl(bobj + 0x10)) {
++            return false;
++        }
++        gi->task = 0;
++        gi->va = ((uint64_t)ldl(bobj + 0x08) << 12) + ldl(bobj + 0x14);
++        gi->width = ldl(bobj + 0x18);
++        gi->height = ldl(bobj + 0x1c);
++        gi->row_bytes = ldl(bobj + 0x20) & 0xffffff;
++    } else {
++        return false;
++    }
++    gi->format = mtl_pixel_format(lduw(desc + 2), &gi->bpp, &gi->swizzle);
++    return gi->format != VK_FORMAT_UNDEFINED && gi->width && gi->height &&
++           gi->width <= 16384 && gi->height <= 16384 && gi->row_bytes >= gi->width * gi->bpp;
++}
++
++static HostImage *host_image(PVGExec *e, uint32_t task, uint32_t ref, const GuestImage *gi,
++                             bool render_target)
++{
++    PVGGpu *g = e->gpu;
++    gint64 key = key_of(task, ref);
++    HostImage *hi = g_hash_table_lookup(e->images, &key);
++    VkImageCreateInfo ici = {
++        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
++        .format = gi->format, .extent = { gi->width, gi->height, 1 }, .mipLevels = 1,
++        .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
++        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
++                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
++        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++    };
++    VkImageViewCreateInfo vci = {
++        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .viewType = VK_IMAGE_VIEW_TYPE_2D,
++        .format = gi->format, .components = gi->swizzle,
++        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
++    };
++    VkMemoryRequirements req;
++    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
++
++    (void)render_target;
++    if (hi && hi->format == gi->format && hi->width == gi->width && hi->height == gi->height) {
++        return hi;
++    }
++    if (hi) {
++        /* wrong size/format: the table's destroy notify frees the old image */
++        vkQueueWaitIdle(g->queue);
++        g_hash_table_remove(e->images, &key);
++    }
++    hi = g_new0(HostImage, 1);
++    if (vkCreateImage(g->device, &ici, NULL, &hi->image) != VK_SUCCESS) {
++        g_free(hi);
++        return NULL;
++    }
++    vkGetImageMemoryRequirements(g->device, hi->image, &req);
++    mai.allocationSize = req.size;
++    mai.memoryTypeIndex = pvg_gpu_memory_type(g, req.memoryTypeBits,
++                                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++    if (vkAllocateMemory(g->device, &mai, NULL, &hi->mem) != VK_SUCCESS) {
++        vkDestroyImage(g->device, hi->image, NULL);
++        g_free(hi);
++        return NULL;
++    }
++    vkBindImageMemory(g->device, hi->image, hi->mem, 0);
++    vci.image = hi->image;
++    vkCreateImageView(g->device, &vci, NULL, &hi->view);
++    hi->format = gi->format;
++    hi->width = gi->width;
++    hi->height = gi->height;
++    g_hash_table_insert(e->images, key_new(task, ref), hi);
++    return hi;
++}
++
++static void barrier(PVGExec *e, VkImage img, VkImageLayout from, VkImageLayout to);
++
++/* 1x1(x1) zero image for bindings we cannot serve yet, created on first use */
++static HostImage *dummy_image(PVGExec *e, int view)
++{
++    PVGGpu *g = e->gpu;
++    HostImage *hi = &e->dummy[view];
++    bool cube = view == VK_IMAGE_VIEW_TYPE_CUBE || view == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
++    VkImageCreateInfo ici = {
++        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++        .flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0,
++        .imageType = view == VK_IMAGE_VIEW_TYPE_1D || view == VK_IMAGE_VIEW_TYPE_1D_ARRAY ?
++                     VK_IMAGE_TYPE_1D : view == VK_IMAGE_VIEW_TYPE_3D ? VK_IMAGE_TYPE_3D :
++                     VK_IMAGE_TYPE_2D,
++        .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = { 1, 1, 1 }, .mipLevels = 1,
++        .arrayLayers = cube ? 6 : 1, .samples = VK_SAMPLE_COUNT_1_BIT,
++        .tiling = VK_IMAGE_TILING_OPTIMAL,
++        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++    };
++    VkImageViewCreateInfo vci = {
++        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .viewType = view,
++        .format = VK_FORMAT_R8G8B8A8_UNORM,
++        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, cube ? 6 : 1 },
++    };
++    VkMemoryRequirements req;
++    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
++    VkImageMemoryBarrier b = {
++        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, cube ? 6 : 1 },
++    };
++
++    if (hi->view) {
++        return hi;
++    }
++    if (!e->creating_dummies) {
++        return NULL;    /* created at init, outside any render pass */
++    }
++    if (vkCreateImage(g->device, &ici, NULL, &hi->image) != VK_SUCCESS) {
++        return NULL;
++    }
++    vkGetImageMemoryRequirements(g->device, hi->image, &req);
++    mai.allocationSize = req.size;
++    mai.memoryTypeIndex = pvg_gpu_memory_type(g, req.memoryTypeBits,
++                                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++    vkAllocateMemory(g->device, &mai, NULL, &hi->mem);
++    vkBindImageMemory(g->device, hi->image, hi->mem, 0);
++    vci.image = hi->image;
++    vkCreateImageView(g->device, &vci, NULL, &hi->view);
++    /* layout transition recorded into the segment's command buffer */
++    b.image = hi->image;
++    vkCmdPipelineBarrier(e->cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b);
++    return hi;
++}
++
++static void barrier(PVGExec *e, VkImage img, VkImageLayout from, VkImageLayout to)
++{
++    VkImageMemoryBarrier b = {
++        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
++        .oldLayout = from, .newLayout = to,
++        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .image = img, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
++    };
++
++    vkCmdPipelineBarrier(e->cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b);
++}
++
++/* guest linear rows → arena → image (left in 'final' layout) */
++static bool image_upload(PVGExec *e, const GuestImage *gi, HostImage *hi, VkImageLayout final)
++{
++    uint64_t size = (uint64_t)gi->row_bytes * gi->height, off = arena_alloc(e, size);
++    VkBufferImageCopy r = {
++        .bufferRowLength = gi->row_bytes / gi->bpp,
++        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++        .imageExtent = { gi->width, gi->height, 1 },
++    };
++
++    if (off == UINT64_MAX ||
++        !e->host.read(e->host.opaque, gi->task, gi->va, e->arena_ptr + off, size)) {
++        return false;
++    }
++    r.bufferOffset = off;
++    barrier(e, hi->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++    vkCmdCopyBufferToImage(e->cmd, e->arena, hi->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
++                           &r);
++    barrier(e, hi->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, final);
++    e->stats.uploads++;
++    return true;
++}
++
++/* ---- pipelines ---- */
++
++typedef struct PlEntry {
++    uint8_t key, len;
++    const uint8_t *val;
++} PlEntry;
++
++/* SerializedCompactPropertyList: u8 count, {u8 key, u8 len, value}* */
++static int plist(const uint8_t *base, uint32_t off, uint32_t end, PlEntry *out, int max)
++{
++    int n, k = 0;
++    uint32_t p = off + 1;
++
++    if (off >= end) {
++        return 0;
++    }
++    n = base[off];
++    for (int i = 0; i < n && k < max && p + 2 <= end; i++) {
++        out[k].key = base[p];
++        out[k].len = base[p + 1];
++        out[k].val = base + p + 2;
++        if (p + 2 + out[k].len > end) {
++            break;
++        }
++        p += 2 + out[k].len;
++        k++;
++    }
++    return k;
++}
++
++static uint32_t plval(const PlEntry *en)
++{
++    uint32_t v = 0;
++
++    memcpy(&v, en->val, en->len < 4 ? en->len : 4);
++    return v;
++}
++
++/* nested object list at 'off' (relative to base): u32 count, u32 offsets[] relative to the list */
++static int objlist(const uint8_t *base, uint32_t off, uint32_t end, uint32_t *offs, int max)
++{
++    uint32_t n;
++
++    if (off + 4 > end) {
++        return 0;
++    }
++    n = ldl(base + off);
++    for (uint32_t i = 0; i < n && (int)i < max && off + 8 + 4 * i <= end; i++) {
++        offs[i] = off + ldl(base + off + 4 + 4 * i);
++    }
++    return n < (uint32_t)max ? (int)n : max;
++}
++
++static uint32_t *function_spirv(PVGExec *e, uint32_t task, uint32_t fn, A2SResult *r)
++{
++    uint8_t obj[MAX_OBJ];
++    uint32_t len;
++    uint64_t lib_va;
++    uint32_t lib_len;
++    g_autofree uint8_t *lib = NULL;
++    const void *bc;
++    size_t bclen;
++
++    if (object(e, task, fn, obj, &len) != OBJ_FUNCTION || len < 12) {
++        elog(e, "task %u: object %u is not a function", task, fn);
++        return NULL;
++    }
++    lib_va = ldq(obj);
++    lib_len = ldl(obj + 8);
++    if (!lib_len || lib_len > (8u << 20)) {
++        return NULL;
++    }
++    lib = g_malloc(lib_len);
++    if (!e->host.read(e->host.opaque, task, lib_va, lib, lib_len) ||
++        !(bc = air2spv_metallib_bitcode(lib, lib_len, &bclen))) {
++        elog(e, "task %u: function %u: no metallib", task, fn);
++        return NULL;
++    }
++    if (air2spv_translate(bc, bclen, r)) {
++        elog(e, "task %u: function %u: %s", task, fn, r->error);
++        return NULL;
++    }
++    if (e->dump_dir) {
++        g_autofree char *path = g_strdup_printf("%s/fn-t%u-%u-%s.metallib", e->dump_dir, task,
++                                                fn, r->entry);
++
++        g_file_set_contents(path, (const char *)lib, lib_len, NULL);
++    }
++    return r->spirv;
++}
++
++static VkShaderModule shader_module(PVGExec *e, const A2SResult *r)
++{
++    VkShaderModuleCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
++                                    .codeSize = r->nwords * 4, .pCode = r->spirv };
++    VkShaderModule m = VK_NULL_HANDLE;
++
++    vkCreateShaderModule(e->gpu->device, &ci, NULL, &m);
++    return m;
++}
++
++static Pipeline *pipeline_get(PVGExec *e, uint32_t task, uint32_t ref, VkFormat target_format)
++{
++    PVGGpu *g = e->gpu;
++    gint64 key = key_of(task, ref);
++    Pipeline *p = g_hash_table_lookup(e->pipelines, &key);
++    uint8_t obj[MAX_OBJ];
++    uint32_t len, plen, vs_fn = 0, fs_fn = 0, vd_off = 0, ca_off = 0;
++    const uint8_t *pl;
++    PlEntry ents[64];
++    int n;
++    A2SResult vs = { 0 }, fs = { 0 };
++    VkShaderModule vsm = VK_NULL_HANDLE, fsm = VK_NULL_HANDLE;
++    VkVertexInputBindingDescription vbind[MAX_SLOTS];
++    VkVertexInputAttributeDescription vattr[MAX_SLOTS];
++    uint32_t nbind = 0, nattr = 0;
++    VkPipelineColorBlendAttachmentState blend = {
++        .colorWriteMask = 0xf, .srcColorBlendFactor = VK_BLEND_FACTOR_ONE,
++        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
++    };
++    VkDescriptorSetLayoutBinding dsb[64];
++    uint32_t ndsb = 0;
++
++    if (p) {
++        return p;
++    }
++    p = g_new0(Pipeline, 1);
++    g_hash_table_insert(e->pipelines, key_new(task, ref), p);
++    e->stats.pipelines++;
++
++    if (object(e, task, ref, obj, &len) != OBJ_SERIALIZED || len < 16 ||
++        ldl(obj) != SER_RENDER_PIPELINE) {
++        elog(e, "task %u: object %u is not a render pipeline", task, ref);
++        goto fail;
++    }
++    plen = MIN(ldl(obj + 12), MIN(len, MAX_OBJ) - 16);
++    pl = obj + 16;
++    n = plist(pl, 0, plen, ents, G_N_ELEMENTS(ents));
++    for (int i = 0; i < n; i++) {
++        switch (ents[i].key) {
++        case 1: vs_fn = plval(&ents[i]); break;
++        case 2: fs_fn = plval(&ents[i]); break;
++        case 3: vd_off = plval(&ents[i]); break;
++        case 8: ca_off = plval(&ents[i]); break;
++        }
++    }
++    /* colour attachment 0 state */
++    if (ca_off) {
++        uint32_t offs[8];
++        int na = objlist(pl, ca_off, plen, offs, 8);
++
++        for (int a = 0; a < na; a++) {
++            PlEntry ce[16];
++            int nc = plist(pl, offs[a], plen, ce, 16), index = 0;
++            VkPipelineColorBlendAttachmentState st = blend;
++
++            uint32_t fmt = 0;
++
++            for (int i = 0; i < nc; i++) {
++                uint32_t v = plval(&ce[i]);
++
++                switch (ce[i].key) {
++                case 0: index = v; break;
++                case 1: fmt = v; break;
++                case 2: st.blendEnable = v & 1; break;
++                case 3: st.srcColorBlendFactor = mtl_blend_factor(v); break;
++                case 4: st.dstColorBlendFactor = mtl_blend_factor(v); break;
++                case 5: st.colorBlendOp = (VkBlendOp)v; break;
++                case 6: st.srcAlphaBlendFactor = mtl_blend_factor(v); break;
++                case 7: st.dstAlphaBlendFactor = mtl_blend_factor(v); break;
++                case 8: st.alphaBlendOp = (VkBlendOp)v; break;
++                case 9:     /* Metal R=8 G=4 B=2 A=1 → Vulkan R=1 G=2 B=4 A=8 */
++                    st.colorWriteMask = (v & 8 ? 1 : 0) | (v & 4 ? 2 : 0) | (v & 2 ? 4 : 0) |
++                                        (v & 1 ? 8 : 0);
++                    break;
++                }
++            }
++            if (index == 0) {
++                uint32_t bpp;
++                VkComponentMapping swz;
++
++                blend = st;
++                p->color_format = mtl_pixel_format(fmt, &bpp, &swz);
++            }
++        }
++    }
++    /* vertex descriptor: attributes (index, format, offset, buffer) and layouts (step, stride) */
++    if (vd_off) {
++        PlEntry vde[4];
++        int nv = plist(pl, vd_off, plen, vde, 4);
++        uint32_t attr_off = 0, lay_off = 0, offs[MAX_SLOTS], strides[32] = { 0 }, steps[32] = { 0 };
++
++        for (int i = 0; i < nv; i++) {
++            if (vde[i].key == 0) {
++                attr_off = vd_off + plval(&vde[i]);
++            } else if (vde[i].key == 1) {
++                lay_off = vd_off + plval(&vde[i]);
++            }
++        }
++        if (lay_off) {
++            int nl = objlist(pl, lay_off, plen, offs, MAX_SLOTS);
++
++            for (int l = 0; l < nl; l++) {
++                PlEntry le[8];
++                int ne = plist(pl, offs[l], plen, le, 8);
++
++                for (int i = 0; i < ne; i++) {
++                    if (le[i].key == 0) {
++                        steps[l] = plval(&le[i]);
++                    } else if (le[i].key == 3) {
++                        strides[l] = plval(&le[i]);
++                    }
++                }
++            }
++        }
++        if (attr_off) {
++            int na = objlist(pl, attr_off, plen, offs, MAX_SLOTS);
++
++            for (int a = 0; a < na; a++) {
++                PlEntry ae[8];
++                int ne = plist(pl, offs[a], plen, ae, 8);
++                uint32_t idx = 0, fmt = 0, aoff = 0, buf = 0;
++
++                for (int i = 0; i < ne; i++) {
++                    uint32_t v = plval(&ae[i]);
++
++                    switch (ae[i].key) {
++                    case 0: idx = v; break;
++                    case 1: fmt = v; break;
++                    case 2: aoff = v; break;
++                    case 3: buf = v; break;
++                    }
++                }
++                if (!fmt || buf >= MAX_SLOTS) {
++                    continue;
++                }
++                vattr[nattr++] = (VkVertexInputAttributeDescription){
++                    .location = idx, .binding = buf, .format = mtl_vertex_format(fmt),
++                    .offset = aoff };
++                if (!(p->vertex_bindings & (1u << buf))) {
++                    p->vertex_bindings |= 1u << buf;
++                    vbind[nbind++] = (VkVertexInputBindingDescription){
++                        .binding = buf, .stride = strides[buf],
++                        .inputRate = steps[buf] == 2 ? VK_VERTEX_INPUT_RATE_INSTANCE :
++                                                       VK_VERTEX_INPUT_RATE_VERTEX };
++                }
++            }
++        }
++    }
++
++    if (p->color_format == VK_FORMAT_UNDEFINED) {
++        p->color_format = target_format;
++    }
++
++    /* shaders: vertex first, then fragment with the vertex stage's varying names */
++    vs.push_base = 0;
++    if (!vs_fn || !fs_fn || !function_spirv(e, task, vs_fn, &vs)) {
++        goto fail;
++    }
++    fs.push_base = PUSH_FRAGMENT_BASE;
++    fs.nvaryings = vs.nvaryings;
++    memcpy(fs.varyings, vs.varyings, sizeof(vs.varyings));
++    if (!function_spirv(e, task, fs_fn, &fs)) {
++        goto fail;
++    }
++    p->vs_buffers = vs.buffer_mask;
++    p->fs_buffers = fs.buffer_mask;
++    p->vs_textures = vs.texture_mask;
++    p->fs_textures = fs.texture_mask;
++    for (int i = 0; i < 32; i++) {
++        p->texture_view[i] = (fs.texture_mask & (1u << i)) ? fs.texture_view[i] :
++                             vs.texture_view[i];
++    }
++    p->vs_samplers = vs.sampler_mask;
++    p->fs_samplers = fs.sampler_mask;
++    p->vs_const_samplers = vs.nconst_samplers;
++    p->fs_const_samplers = fs.nconst_samplers;
++    p->push_size = MAX(MAX(vs.push_size, fs.push_size), 4);
++    vsm = shader_module(e, &vs);
++    fsm = shader_module(e, &fs);
++    if (!vsm || !fsm) {
++        elog(e, "task %u pipeline %u: shader module creation failed", task, ref);
++        goto fail;
++    }
++
++    /* descriptor layout: union of both stages' textures and samplers */
++    for (int i = 0; i < 32; i++) {
++        if ((p->vs_textures | p->fs_textures) & (1u << i)) {
++            dsb[ndsb++] = (VkDescriptorSetLayoutBinding){
++                .binding = A2S_TEXTURE_BINDING + i,
++                .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .descriptorCount = 1,
++                .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS };
++        }
++        if ((p->vs_samplers | p->fs_samplers) & (1u << i)) {
++            dsb[ndsb++] = (VkDescriptorSetLayoutBinding){
++                .binding = A2S_SAMPLER_BINDING + i,
++                .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER, .descriptorCount = 1,
++                .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS };
++        }
++    }
++    for (int i = 0; i < MAX(p->vs_const_samplers, p->fs_const_samplers); i++) {
++        dsb[ndsb++] = (VkDescriptorSetLayoutBinding){
++            .binding = A2S_CONST_SAMPLER_BINDING + i,
++            .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER, .descriptorCount = 1,
++            .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS };
++    }
++    {
++        VkDescriptorSetLayoutCreateInfo dci = {
++            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
++            .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
++            .bindingCount = ndsb, .pBindings = dsb };
++        VkPushConstantRange pcr = { VK_SHADER_STAGE_ALL_GRAPHICS, 0, (p->push_size + 3) & ~3u };
++        VkPipelineLayoutCreateInfo lci = {
++            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
++            .pSetLayouts = &p->dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr };
++
++        if (vkCreateDescriptorSetLayout(g->device, &dci, NULL, &p->dsl) != VK_SUCCESS ||
++            vkCreatePipelineLayout(g->device, &lci, NULL, &p->layout) != VK_SUCCESS) {
++            goto fail;
++        }
++    }
++    {
++        VkPipelineShaderStageCreateInfo stages[2] = {
++            { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
++              .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vsm, .pName = "main" },
++            { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
++              .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fsm, .pName = "main" },
++        };
++        VkPipelineVertexInputStateCreateInfo vi = {
++            .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
++            .vertexBindingDescriptionCount = nbind, .pVertexBindingDescriptions = vbind,
++            .vertexAttributeDescriptionCount = nattr, .pVertexAttributeDescriptions = vattr };
++        VkPipelineInputAssemblyStateCreateInfo ia = {
++            .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
++            .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
++        VkPipelineViewportStateCreateInfo vp = {
++            .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
++            .viewportCount = 1, .scissorCount = 1 };
++        VkPipelineRasterizationStateCreateInfo rs = {
++            .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
++            .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE,
++            .frontFace = VK_FRONT_FACE_CLOCKWISE, .lineWidth = 1.0f };
++        VkPipelineMultisampleStateCreateInfo ms = {
++            .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
++            .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
++        VkPipelineDepthStencilStateCreateInfo ds = {
++            .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
++        VkPipelineColorBlendStateCreateInfo cb = {
++            .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
++            .attachmentCount = 1, .pAttachments = &blend };
++        VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
++                                 VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
++                                 VK_DYNAMIC_STATE_BLEND_CONSTANTS };
++        VkPipelineDynamicStateCreateInfo dy = {
++            .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
++            .dynamicStateCount = G_N_ELEMENTS(dyn), .pDynamicStates = dyn };
++        VkPipelineRenderingCreateInfo ri = {
++            .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
++            .colorAttachmentCount = 1, .pColorAttachmentFormats = &p->color_format };
++        VkGraphicsPipelineCreateInfo gci = {
++            .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri,
++            .stageCount = 2, .pStages = stages, .pVertexInputState = &vi,
++            .pInputAssemblyState = &ia, .pViewportState = &vp, .pRasterizationState = &rs,
++            .pMultisampleState = &ms, .pDepthStencilState = &ds, .pColorBlendState = &cb,
++            .pDynamicState = &dy, .layout = p->layout };
++
++        if (vkCreateGraphicsPipelines(g->device, VK_NULL_HANDLE, 1, &gci, NULL, &p->pipe) !=
++            VK_SUCCESS) {
++            elog(e, "task %u pipeline %u: vkCreateGraphicsPipelines failed", task, ref);
++            goto fail;
++        }
++    }
++    vkDestroyShaderModule(g->device, vsm, NULL);
++    vkDestroyShaderModule(g->device, fsm, NULL);
++    free(vs.spirv);
++    free(fs.spirv);
++    p->ok = true;
++    elog(e, "task %u pipeline %u: vertex %s / fragment %s (bufs %#x/%#x tex %#x)", task, ref,
++         vs.entry, fs.entry, p->vs_buffers, p->fs_buffers, p->fs_textures);
++    return p;
++fail:
++    if (vsm) {
++        vkDestroyShaderModule(g->device, vsm, NULL);
++    }
++    if (fsm) {
++        vkDestroyShaderModule(g->device, fsm, NULL);
++    }
++    free(vs.spirv);
++    free(fs.spirv);
++    e->stats.pipeline_failures++;
++    return p;
++}
++
++/* ---- render segments ---- */
++
++typedef struct RenderState {
++    uint32_t pipeline;
++    Binding vbuf[MAX_SLOTS], fbuf[MAX_SLOTS];
++    uint32_t ftex[MAX_SLOTS], vtex[MAX_SLOTS];
++    VkViewport viewport;
++    VkRect2D scissor;
++    bool have_viewport, have_scissor;
++} RenderState;
++
++static void set_bindings(Binding *b, const uint8_t *a, uint32_t alen)
++{
++    uint32_t start = ldl(a), n = ldl(a + 4);
++
++    for (uint32_t i = 0; i < n && 8 + 12 * (i + 1) <= alen; i++) {
++        if (start + i < MAX_SLOTS) {
++            b[start + i].ref = ldl(a + 8 + 12 * i);
++            b[start + i].offset = ldq(a + 8 + 12 * i + 4);
++        }
++    }
++}
++
++static void set_refs(uint32_t *r, const uint8_t *a, uint32_t alen)
++{
++    uint32_t start = ldl(a), n = ldl(a + 4);
++
++    for (uint32_t i = 0; i < n && 8 + 4 * (i + 1) <= alen; i++) {
++        if (start + i < MAX_SLOTS) {
++            r[start + i] = ldl(a + 8 + 4 * i);
++        }
++    }
++}
++
++static double ldd(const uint8_t *p)
++{
++    double d;
++
++    memcpy(&d, p, 8);
++    return d;
++}
++
++static bool bind_and_push(PVGExec *e, uint32_t task, RenderState *st, Pipeline *p,
++                          HostImage **tex_images)
++{
++    uint8_t pc[256] = { 0 };
++    VkWriteDescriptorSet w[64];
++    VkDescriptorImageInfo ii[64];
++    uint32_t nw = 0;
++
++    for (int i = 0; i < MAX_SLOTS; i++) {
++        uint64_t size, off;
++
++        if (p->vs_buffers & (1u << i)) {
++            off = buffer_upload(e, task, st->vbuf[i].ref, &size);
++            if (off == UINT64_MAX || st->vbuf[i].offset >= size) {
++                return false;   /* never hand the GPU an address outside the arena copy */
++            }
++            stq(pc + 8 * i, e->arena_addr + off + st->vbuf[i].offset);
++        }
++        if (p->fs_buffers & (1u << i)) {
++            off = buffer_upload(e, task, st->fbuf[i].ref, &size);
++            if (off == UINT64_MAX || st->fbuf[i].offset >= size) {
++                return false;
++            }
++            stq(pc + PUSH_FRAGMENT_BASE + 8 * i, e->arena_addr + off + st->fbuf[i].offset);
++        }
++        if (p->vertex_bindings & (1u << i)) {
++            VkDeviceSize vo;
++
++            off = buffer_upload(e, task, st->vbuf[i].ref, &size);
++            if (off == UINT64_MAX || st->vbuf[i].offset >= size) {
++                return false;
++            }
++            vo = off + st->vbuf[i].offset;
++            vkCmdBindVertexBuffers(e->cmd, i, 1, &e->arena, &vo);
++        }
++    }
++    vkCmdPushConstants(e->cmd, p->layout, VK_SHADER_STAGE_ALL_GRAPHICS, 0,
++                       (p->push_size + 3) & ~3u, pc);
++
++    for (int i = 0; i < 32; i++) {
++        if ((p->vs_textures | p->fs_textures) & (1u << i)) {
++            HostImage *img = p->texture_view[i] == VK_IMAGE_VIEW_TYPE_2D ? tex_images[i] : NULL;
++
++            if (!img) {
++                img = dummy_image(e, p->texture_view[i]);
++                if (!img) {
++                    return false;
++                }
++            }
++            ii[nw] = (VkDescriptorImageInfo){ .imageView = img->view,
++                .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
++            w[nw] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
++                .dstBinding = A2S_TEXTURE_BINDING + i, .descriptorCount = 1,
++                .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .pImageInfo = &ii[nw] };
++            nw++;
++        }
++        if ((p->vs_samplers | p->fs_samplers) & (1u << i)) {
++            ii[nw] = (VkDescriptorImageInfo){ .sampler = e->sampler };
++            w[nw] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
++                .dstBinding = A2S_SAMPLER_BINDING + i, .descriptorCount = 1,
++                .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER, .pImageInfo = &ii[nw] };
++            nw++;
++        }
++    }
++    for (int i = 0; i < MAX(p->vs_const_samplers, p->fs_const_samplers); i++) {
++        ii[nw] = (VkDescriptorImageInfo){ .sampler = e->sampler };
++        w[nw] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
++            .dstBinding = A2S_CONST_SAMPLER_BINDING + i, .descriptorCount = 1,
++            .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER, .pImageInfo = &ii[nw] };
++        nw++;
++    }
++    if (nw) {
++        e->push_descriptor(e->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->layout, 0, nw, w);
++    }
++    return true;
++}
++
++static bool submit_wait(PVGExec *e, const VkSubmitInfo *si)
++{
++    VkDevice d = e->gpu->device;
++    VkResult r;
++
++    if (e->dry_run) {
++        return false;
++    }
++    r = vkQueueSubmit(e->gpu->queue, 1, si, e->fence);
++
++    if (r == VK_SUCCESS) {
++        r = vkWaitForFences(d, 1, &e->fence, VK_TRUE, 2000000000ull);
++    }
++    if (r != VK_SUCCESS) {
++        /* the host GPU also drives the host desktop: never risk a second hang */
++        e->disabled = true;
++        elog(e, "GPU submit failed (VkResult %d): executor disabled", r);
++        return false;
++    }
++    vkResetFences(d, 1, &e->fence);
++    return true;
++}
++
++static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uint32_t len)
++{
++    RenderState st = { 0 };
++    GuestImage target;
++    HostImage *timg = NULL;
++    uint32_t off = 0, target_ref = 0, load = 0, store = 0;
++    double clear[4] = { 0 };
++    bool rendering = false;
++    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
++    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
++                        .pCommandBuffers = &e->cmd };
++    uint64_t wb_off = UINT64_MAX;
++    Pipeline *bound = NULL;
++
++    e->stats.segments++;
++    /* the render pass descriptor comes first */
++    while (off + 8 <= len) {
++        uint32_t id = ldl(p + off), clen = ldl(p + off + 4);
++
++        if (clen < 8 || off + clen > len) {
++            return;
++        }
++        off += clen;
++        if (id == 0x1a) {
++            const uint8_t *a = p + off - clen + 8;
++
++            if (clen - 8 < (19 + 15) * 4) {
++                return;
++            }
++            target_ref = ldl(a + 19 * 4);
++            load = lduw(a + 24 * 4);
++            store = lduw(a + 24 * 4 + 2);
++            for (int i = 0; i < 4; i++) {
++                clear[i] = ldd(a + 26 * 4 + 8 * i);
++            }
++            break;
++        }
++        if (id < 0x1e || id > 0x24) {
++            return;     /* continuation segment or unexpected: not handled in v0 */
++        }
++    }
++    if (!target_ref || !guest_image(e, task, target_ref, &target)) {
++        return;
++    }
++    e->stats.render_passes++;
++
++    vkResetCommandBuffer(e->cmd, 0);
++    vkBeginCommandBuffer(e->cmd, &bi);
++
++    /* prepass: upload every texture this segment samples, once */
++    {
++        uint32_t done[64], ndone = 0;
++
++        for (uint32_t o = off; o + 8 <= len;) {
++            uint32_t id = ldl(p + o), clen = ldl(p + o + 4);
++            uint32_t refs[MAX_SLOTS] = { 0 };
++
++            if (clen < 8 || o + clen > len) {
++                break;
++            }
++            if (id == 0x72) {
++                set_refs(refs, p + o + 8, clen - 8);
++                for (int i = 0; i < MAX_SLOTS; i++) {
++                    GuestImage gi;
++                    HostImage *hi;
++                    bool seen = false;
++
++                    if (!refs[i] || refs[i] == target_ref) {
++                        continue;
++                    }
++                    for (uint32_t k = 0; k < ndone; k++) {
++                        seen |= done[k] == refs[i];
++                    }
++                    if (seen || ndone == G_N_ELEMENTS(done) ||
++                        !guest_image(e, task, refs[i], &gi)) {
++                        continue;
++                    }
++                    done[ndone++] = refs[i];
++                    hi = host_image(e, task, refs[i], &gi, false);
++                    if (hi) {
++                        image_upload(e, &gi, hi, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++                    }
++                }
++            }
++            o += clen;
++        }
++    }
++
++    timg = host_image(e, task, target_ref, &target, true);
++    if (!timg) {
++        vkEndCommandBuffer(e->cmd);
++        return;
++    }
++    if (load == 1) {
++        image_upload(e, &target, timg, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++    } else {
++        barrier(e, timg->image, VK_IMAGE_LAYOUT_UNDEFINED,
++                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++    }
++    {
++        VkRenderingAttachmentInfo ca = {
++            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = timg->view,
++            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++            .loadOp = load == 2 ? VK_ATTACHMENT_LOAD_OP_CLEAR :
++                      load == 1 ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
++            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
++            .clearValue.color.float32 = { clear[0], clear[1], clear[2], clear[3] },
++        };
++        VkRenderingInfo ri = {
++            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
++            .renderArea = { { 0, 0 }, { target.width, target.height } }, .layerCount = 1,
++            .colorAttachmentCount = 1, .pColorAttachments = &ca,
++        };
++
++        vkCmdBeginRendering(e->cmd, &ri);
++        rendering = true;
++    }
++    st.viewport = (VkViewport){ 0, (float)target.height, (float)target.width,
++                                -(float)target.height, 0, 1 };
++    st.scissor = (VkRect2D){ { 0, 0 }, { target.width, target.height } };
++
++    while (off + 8 <= len) {
++        uint32_t id = ldl(p + off), clen = ldl(p + off + 4);
++        const uint8_t *a = p + off + 8;
++        uint32_t alen = clen - 8;
++
++        if (clen < 8 || off + clen > len) {
++            break;
++        }
++        off += clen;
++        switch (id) {
++        case 0x74:
++            st.pipeline = alen >= 4 ? ldl(a) : 0;
++            bound = NULL;
++            break;
++        case 0x7d: set_bindings(st.vbuf, a, alen); break;
++        case 0x6e: set_bindings(st.fbuf, a, alen); break;
++        case 0x7e:      /* SetVertexBufferOffset {u32 index, u64 offset} */
++            if (alen >= 12 && ldl(a) < MAX_SLOTS) {
++                st.vbuf[ldl(a)].offset = ldq(a + 4);
++            }
++            break;
++        case 0x6f:      /* SetFragmentBufferOffset {u32 index, u64 offset} */
++            if (alen >= 12 && ldl(a) < MAX_SLOTS) {
++                st.fbuf[ldl(a)].offset = ldq(a + 4);
++            }
++            break;
++        case 0x72: set_refs(st.ftex, a, alen); break;
++        case 0x82:      /* SetViewport: 6 doubles */
++            if (alen >= 48) {
++                double x = ldd(a), y = ldd(a + 8), w = ldd(a + 16), h = ldd(a + 24);
++
++                st.viewport = (VkViewport){ x, y + h, w, -h, ldd(a + 32), ldd(a + 40) };
++            }
++            break;
++        case 0x75:      /* SetScissorRect: 4 x u64 */
++            if (alen >= 32) {
++                st.scissor = (VkRect2D){ { (int32_t)ldq(a), (int32_t)ldq(a + 8) },
++                                         { (uint32_t)ldq(a + 16), (uint32_t)ldq(a + 24) } };
++            }
++            break;
++        case 0x01: case 0x07: case 0x03: case 0x09: {
++            /* Draw[Indexed][Instanced]Primitives16 */
++            bool indexed = id == 0x07 || id == 0x09, inst = id == 0x03 || id == 0x09;
++            uint32_t prim = alen >= 4 ? ldl(a) : 3, count, first = 0, instances = 1;
++            Pipeline *pp;
++            HostImage *draw_tex[32] = { NULL };
++            uint32_t ib = 0, ib_off = 0;
++
++            if (indexed) {
++                ib = ldl(a + 4);
++                count = ldl(a + 8) & 0xffff;
++                ib_off = ldl(a + 8) >> 16;
++                instances = inst && alen >= 16 ? ldl(a + 12) : 1;
++            } else {
++                first = ldl(a + 4) & 0xffff;
++                count = ldl(a + 4) >> 16;
++                instances = inst && alen >= 12 ? ldl(a + 8) : 1;
++            }
++            pp = st.pipeline ? pipeline_get(e, task, st.pipeline, target.format) : NULL;
++            if (count > (1u << 20) || instances > 4096) {
++                elog(e, "task %u draw 0x%x: count %u instances %u: skipped", task, id, count,
++                     instances);
++                e->stats.skipped_draws++;
++                break;
++            }
++            if (pp && pp->draws_logged < 3) {
++                pp->draws_logged++;
++                elog(e, "task %u pipeline %u draw 0x%x prim %u count %u first %u inst %u "
++                     "ib %u+%u target %ux%u", task, st.pipeline, id, prim, count, first,
++                     instances, ib, ib_off, target.width, target.height);
++            }
++            for (int i = 0; i < MAX_SLOTS; i++) {
++                if (st.ftex[i] && st.ftex[i] != target_ref) {
++                    gint64 key = key_of(task, st.ftex[i]);
++
++                    draw_tex[i] = g_hash_table_lookup(e->images, &key);
++                }
++            }
++            if (pp && pp->ok && pp->color_format != target.format) {
++                elog(e, "task %u pipeline %u: format %d vs target %d", task, st.pipeline,
++                     pp->color_format, target.format);
++                pp = NULL;
++            }
++            if (!pp || !pp->ok || !bind_and_push(e, task, &st, pp, draw_tex)) {
++                e->stats.skipped_draws++;
++                break;
++            }
++            if (bound != pp) {
++                vkCmdBindPipeline(e->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pipe);
++                bound = pp;
++            }
++            vkCmdSetViewport(e->cmd, 0, 1, &st.viewport);
++            vkCmdSetScissor(e->cmd, 0, 1, &st.scissor);
++            vkCmdSetPrimitiveTopology(e->cmd, mtl_topology(prim));
++            if (indexed) {
++                uint64_t size, io = buffer_upload(e, task, ib, &size);
++
++                if (io == UINT64_MAX || ib_off + 2ull * count > size) {
++                    e->stats.skipped_draws++;
++                    break;
++                }
++                vkCmdBindIndexBuffer(e->cmd, e->arena, io + ib_off, VK_INDEX_TYPE_UINT16);
++                vkCmdDrawIndexed(e->cmd, count, instances, 0, 0, 0);
++            } else {
++                vkCmdDraw(e->cmd, count, instances, first, 0);
++            }
++            e->stats.draws++;
++            break;
++        }
++        default:
++            break;
++        }
++    }
++    if (rendering) {
++        vkCmdEndRendering(e->cmd);
++    }
++    if (store == 1) {
++        uint64_t size = (uint64_t)target.row_bytes * target.height;
++        VkBufferImageCopy r = {
++            .bufferRowLength = target.row_bytes / target.bpp,
++            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++            .imageExtent = { target.width, target.height, 1 },
++        };
++
++        wb_off = arena_alloc(e, size);
++        if (wb_off != UINT64_MAX) {
++            r.bufferOffset = wb_off;
++            barrier(e, timg->image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++            vkCmdCopyImageToBuffer(e->cmd, timg->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                                   e->arena, 1, &r);
++        }
++    }
++    vkEndCommandBuffer(e->cmd);
++    if (!submit_wait(e, &si)) {
++        return;
++    }
++    if (wb_off != UINT64_MAX) {
++        e->host.write(e->host.opaque, target.task, target.va, e->arena_ptr + wb_off,
++                      (uint64_t)target.row_bytes * target.height);
++        e->stats.writebacks++;
++    }
++}
++
++void pvg_exec_cmdbuf(PVGExec *e, uint32_t task, const uint8_t *buf, uint64_t len)
++{
++    uint64_t off = 0;
++
++    if (e->disabled) {
++        return;
++    }
++    e->arena_used = 0;
++    g_hash_table_remove_all(e->uploaded);
++    while (off + 8 <= len && !e->disabled) {
++        uint32_t seglen = ldl(buf + off);
++        uint8_t enc = buf[off + 4];
++
++        if (seglen < 8 || off + seglen > len) {
++            return;
++        }
++        if (enc == 0 && !buf[off + 5]) {
++            exec_render_segment(e, task, buf + off + 8, seglen - 8);
++            /* a segment's uploads are only valid until its submit completed */
++            e->arena_used = 0;
++            g_hash_table_remove_all(e->uploaded);
++        }
++        off += seglen;
++    }
++}
++
++static gboolean match_task(gpointer key, gpointer value, gpointer task)
++{
++    return (uint32_t)(*(gint64 *)key >> 32) == GPOINTER_TO_UINT(task);
++}
++
++void pvg_exec_task_reset(PVGExec *e, uint32_t task)
++{
++    vkQueueWaitIdle(e->gpu->queue);
++    g_hash_table_foreach_remove(e->images, match_task, GUINT_TO_POINTER(task));
++    g_hash_table_foreach_remove(e->pipelines, match_task, GUINT_TO_POINTER(task));
++}
++
++void pvg_exec_set_dry_run(PVGExec *e, bool dry)
++{
++    e->dry_run = dry;
++}
++
++void pvg_exec_set_dump_dir(PVGExec *e, const char *dir)
++{
++    g_free(e->dump_dir);
++    e->dump_dir = g_strdup(dir);
++}
++
++const PVGExecStats *pvg_exec_stats(PVGExec *e)
++{
++    return &e->stats;
++}
++
++static PVGExec *free_ctx;
++
++static void image_free(gpointer v)
++{
++    HostImage *hi = v;
++    VkDevice d = free_ctx->gpu->device;
++
++    vkDestroyImageView(d, hi->view, NULL);
++    vkDestroyImage(d, hi->image, NULL);
++    vkFreeMemory(d, hi->mem, NULL);
++    g_free(hi);
++}
++
++static void pipeline_free(gpointer v)
++{
++    Pipeline *p = v;
++    VkDevice d = free_ctx->gpu->device;
++
++    if (p->pipe) {
++        vkDestroyPipeline(d, p->pipe, NULL);
++    }
++    if (p->layout) {
++        vkDestroyPipelineLayout(d, p->layout, NULL);
++    }
++    if (p->dsl) {
++        vkDestroyDescriptorSetLayout(d, p->dsl, NULL);
++    }
++    g_free(p);
++}
++
++PVGExec *pvg_exec_new(PVGGpu *gpu, const PVGExecHost *host)
++{
++    PVGExec *e = g_new0(PVGExec, 1);
++    VkSamplerCreateInfo sci = {
++        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_LINEAR,
++        .minFilter = VK_FILTER_LINEAR, .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
++        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
++        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
++        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .maxLod = VK_LOD_CLAMP_NONE,
++    };
++    VkCommandBufferAllocateInfo cai = {
++        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = gpu->pool,
++        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1,
++    };
++
++    e->gpu = gpu;
++    e->host = *host;
++    free_ctx = e;
++    e->images = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, image_free);
++    e->pipelines = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, pipeline_free);
++    e->uploaded = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
++    e->push_descriptor = (PFN_vkCmdPushDescriptorSetKHR)
++        vkGetDeviceProcAddr(gpu->device, "vkCmdPushDescriptorSetKHR");
++    if (!e->push_descriptor || arena_init(e) ||
++        vkCreateSampler(gpu->device, &sci, NULL, &e->sampler) != VK_SUCCESS ||
++        vkAllocateCommandBuffers(gpu->device, &cai, &e->cmd) != VK_SUCCESS ||
++        vkCreateFence(gpu->device, &(VkFenceCreateInfo){
++            .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO }, NULL, &e->fence) != VK_SUCCESS) {
++        pvg_exec_free(e);
++        return NULL;
++    }
++    {
++        VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++                                        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
++        VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
++                            .pCommandBuffers = &e->cmd };
++
++        vkBeginCommandBuffer(e->cmd, &bi);
++        e->creating_dummies = true;
++        for (int v = 0; v < 7; v++) {
++            dummy_image(e, v);
++        }
++        e->creating_dummies = false;
++        vkEndCommandBuffer(e->cmd);
++        submit_wait(e, &si);
++    }
++    return e;
++}
++
++void pvg_exec_free(PVGExec *e)
++{
++    VkDevice d = e->gpu->device;
++
++    vkDeviceWaitIdle(d);
++    free_ctx = e;
++    g_hash_table_destroy(e->images);
++    g_hash_table_destroy(e->pipelines);
++    g_hash_table_destroy(e->uploaded);
++    for (int i = 0; i < 7; i++) {
++        if (e->dummy[i].view) {
++            vkDestroyImageView(d, e->dummy[i].view, NULL);
++            vkDestroyImage(d, e->dummy[i].image, NULL);
++            vkFreeMemory(d, e->dummy[i].mem, NULL);
++        }
++    }
++    if (e->sampler) {
++        vkDestroySampler(d, e->sampler, NULL);
++    }
++    if (e->fence) {
++        vkDestroyFence(d, e->fence, NULL);
++    }
++    g_free(e->dump_dir);
++    if (e->arena) {
++        vkDestroyBuffer(d, e->arena, NULL);
++    }
++    if (e->arena_mem) {
++        vkFreeMemory(d, e->arena_mem, NULL);
++    }
++    g_free(e);
++}
+diff --git a/hw/display/pvg/pvg-exec.h b/hw/display/pvg/pvg-exec.h
+new file mode 100644
+index 0000000..13c9737
+--- /dev/null
++++ b/hw/display/pvg/pvg-exec.h
+@@ -0,0 +1,44 @@
++/*
++ * Metal command buffer executor for pvg-linux-pci (Vulkan backend).
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef PVG_EXEC_H
++#define PVG_EXEC_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#include "pvg-gpu.h"
++
++/* Callbacks into the device: guest task memory and object tables */
++typedef struct PVGExecHost {
++    void *opaque;
++    bool (*read)(void *opaque, uint32_t task, uint64_t va, void *buf, uint64_t len);
++    bool (*write)(void *opaque, uint32_t task, uint64_t va, const void *buf, uint64_t len);
++    /* object 'id' of 'task' into buf (prefix of at most size bytes); returns its type */
++    uint8_t (*object)(void *opaque, uint32_t task, uint32_t id, void *buf, uint32_t size,
++                      uint32_t *len);
++    void (*log)(void *opaque, const char *msg);
++} PVGExecHost;
++
++typedef struct PVGExecStats {
++    uint64_t segments, render_passes, draws, skipped_draws, pipelines, pipeline_failures;
++    uint64_t uploads, writebacks;
++} PVGExecStats;
++
++typedef struct PVGExec PVGExec;
++
++PVGExec *pvg_exec_new(PVGGpu *gpu, const PVGExecHost *host);
++/* save every translated function's metallib to dir (for offline analysis); NULL = off */
++void pvg_exec_set_dump_dir(PVGExec *e, const char *dir);
++/* build pipelines and record work but never submit it to the GPU */
++void pvg_exec_set_dry_run(PVGExec *e, bool dry);
++void pvg_exec_free(PVGExec *e);
++/* Execute one serialized Metal command buffer of a user task */
++void pvg_exec_cmdbuf(PVGExec *e, uint32_t task, const uint8_t *buf, uint64_t len);
++/* A task was (re)defined: drop everything cached for it */
++void pvg_exec_task_reset(PVGExec *e, uint32_t task);
++const PVGExecStats *pvg_exec_stats(PVGExec *e);
++
++#endif
+diff --git a/hw/display/trace-events b/hw/display/trace-events
+index 18abd38..d23a329 100644
+--- a/hw/display/trace-events
++++ b/hw/display/trace-events
+@@ -248,6 +248,8 @@ pvg_linux_segment(uint32_t task, uint64_t off, uint32_t len, const char *enc, ui
+ pvg_linux_segment_bad(uint32_t task, uint64_t off, uint32_t seglen, uint64_t len) "task %u +0x%"PRIx64" bad segment length 0x%x (buffer 0x%"PRIx64")"
+ pvg_linux_gpu(const char *name, bool validation) "host GPU %s (validation %d)"
+ pvg_linux_ref(uint32_t task, const char *cmd, uint32_t slot, uint32_t ref, uint32_t type, uint32_t len, uint32_t kind, uint32_t w0, uint32_t w1) "task %u %s[%u] -> object %u type=0x%x len=0x%x kind=0x%x body=0x%x,0x%x"
++pvg_linux_exec(const char *msg) "%s"
++pvg_linux_exec_stats(uint64_t cmdbufs, uint64_t passes, uint64_t draws, uint64_t skipped, uint64_t pipelines, uint64_t pipe_fail, uint64_t writebacks) "cmdbufs=%"PRIu64" passes=%"PRIu64" draws=%"PRIu64" skipped=%"PRIu64" pipelines=%"PRIu64" failed=%"PRIu64" writebacks=%"PRIu64
+ pvg_linux_child_poke(uint32_t index, uint32_t written, uint32_t read, uint32_t length) "child FIFO %u written=0x%x read=0x%x length=0x%x"
+ pvg_linux_cmd_stub(uint32_t op) "op=0x%02x not implemented, completed"
+ pvg_linux_signal_stamp(uint32_t index, uint32_t value) "stamps[%u]=%u"
+-- 
+2.43.0
+

@@ -1,0 +1,474 @@
+From adef67a17c6d56a9d65e52c6b9c0b27e3e3d26dc Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 12:51:05 +0200
+Subject: [PATCH 13/54] hw/display/pvg: constant globals, 16-bit draw layouts
+ from the decoders, 32-bit indices
+
+air2spv: serialise constant global initialisers into Private arrays and
+read 8/16-bit elements from private memory. Executor: decode
+DrawInstanced16/DrawIndexed[Instanced]16 as the PGDeserializerRenderDecoder
+does (packed u16 fields, index type), dump failed functions, and track
+executor writes by guest-physical page in dump mode.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-pci.c |   6 ++
+ hw/display/pvg/air2spv.c   | 195 ++++++++++++++++++++++++++++++++++---
+ hw/display/pvg/pvg-exec.c  |  90 ++++++++++++-----
+ hw/display/pvg/pvg-exec.h  |   2 +
+ 4 files changed, 255 insertions(+), 38 deletions(-)
+
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index 82cfe66..e045ef9 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -1070,6 +1070,11 @@ static bool pvg_exec_write(void *opaque, uint32_t task, uint64_t va, const void
+     return pvg_task_write(opaque, task, va, buf, len);
+ }
+ 
++static bool pvg_exec_translate(void *opaque, uint32_t task, uint64_t va, uint64_t *gpa)
++{
++    return pvg_task_translate(opaque, task, va, gpa);
++}
++
+ static uint8_t pvg_exec_object(void *opaque, uint32_t task, uint32_t id, void *buf,
+                                uint32_t size, uint32_t *len)
+ {
+@@ -1556,6 +1561,7 @@ static void pvg_linux_realize(PCIDevice *dev, Error **errp)
+                 PVGExecHost host = {
+                     .opaque = s, .read = pvg_exec_read, .write = pvg_exec_write,
+                     .object = pvg_exec_object, .log = pvg_exec_log,
++                    .translate = pvg_exec_translate,
+                 };
+ 
+                 s->exec = pvg_exec_new(&s->gpu, &host);
+diff --git a/hw/display/pvg/air2spv.c b/hw/display/pvg/air2spv.c
+index 54e2d82..b0cdcdb 100644
+--- a/hw/display/pvg/air2spv.c
++++ b/hw/display/pvg/air2spv.c
+@@ -75,7 +75,7 @@ typedef struct Ctx {
+     int nout;
+     LLVMTypeRef ret_ty;
+     /* private memory (alloca): Function-storage uint[] arrays, pointers tracked as byte offsets */
+-    struct { LLVMValueRef v; uint32_t var; uint32_t off; uint32_t words; } priv[64];
++    struct { LLVMValueRef v; uint32_t var; uint32_t off; uint32_t words; uint32_t ptr_t; } priv[64];
+     int npriv;
+     uint32_t t_fn_u32_ptr;
+     bool ret_is_struct;
+@@ -332,7 +332,15 @@ static uint32_t val(Ctx *c, LLVMValueRef v)
+         vset(c, v, id);
+         return id;
+     }
+-    return fail(c, "value without a mapping (%s)", vname(v, NULL)), 0;
++    if (LLVMIsAArgument(v)) {
++        for (unsigned i = 0; i < LLVMCountParams(c->fn); i++) {
++            if (LLVMGetParam(c->fn, i) == v) {
++                return fail(c, "entry argument %u has no supported binding", i), 0;
++            }
++        }
++    }
++    return fail(c, "value without a mapping (%s, kind %d)", vname(v, NULL),
++                (int)LLVMGetValueKind(v)), 0;
+ }
+ 
+ static uint32_t label(Ctx *c, LLVMBasicBlockRef bb)
+@@ -1561,6 +1569,7 @@ static int declare_allocas(Ctx *c)
+             c->priv[c->npriv].var = ops[1];
+             c->priv[c->npriv].off = spv_const_u32(&c->m, 0);
+             c->priv[c->npriv].words = (uint32_t)((size + 3) / 4);
++            c->priv[c->npriv].ptr_t = spv_type_ptr(&c->m, SpvStorageFunction, c->t_u32);
+             c->npriv++;
+         }
+     }
+@@ -1625,7 +1634,130 @@ static uint32_t priv_word_ptr(Ctx *c, int pi, uint32_t k)
+     }
+     ops[0] = c->priv[pi].var;
+     ops[1] = w;
+-    return emit(c, SpvOpAccessChain, c->t_fn_u32_ptr, 0, ops, 2);
++    return emit(c, SpvOpAccessChain, c->priv[pi].ptr_t, 0, ops, 2);
++}
++
++/* byte image of a constant (data layout of the module), for constant globals */
++static bool const_bytes(Ctx *c, LLVMValueRef v, uint8_t *buf, uint64_t size)
++{
++    LLVMTypeRef t = LLVMTypeOf(v);
++    LLVMTypeKind k = LLVMGetTypeKind(t);
++    uint64_t tsize = LLVMABISizeOfType(c->td, t);
++
++    if (tsize > size) {
++        return false;
++    }
++    if (LLVMIsAConstantAggregateZero(v) || LLVMIsUndef(v) || LLVMIsPoison(v) ||
++        LLVMIsAConstantPointerNull(v)) {
++        memset(buf, 0, tsize);
++        return true;
++    }
++    if (LLVMIsAConstantInt(v)) {
++        uint64_t x = LLVMConstIntGetZExtValue(v);
++
++        memcpy(buf, &x, tsize < 8 ? tsize : 8);
++        return true;
++    }
++    if (LLVMIsAConstantFP(v)) {
++        LLVMBool loses;
++        double d = LLVMConstRealGetDouble(v, &loses);
++
++        if (k == LLVMFloatTypeKind) {
++            float f = (float)d;
++
++            memcpy(buf, &f, 4);
++        } else if (k == LLVMDoubleTypeKind) {
++            memcpy(buf, &d, 8);
++        } else if (k == LLVMHalfTypeKind) {
++            uint16_t h = (uint16_t)f32_to_f16((float)d);
++
++            memcpy(buf, &h, 2);
++        } else {
++            return false;
++        }
++        return true;
++    }
++    if (k == LLVMArrayTypeKind || k == LLVMVectorTypeKind || k == LLVMStructTypeKind) {
++        unsigned n = k == LLVMStructTypeKind ? LLVMCountStructElementTypes(t) :
++                     k == LLVMVectorTypeKind ? LLVMGetVectorSize(t) : (unsigned)LLVMGetArrayLength2(t);
++
++        memset(buf, 0, tsize);
++        for (unsigned i = 0; i < n; i++) {
++            LLVMTypeRef et = k == LLVMStructTypeKind ? LLVMStructGetTypeAtIndex(t, i) :
++                             LLVMGetElementType(t);
++            uint64_t off = k == LLVMStructTypeKind ? LLVMOffsetOfElement(c->td, t, i) :
++                           i * LLVMABISizeOfType(c->td, et);
++            LLVMValueRef e = LLVMGetAggregateElement(v, i);
++
++            if (!e || !const_bytes(c, e, buf + off, tsize - off)) {
++                return false;
++            }
++        }
++        return true;
++    }
++    return false;
++}
++
++/* module-scope Private uint[] holding a constant global's initializer */
++static int declare_constant_global(Ctx *c, LLVMValueRef g)
++{
++    LLVMValueRef init = LLVMGetInitializer(g);
++    LLVMTypeRef t = LLVMGlobalGetValueType(g);
++    uint64_t size = LLVMABISizeOfType(c->td, t);
++    uint32_t nwords = (uint32_t)((size + 3) / 4), arr[2], arr_t, ptr_t, ops[4], *words;
++    uint8_t *bytes;
++
++    if (!init || !size || size > 64 * 1024 || c->npriv == 64) {
++        return fail(c, "unsupported global %s", vname(g, NULL));
++    }
++    bytes = calloc(nwords, 4);
++    if (!const_bytes(c, init, bytes, (uint64_t)nwords * 4)) {
++        free(bytes);
++        return fail(c, "unsupported initializer of %s", vname(g, NULL));
++    }
++    words = calloc(nwords, sizeof(*words));
++    for (uint32_t i = 0; i < nwords; i++) {
++        uint32_t w;
++
++        memcpy(&w, bytes + 4 * i, 4);
++        words[i] = spv_const_u32(&c->m, w);
++    }
++    free(bytes);
++    arr[0] = c->t_u32;
++    arr[1] = spv_const_u32(&c->m, nwords);
++    arr_t = spv_type(&c->m, SpvOpTypeArray, arr, 2);
++    ptr_t = spv_type_ptr(&c->m, SpvStoragePrivate, arr_t);
++    ops[0] = ptr_t;
++    ops[1] = spv_id(&c->m);
++    ops[2] = SpvStoragePrivate;
++    ops[3] = spv_const(&c->m, SpvOpConstantComposite, arr_t, words, nwords);
++    free(words);
++    spv_emit(&c->m, SPV_SEC_TYPES, SpvOpVariable, ops, 4);
++    if (c->niface < 128) {
++        c->iface[c->niface++] = ops[1];
++    }
++    c->priv[c->npriv].v = g;
++    c->priv[c->npriv].var = ops[1];
++    c->priv[c->npriv].off = spv_const_u32(&c->m, 0);
++    c->priv[c->npriv].words = nwords;
++    c->priv[c->npriv].ptr_t = spv_type_ptr(&c->m, SpvStoragePrivate, c->t_u32);
++    c->npriv++;
++    return 0;
++}
++
++static int declare_constant_globals(Ctx *c)
++{
++    for (LLVMValueRef g = LLVMGetFirstGlobal(c->mod); g; g = LLVMGetNextGlobal(g)) {
++        const char *n = vname(g, NULL);
++
++        if (!LLVMGetFirstUse(g) || resource_for(c, g) || !strncmp(n, "llvm.", 5)) {
++            continue;
++        }
++        if (declare_constant_global(c, g)) {
++            return -1;
++        }
++    }
++    return 0;
+ }
+ 
+ static bool priv_type_ok(LLVMTypeRef t, unsigned *n)
+@@ -1638,21 +1770,61 @@ static bool priv_type_ok(LLVMTypeRef t, unsigned *n)
+            *n <= 16;
+ }
+ 
++/* component k of element size esize (1, 2 or 4 bytes) at the private offset, as a u32 */
++static uint32_t priv_component(Ctx *c, int pi, unsigned esize, unsigned k)
++{
++    uint32_t ops[3], co, word, w, shift;
++
++    ops[0] = c->priv[pi].off;
++    ops[1] = spv_const_u32(&c->m, esize * k);
++    co = k ? emit(c, SpvOpIAdd, c->t_u32, 0, ops, 2) : c->priv[pi].off;
++    ops[0] = co;
++    ops[1] = spv_const_u32(&c->m, 2);
++    word = emit(c, SpvOpShiftRightLogical, c->t_u32, 0, ops, 2);
++    ops[0] = c->priv[pi].var;
++    ops[1] = word;
++    w = emit(c, SpvOpAccessChain, c->priv[pi].ptr_t, 0, ops, 2);
++    w = emit(c, SpvOpLoad, c->t_u32, 0, &w, 1);
++    if (esize == 4) {
++        return w;
++    }
++    ops[0] = co;
++    ops[1] = spv_const_u32(&c->m, 3);
++    shift = emit(c, SpvOpBitwiseAnd, c->t_u32, 0, ops, 2);
++    ops[0] = shift;
++    ops[1] = spv_const_u32(&c->m, 3);
++    shift = emit(c, SpvOpShiftLeftLogical, c->t_u32, 0, ops, 2);
++    ops[0] = w;
++    ops[1] = shift;
++    w = emit(c, SpvOpShiftRightLogical, c->t_u32, 0, ops, 2);
++    ops[0] = w;
++    ops[1] = spv_const_u32(&c->m, esize == 2 ? 0xffff : 0xff);
++    return emit(c, SpvOpBitwiseAnd, c->t_u32, 0, ops, 2);
++}
++
+ static int priv_load(Ctx *c, int pi, LLVMTypeRef t, uint32_t result)
+ {
+-    unsigned n;
+-    uint32_t parts[16];
+     LLVMTypeRef et = LLVMGetTypeKind(t) == LLVMVectorTypeKind ? LLVMGetElementType(t) : t;
+-    uint32_t etid = ty(c, et);
++    unsigned n = LLVMGetTypeKind(t) == LLVMVectorTypeKind ? LLVMGetVectorSize(t) : 1;
++    unsigned esize = (unsigned)LLVMABISizeOfType(c->td, et);
++    uint32_t etid = ty(c, et), parts[16];
++    bool fp = LLVMGetTypeKind(et) == LLVMFloatTypeKind || LLVMGetTypeKind(et) == LLVMHalfTypeKind;
+ 
+-    if (!priv_type_ok(t, &n)) {
++    if (n > 16 || (esize != 1 && esize != 2 && esize != 4) ||
++        (LLVMGetTypeKind(et) != LLVMIntegerTypeKind && !fp) || is_bool(et)) {
+         return fail(c, "private load of an unsupported type");
+     }
+     for (unsigned k = 0; k < n; k++) {
+-        uint32_t ptr = priv_word_ptr(c, pi, k);
+-        uint32_t w = emit(c, SpvOpLoad, c->t_u32, 0, &ptr, 1);
++        uint32_t w = priv_component(c, pi, esize, k);
+ 
+-        parts[k] = etid == c->t_u32 ? w : emit(c, SpvOpBitcast, etid, 0, &w, 1);
++        if (esize == 4) {
++            parts[k] = etid == c->t_u32 ? w : emit(c, SpvOpBitcast, etid, 0, &w, 1);
++        } else {
++            uint32_t it = spv_type_int(&c->m, esize * 8, false);
++            uint32_t narrow = emit(c, SpvOpUConvert, it, 0, &w, 1);
++
++            parts[k] = fp ? emit(c, SpvOpBitcast, etid, 0, &narrow, 1) : narrow;
++        }
+     }
+     if (n == 1) {
+         emit(c, SpvOpCopyObject, etid, result, parts, 1);
+@@ -2174,7 +2346,8 @@ int air2spv_translate(const void *bitcode, size_t len, A2SResult *io)
+     c.t_u64 = spv_type_int(&c.m, 64, false);
+     c.t_f32 = spv_type_float(&c.m, 32);
+ 
+-    if (parse_entry(&c) || setup_interface(&c) || translate_function(&c)) {
++    if (parse_entry(&c) || setup_interface(&c) || declare_constant_globals(&c) ||
++        translate_function(&c)) {
+         goto out_spv;
+     }
+     io->stage = c.stage;
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index aaa9740..5bccf55 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -127,8 +127,7 @@ struct PVGExec {
+     GHashTable *uploaded;       /* per command buffer: task << 32 | id → arena offset + 1 */
+     GHashTable *samplers;       /* task << 32 | id → VkSampler (as pointer) */
+     HostImage dummy[7];         /* 1x1 placeholders per VkImageViewType */
+-    struct { uint32_t task; uint64_t va, len; char kind; } written[1024];   /* diagnostics ring */
+-    uint32_t nwritten;
++    GHashTable *written;    /* diagnostics: guest-physical page -> writer kind */
+     bool creating_dummies;
+ };
+ 
+@@ -299,27 +298,47 @@ static uint64_t arena_alloc(PVGExec *e, uint64_t len)
+ 
+ /* ---- diagnostics: which guest ranges did the executor produce ---- */
+ 
++/*
++ * Diagnostics (dump mode only): remember which guest-physical pages the executor wrote, so
++ * aliases of the same memory in other tasks (shared IOSurfaces) are recognised.
++ */
+ static void note_write(PVGExec *e, uint32_t task, uint64_t va, uint64_t len, char kind)
+ {
+-    uint32_t i = e->nwritten++ % G_N_ELEMENTS(e->written);
++    uint64_t gpa;
+ 
+-    e->written[i].task = task;
+-    e->written[i].va = va;
+-    e->written[i].len = len;
+-    e->written[i].kind = kind;
++    if (!e->dump_dir || !e->host.translate) {
++        return;
++    }
++    for (uint64_t p = va & ~0xfffull; p < va + len; p += 0x1000) {
++        if (e->host.translate(e->host.opaque, task, p, &gpa)) {
++            g_hash_table_insert(e->written, GSIZE_TO_POINTER(gpa >> 12),
++                                GINT_TO_POINTER(kind));
++        }
++    }
+ }
+ 
++/* kind of the first executor write found in the range, '-' if none, '?' if untranslatable */
+ static char written_by(PVGExec *e, uint32_t task, uint64_t va, uint64_t len)
+ {
+-    uint32_t n = MIN(e->nwritten, G_N_ELEMENTS(e->written));
++    uint64_t gpa;
++    bool any = false;
+ 
+-    for (uint32_t i = 0; i < n; i++) {
+-        if (e->written[i].task == task && va < e->written[i].va + e->written[i].len &&
+-            e->written[i].va < va + len) {
+-            return e->written[i].kind;
++    if (!e->dump_dir || !e->host.translate) {
++        return '?';
++    }
++    for (uint64_t p = va & ~0xfffull; p < va + len; p += 0x1000) {
++        gpointer k;
++
++        if (!e->host.translate(e->host.opaque, task, p, &gpa)) {
++            continue;
++        }
++        any = true;
++        k = g_hash_table_lookup(e->written, GSIZE_TO_POINTER(gpa >> 12));
++        if (k) {
++            return (char)GPOINTER_TO_INT(k);
+         }
+     }
+-    return '-';
++    return any ? '-' : '?';
+ }
+ 
+ /* ---- objects ---- */
+@@ -713,11 +732,10 @@ static uint32_t *function_spirv(PVGExec *e, uint32_t task, uint32_t fn, A2SResul
+     }
+     if (air2spv_translate(bc, bclen, r)) {
+         elog(e, "task %u: function %u: %s", task, fn, r->error);
+-        return NULL;
+     }
+     if (e->dump_dir) {
+-        g_autofree char *path = g_strdup_printf("%s/fn-t%u-%u-%s.metallib", e->dump_dir, task,
+-                                                fn, r->entry);
++        g_autofree char *path = g_strdup_printf("%s/fn-t%u-%u-%s%s.metallib", e->dump_dir, task,
++                                                fn, r->entry, r->spirv ? "" : "-FAILED");
+ 
+         g_file_set_contents(path, (const char *)lib, lib_len, NULL);
+     }
+@@ -1451,22 +1469,37 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+             }
+             break;
+         case 0x01: case 0x07: case 0x03: case 0x09: {
+-            /* Draw[Indexed][Instanced]Primitives16 */
+-            bool indexed = id == 0x07 || id == 0x09, inst = id == 0x03 || id == 0x09;
+-            uint32_t prim = alen >= 4 ? ldl(a) : 3, count, first = 0, instances = 1;
++            /*
++             * Draw[Indexed][Instanced]Primitives16, layouts from the PGDeserializerRenderDecoder
++             * decoders: 0x01 {u32 prim, u16 start, u16 count}; 0x03 {u16 start, u16 count,
++             * u16 instances, u16 prim}; 0x07/0x09 {u16 prim, u16 indexType, u32 ib,
++             * u16 count, u16 offset[, u16 instances]}
++             */
++            bool indexed = id == 0x07 || id == 0x09;
++            uint32_t prim, count, first = 0, instances = 1, idx_size = 2;
+             Pipeline *pp;
+             HostImage *draw_tex[32] = { NULL };
+             uint32_t ib = 0, ib_off = 0;
+ 
++            if (alen < (id == 0x09 ? 14u : id == 0x07 ? 12u : 8u)) {
++                break;
++            }
+             if (indexed) {
++                prim = lduw(a);
++                idx_size = lduw(a + 2) ? 4 : 2;
+                 ib = ldl(a + 4);
+-                count = ldl(a + 8) & 0xffff;
+-                ib_off = ldl(a + 8) >> 16;
+-                instances = inst && alen >= 16 ? ldl(a + 12) : 1;
++                count = lduw(a + 8);
++                ib_off = lduw(a + 10);
++                instances = id == 0x09 ? lduw(a + 12) : 1;
++            } else if (id == 0x03) {
++                first = lduw(a);
++                count = lduw(a + 2);
++                instances = lduw(a + 4);
++                prim = lduw(a + 6);
+             } else {
+-                first = ldl(a + 4) & 0xffff;
+-                count = ldl(a + 4) >> 16;
+-                instances = inst && alen >= 12 ? ldl(a + 8) : 1;
++                prim = ldl(a);
++                first = lduw(a + 4);
++                count = lduw(a + 6);
+             }
+             if (count > (1u << 20) || instances > 4096) {
+                 elog(e, "task %u draw 0x%x: count %u instances %u: skipped", task, id, count,
+@@ -1513,11 +1546,12 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+             if (indexed) {
+                 uint64_t size, io = buffer_upload(e, task, ib, &size);
+ 
+-                if (io == UINT64_MAX || ib_off + 2ull * count > size) {
++                if (io == UINT64_MAX || ib_off + (uint64_t)idx_size * count > size) {
+                     e->stats.skipped_draws++;
+                     break;
+                 }
+-                vkCmdBindIndexBuffer(e->cmd, e->arena, io + ib_off, VK_INDEX_TYPE_UINT16);
++                vkCmdBindIndexBuffer(e->cmd, e->arena, io + ib_off,
++                                     idx_size == 4 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
+                 vkCmdDrawIndexed(e->cmd, count, instances, 0, 0, 0);
+             } else {
+                 vkCmdDraw(e->cmd, count, instances, first, 0);
+@@ -1848,6 +1882,7 @@ PVGExec *pvg_exec_new(PVGGpu *gpu, const PVGExecHost *host)
+     e->pipelines = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, pipeline_free);
+     e->uploaded = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
+     e->samplers = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
++    e->written = g_hash_table_new(g_direct_hash, g_direct_equal);
+     e->push_descriptor = (PFN_vkCmdPushDescriptorSetKHR)
+         vkGetDeviceProcAddr(gpu->device, "vkCmdPushDescriptorSetKHR");
+     if (!e->push_descriptor || arena_init(e) ||
+@@ -1896,6 +1931,7 @@ void pvg_exec_free(PVGExec *e)
+             }
+         }
+         g_hash_table_destroy(e->samplers);
++        g_hash_table_destroy(e->written);
+     }
+     for (int i = 0; i < 7; i++) {
+         if (e->dummy[i].view) {
+diff --git a/hw/display/pvg/pvg-exec.h b/hw/display/pvg/pvg-exec.h
+index 49f8dff..a49f616 100644
+--- a/hw/display/pvg/pvg-exec.h
++++ b/hw/display/pvg/pvg-exec.h
+@@ -20,6 +20,8 @@ typedef struct PVGExecHost {
+     uint8_t (*object)(void *opaque, uint32_t task, uint32_t id, void *buf, uint32_t size,
+                       uint32_t *len);
+     void (*log)(void *opaque, const char *msg);
++    /* guest-physical address of task virtual address va (diagnostics) */
++    bool (*translate)(void *opaque, uint32_t task, uint64_t va, uint64_t *gpa);
+ } PVGExecHost;
+ 
+ typedef struct PVGExecStats {
+-- 
+2.43.0
+

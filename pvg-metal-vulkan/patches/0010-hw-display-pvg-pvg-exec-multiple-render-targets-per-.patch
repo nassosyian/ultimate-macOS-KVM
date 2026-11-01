@@ -1,0 +1,475 @@
+From 37cd1ff2f6b904d706920383612899869b1c396d Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 12:18:47 +0200
+Subject: [PATCH 10/54] hw/display/pvg/pvg-exec: multiple render targets,
+ per-pass pipeline variants, diagnostics
+
+Render passes now bind all colour attachments; pipelines are specialised
+per pass attachment formats with per-index blend state (attachment index
+defaults to list position). Fixes SetVertex/FragmentBufferOffset field
+order ({u32 index, u64 offset}) which produced out-of-range device
+addresses, adds buffer/index bounds checks, an arena guard zone, a
+dry-run mode, and diagnostic logging/dumps of kernel-backing writebacks.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/pvg-exec.c | 272 ++++++++++++++++++++++++++------------
+ 1 file changed, 188 insertions(+), 84 deletions(-)
+
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index 7b72eb0..2cb6b15 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -89,7 +89,6 @@ typedef struct Pipeline {
+     uint8_t texture_view[32];
+     int fs_const_samplers, vs_const_samplers;
+     uint32_t vertex_bindings;           /* Metal buffer indices fetched as vertex buffers */
+-    VkFormat color_format;
+     uint32_t push_size;
+     uint32_t draws_logged;
+ } Pipeline;
+@@ -624,11 +623,21 @@ static VkShaderModule shader_module(PVGExec *e, const A2SResult *r)
+     return m;
+ }
+ 
+-static Pipeline *pipeline_get(PVGExec *e, uint32_t task, uint32_t ref, VkFormat target_format)
++#define MAX_COLOR 8
++
++/* pipelines are specialised per render pass attachment formats (dynamic rendering needs a match) */
++static Pipeline *pipeline_get(PVGExec *e, uint32_t task, uint32_t ref, const VkFormat *pass_formats,
++                              uint32_t npass)
+ {
+     PVGGpu *g = e->gpu;
+-    gint64 key = key_of(task, ref);
+-    Pipeline *p = g_hash_table_lookup(e->pipelines, &key);
++    g_autofree char *key = g_strdup_printf("%u:%u:%d,%d,%d,%d,%d,%d,%d,%d", task, ref,
++        pass_formats[0], npass > 1 ? pass_formats[1] : 0, npass > 2 ? pass_formats[2] : 0,
++        npass > 3 ? pass_formats[3] : 0, npass > 4 ? pass_formats[4] : 0,
++        npass > 5 ? pass_formats[5] : 0, npass > 6 ? pass_formats[6] : 0,
++        npass > 7 ? pass_formats[7] : 0);
++    Pipeline *p = g_hash_table_lookup(e->pipelines, key);
++    VkPipelineColorBlendAttachmentState blends[MAX_COLOR];
++    uint32_t plist_fmt[MAX_COLOR] = { 0 };
+     uint8_t obj[MAX_OBJ];
+     uint32_t len, plen, vs_fn = 0, fs_fn = 0, vd_off = 0, ca_off = 0;
+     const uint8_t *pl;
+@@ -650,7 +659,10 @@ static Pipeline *pipeline_get(PVGExec *e, uint32_t task, uint32_t ref, VkFormat
+         return p;
+     }
+     p = g_new0(Pipeline, 1);
+-    g_hash_table_insert(e->pipelines, key_new(task, ref), p);
++    g_hash_table_insert(e->pipelines, g_strdup(key), p);
++    for (int i = 0; i < MAX_COLOR; i++) {
++        blends[i] = blend;
++    }
+     e->stats.pipelines++;
+ 
+     if (object(e, task, ref, obj, &len) != OBJ_SERIALIZED || len < 16 ||
+@@ -676,7 +688,7 @@ static Pipeline *pipeline_get(PVGExec *e, uint32_t task, uint32_t ref, VkFormat
+ 
+         for (int a = 0; a < na; a++) {
+             PlEntry ce[16];
+-            int nc = plist(pl, offs[a], plen, ce, 16), index = 0;
++            int nc = plist(pl, offs[a], plen, ce, 16), index = a;    /* default: list position */
+             VkPipelineColorBlendAttachmentState st = blend;
+ 
+             uint32_t fmt = 0;
+@@ -700,12 +712,9 @@ static Pipeline *pipeline_get(PVGExec *e, uint32_t task, uint32_t ref, VkFormat
+                     break;
+                 }
+             }
+-            if (index == 0) {
+-                uint32_t bpp;
+-                VkComponentMapping swz;
+-
+-                blend = st;
+-                p->color_format = mtl_pixel_format(fmt, &bpp, &swz);
++            if (index >= 0 && index < MAX_COLOR) {
++                blends[index] = st;
++                plist_fmt[index] = fmt;
+             }
+         }
+     }
+@@ -773,8 +782,14 @@ static Pipeline *pipeline_get(PVGExec *e, uint32_t task, uint32_t ref, VkFormat
+         }
+     }
+ 
+-    if (p->color_format == VK_FORMAT_UNDEFINED) {
+-        p->color_format = target_format;
++    for (uint32_t i = 0; i < npass; i++) {
++        uint32_t bpp;
++        VkComponentMapping swz;
++
++        if (plist_fmt[i] && mtl_pixel_format(plist_fmt[i], &bpp, &swz) != pass_formats[i]) {
++            elog(e, "task %u pipeline %u: attachment %u declares Metal format %u, pass has %d",
++                 task, ref, i, plist_fmt[i], pass_formats[i]);
++        }
+     }
+ 
+     /* shaders: vertex first, then fragment with the vertex stage's varying names */
+@@ -872,7 +887,7 @@ static Pipeline *pipeline_get(PVGExec *e, uint32_t task, uint32_t ref, VkFormat
+             .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+         VkPipelineColorBlendStateCreateInfo cb = {
+             .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+-            .attachmentCount = 1, .pAttachments = &blend };
++            .attachmentCount = npass, .pAttachments = blends };
+         VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                                  VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
+                                  VK_DYNAMIC_STATE_BLEND_CONSTANTS };
+@@ -881,7 +896,7 @@ static Pipeline *pipeline_get(PVGExec *e, uint32_t task, uint32_t ref, VkFormat
+             .dynamicStateCount = G_N_ELEMENTS(dyn), .pDynamicStates = dyn };
+         VkPipelineRenderingCreateInfo ri = {
+             .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+-            .colorAttachmentCount = 1, .pColorAttachmentFormats = &p->color_format };
++            .colorAttachmentCount = npass, .pColorAttachmentFormats = pass_formats };
+         VkGraphicsPipelineCreateInfo gci = {
+             .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri,
+             .stageCount = 2, .pStages = stages, .pVertexInputState = &vi,
+@@ -1058,20 +1073,38 @@ static bool submit_wait(PVGExec *e, const VkSubmitInfo *si)
+     return true;
+ }
+ 
++typedef struct Attachment {
++    uint32_t ref, load, store;
++    double clear[4];
++    GuestImage gi;
++    HostImage *img;
++    uint64_t wb_off;
++} Attachment;
++
++static bool is_attachment(const Attachment *att, uint32_t natt, uint32_t ref)
++{
++    for (uint32_t i = 0; i < natt; i++) {
++        if (att[i].img && att[i].ref == ref) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uint32_t len)
+ {
+     RenderState st = { 0 };
+-    GuestImage target;
+-    HostImage *timg = NULL;
+-    uint32_t off = 0, target_ref = 0, load = 0, store = 0;
+-    double clear[4] = { 0 };
+-    bool rendering = false;
++    Attachment att[MAX_COLOR] = { 0 };
++    VkFormat formats[MAX_COLOR];
++    VkRenderingAttachmentInfo ca[MAX_COLOR];
++    uint32_t off = 0, natt = 0, rw = 0, rh = 0;
+     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                     .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
+                         .pCommandBuffers = &e->cmd };
+-    uint64_t wb_off = UINT64_MAX;
+     Pipeline *bound = NULL;
++    bool found = false;
++    uint32_t seg_draws = 0, seg_skipped = 0, seg_dummy = 0, seg_pipes[8], nseg_pipes = 0;
+ 
+     e->stats.segments++;
+     /* the render pass descriptor comes first */
+@@ -1085,28 +1118,55 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+         if (id == 0x1a) {
+             const uint8_t *a = p + off - clen + 8;
+ 
+-            if (clen - 8 < (19 + 15) * 4) {
+-                return;
+-            }
+-            target_ref = ldl(a + 19 * 4);
+-            load = lduw(a + 24 * 4);
+-            store = lduw(a + 24 * 4 + 2);
+-            for (int i = 0; i < 4; i++) {
+-                clear[i] = ldd(a + 26 * 4 + 8 * i);
++            for (int i = 0; i < MAX_COLOR && (19 + 15 * (i + 1)) * 4 <= (int)(clen - 8); i++) {
++                const uint8_t *c = a + (19 + 15 * i) * 4;
++
++                att[i].ref = ldl(c);
++                att[i].load = lduw(c + 5 * 4);
++                att[i].store = lduw(c + 5 * 4 + 2);
++                for (int k = 0; k < 4; k++) {
++                    att[i].clear[k] = ldd(c + 7 * 4 + 8 * k);
++                }
+             }
++            found = true;
+             break;
+         }
+         if (id < 0x1e || id > 0x24) {
+             return;     /* continuation segment or unexpected: not handled in v0 */
+         }
+     }
+-    if (!target_ref || !guest_image(e, task, target_ref, &target)) {
++    if (!found) {
++        return;
++    }
++    for (uint32_t i = 0; i < MAX_COLOR; i++) {
++        formats[i] = VK_FORMAT_UNDEFINED;
++        if (att[i].ref && guest_image(e, task, att[i].ref, &att[i].gi) &&
++            (!rw || (att[i].gi.width == rw && att[i].gi.height == rh))) {
++            formats[i] = att[i].gi.format;
++            rw = att[i].gi.width;
++            rh = att[i].gi.height;
++            natt = i + 1;
++        } else {
++            att[i].ref = 0;
++        }
++    }
++    if (!natt) {
+         return;
+     }
+     e->stats.render_passes++;
+ 
+     vkResetCommandBuffer(e->cmd, 0);
+     vkBeginCommandBuffer(e->cmd, &bi);
++    for (uint32_t i = 0; i < natt; i++) {
++        if (!att[i].ref) {
++            continue;
++        }
++        att[i].img = host_image(e, task, att[i].ref, &att[i].gi, true);
++        if (!att[i].img) {
++            vkEndCommandBuffer(e->cmd);
++            return;
++        }
++    }
+ 
+     /* prepass: upload every texture this segment samples, once */
+     {
+@@ -1126,7 +1186,7 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                     HostImage *hi;
+                     bool seen = false;
+ 
+-                    if (!refs[i] || refs[i] == target_ref) {
++                    if (!refs[i] || is_attachment(att, natt, refs[i])) {
+                         continue;
+                     }
+                     for (uint32_t k = 0; k < ndone; k++) {
+@@ -1147,38 +1207,37 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+         }
+     }
+ 
+-    timg = host_image(e, task, target_ref, &target, true);
+-    if (!timg) {
+-        vkEndCommandBuffer(e->cmd);
+-        return;
+-    }
+-    if (load == 1) {
+-        image_upload(e, &target, timg, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+-    } else {
+-        barrier(e, timg->image, VK_IMAGE_LAYOUT_UNDEFINED,
+-                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++    for (uint32_t i = 0; i < natt; i++) {
++        ca[i] = (VkRenderingAttachmentInfo){ .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
++        if (!att[i].img) {
++            continue;
++        }
++        if (att[i].load == 1) {
++            image_upload(e, &att[i].gi, att[i].img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++        } else {
++            barrier(e, att[i].img->image, VK_IMAGE_LAYOUT_UNDEFINED,
++                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++        }
++        ca[i].imageView = att[i].img->view;
++        ca[i].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++        ca[i].loadOp = att[i].load == 2 ? VK_ATTACHMENT_LOAD_OP_CLEAR :
++                       att[i].load == 1 ? VK_ATTACHMENT_LOAD_OP_LOAD :
++                       VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++        ca[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++        for (int k = 0; k < 4; k++) {
++            ca[i].clearValue.color.float32[k] = att[i].clear[k];
++        }
+     }
+     {
+-        VkRenderingAttachmentInfo ca = {
+-            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = timg->view,
+-            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+-            .loadOp = load == 2 ? VK_ATTACHMENT_LOAD_OP_CLEAR :
+-                      load == 1 ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+-            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+-            .clearValue.color.float32 = { clear[0], clear[1], clear[2], clear[3] },
+-        };
+         VkRenderingInfo ri = {
+-            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+-            .renderArea = { { 0, 0 }, { target.width, target.height } }, .layerCount = 1,
+-            .colorAttachmentCount = 1, .pColorAttachments = &ca,
++            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = { { 0, 0 }, { rw, rh } },
++            .layerCount = 1, .colorAttachmentCount = natt, .pColorAttachments = ca,
+         };
+ 
+         vkCmdBeginRendering(e->cmd, &ri);
+-        rendering = true;
+     }
+-    st.viewport = (VkViewport){ 0, (float)target.height, (float)target.width,
+-                                -(float)target.height, 0, 1 };
+-    st.scissor = (VkRect2D){ { 0, 0 }, { target.width, target.height } };
++    st.viewport = (VkViewport){ 0, (float)rh, (float)rw, -(float)rh, 0, 1 };
++    st.scissor = (VkRect2D){ { 0, 0 }, { rw, rh } };
+ 
+     while (off + 8 <= len) {
+         uint32_t id = ldl(p + off), clen = ldl(p + off + 4);
+@@ -1238,35 +1297,41 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                 count = ldl(a + 4) >> 16;
+                 instances = inst && alen >= 12 ? ldl(a + 8) : 1;
+             }
+-            pp = st.pipeline ? pipeline_get(e, task, st.pipeline, target.format) : NULL;
+             if (count > (1u << 20) || instances > 4096) {
+                 elog(e, "task %u draw 0x%x: count %u instances %u: skipped", task, id, count,
+                      instances);
+                 e->stats.skipped_draws++;
+                 break;
+             }
++            pp = st.pipeline ? pipeline_get(e, task, st.pipeline, formats, natt) : NULL;
+             if (pp && pp->draws_logged < 3) {
+                 pp->draws_logged++;
+                 elog(e, "task %u pipeline %u draw 0x%x prim %u count %u first %u inst %u "
+-                     "ib %u+%u target %ux%u", task, st.pipeline, id, prim, count, first,
+-                     instances, ib, ib_off, target.width, target.height);
++                     "ib %u+%u target %ux%u x%u", task, st.pipeline, id, prim, count, first,
++                     instances, ib, ib_off, rw, rh, natt);
+             }
+             for (int i = 0; i < MAX_SLOTS; i++) {
+-                if (st.ftex[i] && st.ftex[i] != target_ref) {
++                if (st.ftex[i] && !is_attachment(att, natt, st.ftex[i])) {
+                     gint64 key = key_of(task, st.ftex[i]);
+ 
+                     draw_tex[i] = g_hash_table_lookup(e->images, &key);
+                 }
+             }
+-            if (pp && pp->ok && pp->color_format != target.format) {
+-                elog(e, "task %u pipeline %u: format %d vs target %d", task, st.pipeline,
+-                     pp->color_format, target.format);
+-                pp = NULL;
++            if (nseg_pipes < 8 && (!nseg_pipes || seg_pipes[nseg_pipes - 1] != st.pipeline)) {
++                seg_pipes[nseg_pipes++] = st.pipeline;
++            }
++            for (int i = 0; pp && pp->ok && i < 32; i++) {
++                if (((pp->vs_textures | pp->fs_textures) >> i & 1) &&
++                    (pp->texture_view[i] != VK_IMAGE_VIEW_TYPE_2D || !draw_tex[i])) {
++                    seg_dummy++;
++                }
+             }
+             if (!pp || !pp->ok || !bind_and_push(e, task, &st, pp, draw_tex)) {
+                 e->stats.skipped_draws++;
++                seg_skipped++;
+                 break;
+             }
++            seg_draws++;
+             if (bound != pp) {
+                 vkCmdBindPipeline(e->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pipe);
+                 bound = pp;
+@@ -1293,34 +1358,68 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+             break;
+         }
+     }
+-    if (rendering) {
+-        vkCmdEndRendering(e->cmd);
++    vkCmdEndRendering(e->cmd);
++    if (att[0].img && att[0].gi.task == 0 && att[0].gi.width >= 1024 && e->stats.segments < 20000) {
++        elog(e, "segment task %u -> kernel 0x%" G_GINT64_MODIFIER "x %ux%u load %u: draws %u "
++             "skipped %u dummy-tex %u pipelines %u %u %u %u", task, att[0].gi.va, rw, rh,
++             att[0].load, seg_draws, seg_skipped, seg_dummy, nseg_pipes > 0 ? seg_pipes[0] : 0,
++             nseg_pipes > 1 ? seg_pipes[1] : 0, nseg_pipes > 2 ? seg_pipes[2] : 0,
++             nseg_pipes > 3 ? seg_pipes[3] : 0);
+     }
+-    if (store == 1) {
+-        uint64_t size = (uint64_t)target.row_bytes * target.height;
++    for (uint32_t i = 0; i < natt; i++) {
++        uint64_t size = (uint64_t)att[i].gi.row_bytes * att[i].gi.height;
+         VkBufferImageCopy r = {
+-            .bufferRowLength = target.row_bytes / target.bpp,
+             .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+-            .imageExtent = { target.width, target.height, 1 },
+         };
+ 
+-        wb_off = arena_alloc(e, size);
+-        if (wb_off != UINT64_MAX) {
+-            r.bufferOffset = wb_off;
+-            barrier(e, timg->image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+-                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+-            vkCmdCopyImageToBuffer(e->cmd, timg->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+-                                   e->arena, 1, &r);
++        att[i].wb_off = UINT64_MAX;
++        if (!att[i].img || att[i].store != 1) {
++            continue;
++        }
++        att[i].wb_off = arena_alloc(e, size);
++        if (att[i].wb_off == UINT64_MAX) {
++            continue;
+         }
++        r.bufferOffset = att[i].wb_off;
++        r.bufferRowLength = att[i].gi.row_bytes / att[i].gi.bpp;
++        r.imageExtent = (VkExtent3D){ att[i].gi.width, att[i].gi.height, 1 };
++        barrier(e, att[i].img->image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++        vkCmdCopyImageToBuffer(e->cmd, att[i].img->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                               e->arena, 1, &r);
+     }
+     vkEndCommandBuffer(e->cmd);
+     if (!submit_wait(e, &si)) {
+         return;
+     }
+-    if (wb_off != UINT64_MAX) {
+-        e->host.write(e->host.opaque, target.task, target.va, e->arena_ptr + wb_off,
+-                      (uint64_t)target.row_bytes * target.height);
+-        e->stats.writebacks++;
++    for (uint32_t i = 0; i < natt; i++) {
++        if (att[i].wb_off != UINT64_MAX && att[i].gi.task == 0 && e->stats.writebacks < 400 &&
++            e->stats.writebacks % 20 == 0) {
++            const uint32_t *px = (const uint32_t *)(e->arena_ptr + att[i].wb_off);
++            uint64_t n = (uint64_t)att[i].gi.row_bytes / 4 * att[i].gi.height, nz = 0;
++
++            for (uint64_t k = 0; k < n; k += 97) {
++                nz += (px[k] & 0xffffff) != 0;
++            }
++            elog(e, "writeback task %u ref %u -> kernel va 0x%" G_GINT64_MODIFIER "x %ux%u "
++                 "nonzero %" G_GUINT64_FORMAT "/%" G_GUINT64_FORMAT, task, att[i].ref,
++                 att[i].gi.va, att[i].gi.width, att[i].gi.height, nz, n / 97);
++            if (e->dump_dir) {
++                g_autofree char *path = g_strdup_printf(
++                    "%s/wb-%05" G_GUINT64_FORMAT "-t%u-r%u-%ux%u-s%u.bgra", e->dump_dir,
++                    e->stats.writebacks, task, att[i].ref, att[i].gi.width, att[i].gi.height,
++                    att[i].gi.row_bytes);
++
++                g_file_set_contents(path, (const char *)px,
++                                    (gssize)att[i].gi.row_bytes * att[i].gi.height, NULL);
++            }
++        }
++        if (att[i].wb_off != UINT64_MAX) {
++            e->host.write(e->host.opaque, att[i].gi.task, att[i].gi.va,
++                          e->arena_ptr + att[i].wb_off,
++                          (uint64_t)att[i].gi.row_bytes * att[i].gi.height);
++            e->stats.writebacks++;
++        }
+     }
+ }
+ 
+@@ -1355,11 +1454,16 @@ static gboolean match_task(gpointer key, gpointer value, gpointer task)
+     return (uint32_t)(*(gint64 *)key >> 32) == GPOINTER_TO_UINT(task);
+ }
+ 
++static gboolean match_task_str(gpointer key, gpointer value, gpointer task)
++{
++    return (uint32_t)strtoul(key, NULL, 10) == GPOINTER_TO_UINT(task);
++}
++
+ void pvg_exec_task_reset(PVGExec *e, uint32_t task)
+ {
+     vkQueueWaitIdle(e->gpu->queue);
+     g_hash_table_foreach_remove(e->images, match_task, GUINT_TO_POINTER(task));
+-    g_hash_table_foreach_remove(e->pipelines, match_task, GUINT_TO_POINTER(task));
++    g_hash_table_foreach_remove(e->pipelines, match_task_str, GUINT_TO_POINTER(task));
+ }
+ 
+ void pvg_exec_set_dry_run(PVGExec *e, bool dry)
+@@ -1427,7 +1531,7 @@ PVGExec *pvg_exec_new(PVGGpu *gpu, const PVGExecHost *host)
+     e->host = *host;
+     free_ctx = e;
+     e->images = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, image_free);
+-    e->pipelines = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, pipeline_free);
++    e->pipelines = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, pipeline_free);
+     e->uploaded = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
+     e->push_descriptor = (PFN_vkCmdPushDescriptorSetKHR)
+         vkGetDeviceProcAddr(gpu->device, "vkCmdPushDescriptorSetKHR");
+-- 
+2.43.0
+

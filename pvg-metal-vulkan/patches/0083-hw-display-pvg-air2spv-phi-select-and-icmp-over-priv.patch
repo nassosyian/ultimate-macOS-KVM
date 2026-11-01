@@ -1,0 +1,242 @@
+From d2314b13669b512fc61ac3c5897cd8dcbe1ad3db Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Sun, 1 Nov 2026 00:02:31 +0200
+Subject: [PATCH 2/2] hw/display/pvg: air2spv: phi, select and icmp over
+ private pointers
+
+A pointer phi into a private array (a loop walking it, or two branches
+picking different fields), a select between two of its elements, or a
+compare of such pointers failed with 'unsupported use of private memory'.
+Each private pointer's byte offset is now its own u32 value, so these
+become the same operations on offsets (forward references from a loop's
+back edge included). Private pointer limit 64 -> 256.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/air2spv.c | 141 +++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 134 insertions(+), 7 deletions(-)
+
+diff --git a/hw/display/pvg/air2spv.c b/hw/display/pvg/air2spv.c
+index a782703..3e76839 100644
+--- a/hw/display/pvg/air2spv.c
++++ b/hw/display/pvg/air2spv.c
+@@ -23,6 +23,7 @@
+ #include "spv.h"
+ 
+ #define MAX_ARGS 64
++#define MAX_PRIV 256     /* private pointers (allocas, constant globals, GEPs, phis) */
+ 
+ enum ArgKind {
+     ARG_NONE, ARG_BUFFER, ARG_TEXTURE, ARG_SAMPLER, ARG_POSITION, ARG_VARYING,
+@@ -90,7 +91,7 @@ typedef struct Ctx {
+     int nout;
+     LLVMTypeRef ret_ty;
+     /* private memory (alloca): Function-storage uint[] arrays, pointers tracked as byte offsets */
+-    struct { LLVMValueRef v; uint32_t var; uint32_t off; uint32_t words; uint32_t ptr_t; } priv[64];
++    struct { LLVMValueRef v; uint32_t var; uint32_t off; uint32_t words; uint32_t ptr_t; } priv[MAX_PRIV];
+     int npriv;
+     uint32_t t_fn_u32_ptr;
+     bool ret_is_struct;
+@@ -824,7 +825,7 @@ static int setup_interface(Ctx *c)
+             uint32_t sc[3] = { c->t_u32, spv_id(&c->m), 1024 }, arr[2], arr_t, ops[3];
+ 
+             if (c->stage != A2S_STAGE_COMPUTE || a->index >= A2S_MAX_THREADGROUP ||
+-                c->npriv == 64) {
++                c->npriv == MAX_PRIV) {
+                 return fail(c, "unsupported threadgroup buffer %d", a->index);
+             }
+             spv_emit(&c->m, SPV_SEC_TYPES, SpvOpSpecConstant, sc, 3);
+@@ -2314,7 +2315,7 @@ static int declare_allocas(Ctx *c)
+             if (LLVMGetInstructionOpcode(in) != LLVMAlloca) {
+                 continue;
+             }
+-            if (c->npriv == 64 || !LLVMIsAConstantInt(LLVMGetOperand(in, 0))) {
++            if (c->npriv == MAX_PRIV || !LLVMIsAConstantInt(LLVMGetOperand(in, 0))) {
+                 return fail(c, "unsupported alloca");
+             }
+             at = LLVMGetAllocatedType(in);
+@@ -2349,7 +2350,7 @@ static int priv_gep(Ctx *c, LLVMValueRef inst, int base)
+     unsigned n = LLVMGetNumOperands(inst);
+     uint32_t off = c->priv[base].off;
+ 
+-    if (c->npriv == 64) {
++    if (c->npriv == MAX_PRIV) {
+         return fail(c, "too many private pointers");
+     }
+     for (unsigned i = 1; i < n; i++) {
+@@ -2379,6 +2380,8 @@ static int priv_gep(Ctx *c, LLVMValueRef inst, int base)
+         ops[1] = term;
+         off = emit(c, SpvOpIAdd, c->t_u32, 0, ops, 2);
+     }
++    /* the offset is the GEP's own value: a phi or select may have referenced it already */
++    off = emit(c, SpvOpCopyObject, c->t_u32, val(c, inst), &off, 1);
+     c->priv[c->npriv] = c->priv[base];
+     c->priv[c->npriv].v = inst;
+     c->priv[c->npriv].off = off;
+@@ -2472,7 +2475,7 @@ static int declare_constant_global(Ctx *c, LLVMValueRef g)
+     uint32_t nwords = (uint32_t)((size + 3) / 4), arr[2], arr_t, ptr_t, ops[4], *words;
+     uint8_t *bytes;
+ 
+-    if (!init || !size || size > 64 * 1024 || c->npriv == 64) {
++    if (!init || !size || size > 64 * 1024 || c->npriv == MAX_PRIV) {
+         return fail(c, "unsupported global %s", vname(g, NULL));
+     }
+     bytes = calloc(nwords, 4);
+@@ -2516,7 +2519,7 @@ static int declare_threadgroup_global(Ctx *c, LLVMValueRef g)
+     uint64_t size = LLVMABISizeOfType(c->td, LLVMGlobalGetValueType(g));
+     uint32_t arr[2], arr_t, ops[3];
+ 
+-    if (c->stage != A2S_STAGE_COMPUTE || !size || size > 64 * 1024 || c->npriv == 64) {
++    if (c->stage != A2S_STAGE_COMPUTE || !size || size > 64 * 1024 || c->npriv == MAX_PRIV) {
+         return fail(c, "unsupported threadgroup global %s", vname(g, NULL));
+     }
+     arr[0] = c->t_u32;
+@@ -2711,6 +2714,123 @@ static int priv_store(Ctx *c, int pi, LLVMValueRef value)
+     return 0;
+ }
+ 
++/*
++ * Private memory a pointer value points into (index of a priv entry with that variable), -1 if
++ * none. Follows GEPs, casts, phis and selects, so a loop's pointer phi resolves through its
++ * not-yet-translated back-edge GEP; for an icmp, the memory its operands point into.
++ */
++static int priv_root(Ctx *c, LLVMValueRef v, int depth)
++{
++    int pi = priv_find(c, v);
++    unsigned first = 0, n;
++
++    if (pi >= 0 || depth > 8 || !LLVMIsAInstruction(v)) {
++        return pi;
++    }
++    switch (LLVMGetInstructionOpcode(v)) {
++    case LLVMGetElementPtr: case LLVMBitCast: case LLVMAddrSpaceCast:
++        n = 1;
++        break;
++    case LLVMSelect:
++        first = 1;
++        n = 3;
++        break;
++    case LLVMPHI: case LLVMICmp:
++        n = LLVMGetNumOperands(v);
++        break;
++    default:
++        return -1;
++    }
++    for (unsigned i = first; i < n; i++) {
++        pi = priv_root(c, LLVMGetOperand(v, i), depth + 1);
++        if (pi >= 0) {
++            return pi;
++        }
++    }
++    return -1;
++}
++
++/* byte offset of a private pointer operand of a phi/select/icmp (in the root's memory) */
++static int priv_off_of(Ctx *c, LLVMValueRef v, int root, uint32_t *off)
++{
++    int pi = priv_find(c, v), r = pi >= 0 ? pi : priv_root(c, v, 0);
++
++    if (LLVMIsUndef(v) || LLVMIsPoison(v)) {
++        *off = spv_const_u32(&c->m, 0);
++        return 0;
++    }
++    if (r < 0) {
++        return fail(c, "private pointer mixed with another pointer");
++    }
++    if (c->priv[r].var != c->priv[root].var) {
++        return fail(c, "private pointers into different memory");
++    }
++    /* translated already: its offset; otherwise (a back edge) its own value, defined later */
++    *off = pi >= 0 ? c->priv[pi].off : val(c, v);
++    return 0;
++}
++
++/* phi / select / icmp over pointers into one private variable: the same on the byte offsets */
++static int priv_ptr_op(Ctx *c, Cfg *g, LLVMValueRef inst)
++{
++    LLVMOpcode op = LLVMGetInstructionOpcode(inst);
++    int root = priv_root(c, inst, 0);
++    uint32_t ops[64];
++
++    if (op == LLVMICmp) {
++        LLVMIntPredicate p = LLVMGetICmpPredicate(inst);
++        LLVMValueRef a = LLVMGetOperand(inst, 0), b = LLVMGetOperand(inst, 1);
++
++        if (LLVMIsAConstantPointerNull(a) || LLVMIsAConstantPointerNull(b)) {
++            /* private memory is never at null */
++            if (p != LLVMIntEQ && p != LLVMIntNE) {
++                return fail(c, "ordered compare of a private pointer with null");
++            }
++            ops[0] = spv_const(&c->m, p == LLVMIntNE ? SpvOpConstantTrue : SpvOpConstantFalse,
++                               c->t_bool, NULL, 0);
++            emit(c, SpvOpCopyObject, c->t_bool, val(c, inst), ops, 1);
++            return 0;
++        }
++        if (priv_off_of(c, a, root, &ops[0]) || priv_off_of(c, b, root, &ops[1])) {
++            return -1;
++        }
++        emit(c, icmp_op(p, false), c->t_bool, val(c, inst), ops, 2);
++        return 0;
++    }
++    if (c->npriv == MAX_PRIV) {
++        return fail(c, "too many private pointers");
++    }
++    if (op == LLVMSelect) {
++        ops[0] = val(c, LLVMGetOperand(inst, 0));
++        if (priv_off_of(c, LLVMGetOperand(inst, 1), root, &ops[1]) ||
++            priv_off_of(c, LLVMGetOperand(inst, 2), root, &ops[2])) {
++            return -1;
++        }
++        emit(c, SpvOpSelect, c->t_u32, val(c, inst), ops, 3);
++    } else {
++        unsigned n = LLVMCountIncoming(inst);
++
++        if (n > 30) {
++            return fail(c, "phi too wide");
++        }
++        for (unsigned i = 0; i < n; i++) {
++            int pb = bb_index(g, LLVMGetIncomingBlock(inst, i));
++
++            if (priv_off_of(c, LLVMGetIncomingValue(inst, i), root, &ops[2 * i])) {
++                return -1;
++            }
++            ops[2 * i + 1] = pb >= 0 && g->cont_label[pb] ? g->cont_label[pb] :
++                             pb >= 0 && g->split_label[pb] ? g->split_label[pb] :
++                             label(c, LLVMGetIncomingBlock(inst, i));
++        }
++        emit(c, SpvOpPhi, c->t_u32, val(c, inst), ops, 2 * n);
++    }
++    c->priv[c->npriv] = c->priv[root];
++    c->priv[c->npriv].v = inst;
++    c->priv[c->npriv++].off = val(c, inst);
++    return 0;
++}
++
+ static int instruction(Ctx *c, Cfg *g, int bi, LLVMValueRef inst)
+ {
+     LLVMOpcode op = LLVMGetInstructionOpcode(inst);
+@@ -2723,13 +2843,20 @@ static int instruction(Ctx *c, Cfg *g, int bi, LLVMValueRef inst)
+     if ((op == LLVMBitCast || op == LLVMAddrSpaceCast) && priv_find(c, LLVMGetOperand(inst, 0)) >= 0) {
+         int b = priv_find(c, LLVMGetOperand(inst, 0));
+ 
+-        if (c->npriv == 64) {
++        if (c->npriv == MAX_PRIV) {
+             return fail(c, "too many private pointers");
+         }
+         c->priv[c->npriv] = c->priv[b];     /* same memory, same offset */
++        c->priv[c->npriv].off = emit(c, SpvOpCopyObject, c->t_u32, val(c, inst),
++                                     &c->priv[b].off, 1);
+         c->priv[c->npriv++].v = inst;
+         return 0;
+     }
++    if ((op == LLVMPHI || op == LLVMSelect || op == LLVMICmp) &&
++        LLVMGetTypeKind(LLVMTypeOf(LLVMGetOperand(inst, op == LLVMSelect))) ==
++        LLVMPointerTypeKind && priv_root(c, inst, 0) >= 0) {
++        return priv_ptr_op(c, g, inst);
++    }
+     if (op == LLVMGetElementPtr && priv_find(c, LLVMGetOperand(inst, 0)) >= 0) {
+         return priv_gep(c, inst, priv_find(c, LLVMGetOperand(inst, 0)));
+     }
+-- 
+2.43.0
+

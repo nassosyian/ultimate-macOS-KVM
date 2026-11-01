@@ -1,0 +1,44 @@
+From 69d0425a807994c95a000feaef2fcc9cf0549be3 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 20:30:25 +0200
+Subject: [PATCH 35/54] hw/display/pvg/pvg-exec: log unresolved compute buffers
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/pvg-exec.c | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index 60982a8..ab191eb 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -156,7 +156,7 @@ struct PVGExec {
+     GHashTable *uploaded;       /* per command buffer: task << 32 | id → arena offset + 1 */
+     GHashTable *samplers;       /* task << 32 | id → VkSampler (as pointer) */
+     uint32_t upload_failures, ds_kind_logged, ds_states_logged, ds_dumps, blends_logged;
+-    uint32_t texfail_logged, cwb_logged, cio_dumps;
++    uint32_t texfail_logged, cwb_logged, cio_dumps, buffail_logged;
+     DSAttachmentSave last_ds;
+     HostImage dummy[7];         /* 1x1 placeholders per VkImageViewType */
+     GHashTable *written;
+@@ -2715,6 +2715,17 @@ static void exec_compute_segment(PVGExec *e, uint32_t task, const uint8_t *p, ui
+                     continue;
+                 }
+                 boff = cs.buf[i].ref ? buffer_upload(e, task, cs.buf[i].ref, &size) : UINT64_MAX;
++                if (boff == UINT64_MAX && e->buffail_logged < 40) {
++                    uint8_t obj[MAX_OBJ];
++                    uint32_t olen;
++                    uint8_t ty = object(e, task, cs.buf[i].ref, obj, &olen);
++
++                    e->buffail_logged++;
++                    elog(e, "task %u kernel %s: buffer %d ref %u unresolved: object type 0x%x "
++                         "len 0x%x words %08x %08x %08x %08x %08x %08x", task, pp->fs_name, i,
++                         cs.buf[i].ref, ty, olen, ldl(obj), ldl(obj + 4), ldl(obj + 8),
++                         ldl(obj + 12), ldl(obj + 16), ldl(obj + 20));
++                }
+                 if (boff == UINT64_MAX || cs.buf[i].offset >= size) {
+                     stq(pc + 8 * i, e->arena_addr);     /* guard zone at the arena start */
+                     continue;
+-- 
+2.43.0
+

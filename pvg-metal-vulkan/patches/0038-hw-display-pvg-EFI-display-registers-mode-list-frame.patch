@@ -1,0 +1,170 @@
+From fe8610233d9bed7b9af55cad2fc45dd198a69264 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 22:06:40 +0200
+Subject: [PATCH 38/54] hw/display/pvg: EFI display registers (mode list,
+ framebuffer scanout) for AppleParavirtEFI GOP
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-pci.c | 103 +++++++++++++++++++++++++++++++++++++
+ hw/display/trace-events    |   1 +
+ 2 files changed, 104 insertions(+)
+
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index 766b029..f40f9b1 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -52,6 +52,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(PVGLinuxPCIState, PVG_LINUX_PCI)
+ #define PVG_REG_RESUME_CHILD    0x1028  /* child FIFO index */
+ #define PVG_REG_FIFO_BASE_PAGE  0x1030
+ #define PVG_REG_DISPLAY_DOORBELL 0x1220 /* port */
++/* EFI display (AppleParavirtEFI.rom GOP driver, before the OS driver takes over) */
++#define PVG_REG_EFI_DISPLAY     0x1200  /* W: enable */
++#define PVG_REG_EFI_MODE_COUNT  0x1204  /* R */
++#define PVG_REG_EFI_MODE_SELECT 0x1208  /* W */
++#define PVG_REG_EFI_MODE_VALUE  0x120c  /* R: width | height << 16, ~0 if no such mode */
++#define PVG_REG_EFI_FB_START    0x1210  /* W: framebuffer task root PFN */
++#define PVG_REG_EFI_FB_LENGTH   0x1214  /* W: bytes */
++#define PVG_REG_EFI_FB_DEPTH    0x1218  /* W */
++#define PVG_REG_EFI_FB_MODE     0x121c  /* W: width | height << 16 */
++#define PVG_REG_EFI_STRIDE_ALIGN 0x1224 /* R */
++#define PVG_REG_EFI_FB_STRIDE   0x1228  /* W: bytes per row, 0 = width * 4 */
+ #define PVG_REG_DISPLAY_PORTS   0x122c
+ 
+ #define PVG_CMD_HDR_SIZE        12
+@@ -245,6 +256,7 @@ struct PVGLinuxPCIState {
+     bool scanout_valid;             /* console holds a presented frame */
+     uint8_t gamma_lut[3][256];      /* Transaction3 gamma table, 8-bit per channel */
+     bool gamma_active;              /* table set and not the identity */
++    QEMUTimer *efi_timer;           /* EFI display scanout while the GOP driver owns the screen */
+     int64_t fps_start;              /* frame-rate window (realtime ms) */
+     uint32_t fps_frames;
+ 
+@@ -1614,6 +1626,16 @@ static uint64_t pvg_linux_mmio_read(void *opaque, hwaddr addr, unsigned size)
+         s->stamp_status = 0;
+     } else if (size == 4 && addr == PVG_REG_DISPLAY_PORTS) {
+         val = s->display_ports;
++    } else if (size == 4 && addr == PVG_REG_EFI_MODE_COUNT) {
++        val = ARRAY_SIZE(pvg_display_modes);
++    } else if (size == 4 && addr == PVG_REG_EFI_MODE_VALUE) {
++        uint32_t sel = s->regs[PVG_REG_EFI_MODE_SELECT / 4];
++
++        val = sel < ARRAY_SIZE(pvg_display_modes) ?
++              pvg_display_modes[sel].width | (uint32_t)pvg_display_modes[sel].height << 16 :
++              0xffffffffu;
++    } else if (size == 4 && addr == PVG_REG_EFI_STRIDE_ALIGN) {
++        val = 256;      /* minimumLinearTextureAlignmentForPixelFormat:BGRA8 */
+     } else {
+         memcpy(&val, (uint8_t *)s->regs + addr, size);
+     }
+@@ -1642,7 +1664,87 @@ static void pvg_linux_mmio_write(void *opaque, hwaddr addr, uint64_t val,
+     case PVG_REG_DISPLAY_DOORBELL:
+         pvg_display_doorbell(s, val);
+         break;
++    case PVG_REG_EFI_DISPLAY: case PVG_REG_EFI_FB_START: case PVG_REG_EFI_FB_LENGTH:
++    case PVG_REG_EFI_FB_MODE: case PVG_REG_EFI_FB_STRIDE:
++        trace_pvg_linux_efi_display(s->regs[PVG_REG_EFI_DISPLAY / 4],
++                                    s->regs[PVG_REG_EFI_FB_START / 4],
++                                    s->regs[PVG_REG_EFI_FB_LENGTH / 4],
++                                    s->regs[PVG_REG_EFI_FB_MODE / 4],
++                                    s->regs[PVG_REG_EFI_FB_STRIDE / 4]);
++        if (s->efi_timer) {
++            if (s->regs[PVG_REG_EFI_DISPLAY / 4] && s->regs[PVG_REG_EFI_FB_START / 4] &&
++                s->regs[PVG_REG_EFI_FB_MODE / 4]) {
++                timer_mod(s->efi_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 33);
++            } else {
++                timer_del(s->efi_timer);
++            }
++        }
++        break;
++    }
++}
++
++/*
++ * EFI framebuffer address: like a task, START is the PFN of a root page
++ * {u32 page table root PFN, u32 depth} (PGEFIDisplay creates a task for it); a plain PFN of
++ * contiguous memory is accepted as a fallback.
++ */
++static bool pvg_efi_translate(PVGLinuxPCIState *s, uint64_t va, uint64_t *gpa)
++{
++    PCIDevice *d = PCI_DEVICE(s);
++    uint64_t root = (uint64_t)s->regs[PVG_REG_EFI_FB_START / 4] << 12;
++    uint32_t table, depth, entry;
++
++    ldl_le_pci_dma(d, root, &table, MEMTXATTRS_UNSPECIFIED);
++    ldl_le_pci_dma(d, root + 4, &depth, MEMTXATTRS_UNSPECIFIED);
++    if (depth < 1 || depth > 4 || !table) {
++        *gpa = root + va;
++        return true;
++    }
++    for (int level = depth - 1; level >= 0; level--) {
++        ldl_le_pci_dma(d, ((uint64_t)table << 12) + ((va >> (12 + 10 * level)) & 0x3ff) * 4,
++                       &entry, MEMTXATTRS_UNSPECIFIED);
++        table = entry & 0x7fffffff;
++        if (!table) {
++            return false;
++        }
++    }
++    *gpa = ((uint64_t)table << 12) | (va & 0xfff);
++    return true;
++}
++
++/* copy the EFI framebuffer (32-bit BGRX) to the console, ~30 Hz */
++static void pvg_efi_scanout(void *opaque)
++{
++    PVGLinuxPCIState *s = opaque;
++    uint32_t mode = s->regs[PVG_REG_EFI_FB_MODE / 4];
++    uint32_t w = mode & 0xffff, h = mode >> 16, stride = s->regs[PVG_REG_EFI_FB_STRIDE / 4];
++    uint32_t len = s->regs[PVG_REG_EFI_FB_LENGTH / 4];
++    uint8_t *fb;
++    int fstride;
++
++    if (!s->con || !s->regs[PVG_REG_EFI_DISPLAY / 4] || !w || !h || w > 8192 || h > 8192) {
++        return;
+     }
++    stride = stride ? stride : w * 4;
++    if (len && (uint64_t)stride * h > len) {
++        h = len / stride;
++    }
++    pvg_display_ensure_surface(s, w, h);
++    fb = surface_data(s->surface);
++    fstride = surface_stride(s->surface);
++    for (uint32_t y = 0; y < h; y++) {
++        for (uint32_t x = 0; x < w * 4;) {
++            uint64_t va = (uint64_t)y * stride + x, gpa;
++            uint32_t chunk = MIN(w * 4 - x, 0x1000 - (va & 0xfff));
++
++            if (pvg_efi_translate(s, va, &gpa)) {
++                pci_dma_read(PCI_DEVICE(s), gpa, fb + y * fstride + x, chunk);
++            }
++            x += chunk;
++        }
++    }
++    qemu_console_update_full(s->con);
++    timer_mod(s->efi_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 33);
+ }
+ 
+ static const MemoryRegionOps pvg_linux_mmio_ops = {
+@@ -1688,6 +1790,7 @@ static void pvg_linux_realize(PCIDevice *dev, Error **errp)
+     if (s->display_ports) {
+         s->con = qemu_graphic_console_create(DEVICE(dev), 0, &pvg_display_ops,
+                                              s);
++        s->efi_timer = timer_new_ms(QEMU_CLOCK_REALTIME, pvg_efi_scanout, s);
+     }
+     if (s->gpu_enable) {
+         char err[256];
+diff --git a/hw/display/trace-events b/hw/display/trace-events
+index 078c0af..b9fbb4a 100644
+--- a/hw/display/trace-events
++++ b/hw/display/trace-events
+@@ -242,6 +242,7 @@ pvg_linux_doorbell(uint32_t port, uint32_t show, int x, int y) "port %u show=%u
+ pvg_linux_present(uint32_t port, uint32_t task, uint32_t surface) "port %u task %u surface %u"
+ pvg_linux_present_done(uint32_t events, uint32_t mask) "events=0x%x mask=0x%x"
+ pvg_linux_fps(uint32_t fps) "presents per second %u"
++pvg_linux_efi_display(uint32_t on, uint32_t start, uint32_t len, uint32_t mode, uint32_t stride) "efi display %u start 0x%x len 0x%x mode 0x%x stride %u"
+ pvg_linux_object_list(uint32_t task, uint64_t va, uint32_t len) "task %u objects at va=0x%"PRIx64" len=0x%x"
+ pvg_linux_scanout(uint32_t surface, uint32_t w, uint32_t h, uint64_t va, uint32_t missing_rows, uint32_t nonzero_samples) "surface %u %ux%u va=0x%"PRIx64" unreadable_rows=%u nonzero_samples=%u"
+ pvg_linux_scanout_skip(uint32_t surface, const char *why) "surface %u: %s"
+-- 
+2.43.0
+

@@ -1,0 +1,626 @@
+From 85b6a87031a03493cec10a8116aa447ed2d98dd1 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Sat, 31 Oct 2026 15:21:26 +0200
+Subject: [PATCH 74/75] hw/display/pvg: on-disk shader caches, presents on the
+ executor thread
+
+Translations (SPIR-V per SHA-256 of the translator inputs) and the
+VkPipelineCache are kept under $XDG_CACHE_HOME/pvg, keyed by the QEMU
+binary; caches of other builds go after a week. PVG_NO_DISK_CACHE=1
+disables them.
+
+With the async worker, Transaction3 no longer drains the worker under
+the BQL and copies the frame on the vCPU: it is queued behind the
+command buffers it shows. The worker reads the frame and records the
+rows that changed; a bottom half copies only those (applying gamma),
+updates that band of the console and signals the present. Mission
+Control test: 16.1-16.8 -> 17.0-17.6 presents/s.
+
+PVG_DIAG_REDUNDANT=1 logs how many uploaded bytes repeat the previous
+upload of the same range (measurement only).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-pci.c | 167 ++++++++++++++++++++++++++-
+ hw/display/pvg/pvg-exec.c  | 226 ++++++++++++++++++++++++++++++++++++-
+ hw/display/pvg/pvg-exec.h  |   2 +
+ hw/display/trace-events    |   3 +-
+ 4 files changed, 390 insertions(+), 8 deletions(-)
+
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index 2ad8a38..2e29e96 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -263,6 +263,18 @@ struct PVGLinuxPCIState {
+     bool scanout_valid;             /* console holds a presented frame */
+     uint8_t gamma_lut[3][256];      /* Transaction3 gamma table, 8-bit per channel */
+     bool gamma_active;              /* table set and not the identity */
++    /*
++     * Presents with the async worker: the worker copies the frame from guest memory into
++     * present_buf (raw, before gamma) and records which rows changed; the main loop copies
++     * those rows into the console surface (applying gamma) and signals the present.
++     */
++    QemuMutex present_lock;
++    uint32_t *present_buf, *present_tmp;
++    uint32_t present_w, present_h;
++    uint32_t present_y0, present_y1;    /* changed rows not yet on the console; y1 == 0: none */
++    uint32_t presents_done, presents_shown;
++    bool present_full;              /* gamma or size changed: copy every row */
++    int64_t present_queued_us;
+     int64_t exec_us, exec_max_us, exec_window_start;   /* executor time per 500 cmdbufs */
+     int64_t exec_read_us, exec_write_us;            /* ... of it copying guest memory */
+     uint64_t exec_read_bytes, exec_write_bytes;
+@@ -1180,6 +1192,7 @@ static void pvg_display_set_gamma(PVGLinuxPCIState *s, uint64_t va, uint64_t len
+         }
+     }
+     s->gamma_active = !identity;
++    s->present_full = true;
+ }
+ 
+ /* Copy a presented BGRA backing (kernel task) into the console */
+@@ -1242,6 +1255,127 @@ static void pvg_display_scanout(PVGLinuxPCIState *s, uint32_t surface_id)
+     qemu_console_update_full(s->con);
+ }
+ 
++/*
++ * Worker side of a present: read the frame into present_tmp without holding anything, then
++ * merge it into present_buf under present_lock, recording the rows that changed.
++ */
++static void pvg_present_run(PVGLinuxPCIState *s, uint32_t surface_id)
++{
++    uint8_t obj[0x100];
++    uint32_t objlen, offset, width, height, row_bytes, missing = 0, changed = 0;
++    uint64_t base;
++
++    if (pvg_task_object(s, 0, surface_id, obj, sizeof(obj), &objlen) !=
++        PVG_OBJ_BACKING || objlen < 0x24 || ldl_le_p(obj + 0x10) < 1) {
++        trace_pvg_linux_scanout_skip(surface_id, "not a backing");
++        goto done;
++    }
++    base = (uint64_t)ldl_le_p(obj + 0x08) << 12;
++    offset = ldl_le_p(obj + 0x14);
++    width = ldl_le_p(obj + 0x18);
++    height = ldl_le_p(obj + 0x1c);
++    row_bytes = ldl_le_p(obj + 0x20) & 0xffffff;
++    if (ldl_le_p(obj + 0x0c) != PVG_FOURCC_BGRA || (ldl_le_p(obj + 0x20) >> 24) != 4 ||
++        !width || !height || width > 8192 || height > 8192 || row_bytes < width * 4) {
++        trace_pvg_linux_scanout_skip(surface_id, "unsupported format");
++        goto done;
++    }
++    if (width != s->present_w || height != s->present_h) {
++        qemu_mutex_lock(&s->present_lock);
++        g_free(s->present_buf);
++        g_free(s->present_tmp);
++        s->present_buf = g_new0(uint32_t, (size_t)width * height);
++        s->present_tmp = g_new0(uint32_t, (size_t)width * height);
++        s->present_w = width;
++        s->present_h = height;
++        s->present_y0 = 0;
++        s->present_y1 = height;
++        qemu_mutex_unlock(&s->present_lock);
++    }
++    for (uint32_t y = 0; y < height; y++) {
++        uint32_t *row = s->present_tmp + (size_t)y * width;
++
++        if (!pvg_task_read(s, 0, base + offset + (uint64_t)y * row_bytes, row, width * 4)) {
++            memset(row, 0, width * 4);
++            missing++;
++        }
++    }
++    qemu_mutex_lock(&s->present_lock);
++    for (uint32_t y = 0; y < height; y++) {
++        uint32_t *src = s->present_tmp + (size_t)y * width;
++        uint32_t *dst = s->present_buf + (size_t)y * width;
++
++        if (memcmp(src, dst, width * 4)) {
++            memcpy(dst, src, width * 4);
++            if (s->present_y1 == 0) {
++                s->present_y0 = y;
++            }
++            s->present_y0 = MIN(s->present_y0, y);
++            s->present_y1 = MAX(s->present_y1, y + 1);
++            changed++;
++        }
++    }
++    qemu_mutex_unlock(&s->present_lock);
++    trace_pvg_linux_scanout(surface_id, width, height, base, missing, changed);
++done:
++    qatomic_inc(&s->presents_done);
++}
++
++/* main loop: put the rows the worker found changed on the console and complete the present */
++static void pvg_present_show(PVGLinuxPCIState *s)
++{
++    uint32_t done = qatomic_read(&s->presents_done), y0, y1, w, h;
++    uint32_t *fb;
++    int stride;
++
++    if (done == s->presents_shown || !s->con) {
++        return;
++    }
++    s->presents_shown = done;
++    qemu_mutex_lock(&s->present_lock);
++    w = s->present_w;
++    h = s->present_h;
++    if (w && h) {
++        pvg_display_ensure_surface(s, w, h);
++        if (s->present_full || !s->scanout_valid) {
++            s->present_y0 = 0;
++            s->present_y1 = h;
++            s->present_full = false;
++        }
++    }
++    y0 = s->present_y0;
++    y1 = s->present_y1;
++    s->present_y0 = s->present_y1 = 0;
++    if (w && h && y1 > y0) {
++        fb = surface_data(s->surface);
++        stride = surface_stride(s->surface);
++        for (uint32_t y = y0; y < y1; y++) {
++            const uint32_t *src = s->present_buf + (size_t)y * w;
++            uint32_t *row = (uint32_t *)((uint8_t *)fb + y * stride);
++
++            if (!s->gamma_active) {
++                memcpy(row, src, w * 4);
++                continue;
++            }
++            for (uint32_t x = 0; x < w; x++) {
++                uint32_t p = src[x];
++
++                row[x] = (p & 0xff000000) | s->gamma_lut[0][p >> 16 & 0xff] << 16 |
++                         s->gamma_lut[1][p >> 8 & 0xff] << 8 | s->gamma_lut[2][p & 0xff];
++            }
++        }
++    }
++    qemu_mutex_unlock(&s->present_lock);
++    if (w && h) {
++        s->scanout_valid = true;
++        if (y1 > y0) {
++            qemu_console_update(s->con, 0, y0, w, y1 - y0);
++        }
++    }
++    pvg_display_event(s, DS_EVENT_PRESENTED);
++    trace_pvg_linux_present_shown(y0, y1, g_get_monotonic_time() - s->present_queued_us);
++}
++
+ /* ---- executor glue ---- */
+ 
+ static bool pvg_exec_read(void *opaque, uint32_t task, uint64_t va, void *buf, uint64_t len)
+@@ -1523,14 +1657,18 @@ typedef struct PVGExecJob {
+     GPtrArray *bufs;            /* GBytes: command buffers, copied at submission */
+     int stamp_index;            /* FIFO stamp to publish when done, -1 none */
+     uint32_t stamp;
++    uint32_t present;           /* Transaction3 surface to scan out (bufs NULL), 0 none */
+ } PVGExecJob;
+ 
+ static void pvg_exec_job_free(PVGExecJob *job)
+ {
+-    g_ptr_array_unref(job->bufs);
++    if (job->bufs) {
++        g_ptr_array_unref(job->bufs);
++    }
+     g_free(job);
+ }
+ 
++
+ /* Execute one command buffer; per-500 timing and statistics traces */
+ static void pvg_exec_run_buf(PVGLinuxPCIState *s, uint32_t task, const uint8_t *buf,
+                              uint64_t cblen)
+@@ -1558,7 +1696,7 @@ static void pvg_exec_run_buf(PVGLinuxPCIState *s, uint32_t task, const uint8_t *
+                                    st->cache_sync_us / 1000, s->dirty_sync_us / 1000);
+         s->dirty_sync_us = 0;
+         trace_pvg_linux_exec_pipelines(st->pipeline_us / 1000, st->spv_cache_hits,
+-                                       st->damage_saved >> 20);
++                                       st->spv_disk_hits, st->damage_saved >> 20);
+         trace_pvg_linux_exec_stats(s->exec_cmdbufs, st->render_passes, st->draws,
+                                    st->skipped_draws, st->pipelines,
+                                    st->pipeline_failures, st->writebacks, st->blits,
+@@ -1588,7 +1726,10 @@ static void *pvg_exec_thread(void *opaque)
+         job = g_queue_pop_head(&s->exec_jobs);
+         s->exec_busy = true;
+         qemu_mutex_unlock(&s->exec_lock);
+-        for (guint i = 0; i < job->bufs->len; i++) {
++        if (job->present) {
++            pvg_present_run(s, job->present);
++        }
++        for (guint i = 0; job->bufs && i < job->bufs->len; i++) {
+             gsize n;
+             const uint8_t *b = g_bytes_get_data(g_ptr_array_index(job->bufs, i), &n);
+ 
+@@ -1617,6 +1758,7 @@ static void pvg_exec_bh(void *opaque)
+ {
+     PVGLinuxPCIState *s = opaque;
+ 
++    pvg_present_show(s);
+     for (int i = 0; i < PVG_MAX_STAMPS; i++) {
+         uint32_t value;
+         bool fire = false;
+@@ -1643,7 +1785,7 @@ static void pvg_exec_submit(PVGLinuxPCIState *s, PVGExecJob *job)
+     job->stamp_index = s->cur_stamp_index;
+     job->stamp = s->cur_stamp_value;
+     if (!s->async_exec || !s->exec_thread_started) {
+-        for (guint i = 0; i < job->bufs->len; i++) {
++        for (guint i = 0; job->bufs && i < job->bufs->len; i++) {
+             gsize n;
+             const uint8_t *b = g_bytes_get_data(g_ptr_array_index(job->bufs, i), &n);
+ 
+@@ -1771,7 +1913,12 @@ static void pvg_dispatch(PVGLinuxPCIState *s, const PVGCmdHeader *h,
+                          const uint8_t *payload, uint32_t len)
+ {
+     switch (h->opcode) {
+-    case PVG_CMD_DISPLAY_TRANSACTION3: case PVG_CMD_UNMAP_MEMORY: case PVG_CMD_MAP_MEMORY2:
++    case PVG_CMD_DISPLAY_TRANSACTION3:
++        if (s->exec_thread_started) {
++            break;              /* queued behind the command buffers it shows */
++        }
++        /* fall through */
++    case PVG_CMD_UNMAP_MEMORY: case PVG_CMD_MAP_MEMORY2:
+     case PVG_CMD_DELETE_TASK: case PVG_CMD_DELETE_RESOURCE: case PVG_CMD_DELETE_OBJECT:
+     case PVG_CMD_DEFINE_TASK2: case PVG_CMD_SET_OBJECT_LIST: case 0x3c: /* ReplacePhysical */
+     case 0x35:          /* SynchronizeResources: the executor writes resources back */
+@@ -1812,6 +1959,14 @@ static void pvg_dispatch(PVGLinuxPCIState *s, const PVGCmdHeader *h,
+                 pvg_display_set_gamma(s, ldq_le_p(payload + 12), ldq_le_p(payload + 20),
+                                       ldl_le_p(payload + 28));
+             }
++            if (s->exec_thread_started) {
++                PVGExecJob *job = g_new0(PVGExecJob, 1);
++
++                job->present = ldl_le_p(payload + 8);
++                s->present_queued_us = g_get_monotonic_time();
++                pvg_exec_submit(s, job);
++                break;
++            }
+             pvg_display_scanout(s, ldl_le_p(payload + 8));
+             /* the host's presentFrame completion: the guest waits for it before the next frame */
+             pvg_display_event(s, DS_EVENT_PRESENTED);
+@@ -2247,6 +2402,7 @@ static void pvg_linux_realize(PCIDevice *dev, Error **errp)
+                     warn_report("pvg-linux-pci: Metal executor initialisation failed");
+                 } else if (s->async_exec) {
+                     qemu_mutex_init(&s->exec_lock);
++                    qemu_mutex_init(&s->present_lock);
+                     qemu_cond_init(&s->exec_cond);
+                     g_queue_init(&s->exec_jobs);
+                     s->exec_bh = qemu_bh_new(pvg_exec_bh, s);
+@@ -2328,6 +2484,7 @@ static void pvg_linux_reset(DeviceState *dev)
+     memset(s->tasks, 0, sizeof(s->tasks));
+     s->ds_gpa = 0;
+     s->scanout_valid = false;
++    s->present_full = true;
+     s->cursor_show = false;
+ }
+ 
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index 40c8f7a..217edc3 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -238,6 +238,8 @@ struct PVGExec {
+     uint32_t upload_failures, ds_kind_logged, ds_states_logged, ds_dumps, blends_logged;
+     GHashTable *spv_cache;      /* SHA-256 of translator inputs -> A2SResult */
+     VkPipelineCache vk_cache;
++    char *cache_dir;            /* on-disk caches ($XDG_CACHE_HOME/pvg); NULL: memory only */
++    uint64_t vk_cache_saved;    /* pipelines created when the VkPipelineCache was last saved */
+     bool damage_limit;          /* upload / write back only what a pass draws */
+     bool msaa;                  /* render multisample passes multisampled (else into the resolve texture) */
+     bool upload_cache;
+@@ -1033,11 +1035,57 @@ static bool zc_copy(PVGExec *e, uint32_t task, uint64_t cva, uint64_t clen, uint
+  * Guest memory -> arena offset off, for the GPU: a GPU gather into the twin with zero-copy;
+  * otherwise (and as fallback) a CPU copy into the arena, then copied on into the twin.
+  */
++/*
++ * Diagnostic (PVG_DIAG_REDUNDANT=1): how many uploaded bytes are identical to the previous upload
++ * of the same guest range. Hashes every upload on the CPU: slow, measurement runs only.
++ */
++static void diag_redundant(PVGExec *e, uint32_t task, uint64_t va, uint64_t len)
++{
++    static GHashTable *last;
++    static uint64_t total[2], same[2], n;
++    static int on = -1;
++    g_autofree uint64_t *buf = NULL;
++    uint64_t h = 0xcbf29ce484222325ull, key[2] = { (uint64_t)task << 48 ^ va, len };
++    gint64 k;
++    gpointer old;
++    int big = len > (1u << 20);
++
++    if (on < 0) {
++        on = g_getenv("PVG_DIAG_REDUNDANT") != NULL;
++        last = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
++    }
++    if (!on || len < 64) {
++        return;
++    }
++    buf = g_malloc((len + 7) & ~7ull);
++    if (!e->host.read(e->host.opaque, task, va, buf, len)) {
++        return;
++    }
++    for (uint64_t i = 0; i < len / 8; i++) {
++        h = (h ^ buf[i]) * 0x100000001b3ull;
++    }
++    k = (gint64)(key[0] * 31 + key[1]);
++    total[big] += len;
++    if (g_hash_table_lookup_extended(last, &k, NULL, &old) && (uint64_t)(uintptr_t)old == h) {
++        same[big] += len;
++    } else {
++        g_hash_table_replace(last, g_memdup2(&k, sizeof(k)), (gpointer)(uintptr_t)h);
++    }
++    if (++n % 20000 == 0) {
++        elog(e, "diag: uploads <=1MiB %" G_GUINT64_FORMAT " MiB, %" G_GUINT64_FORMAT
++             " MiB unchanged; >1MiB %" G_GUINT64_FORMAT " MiB, %" G_GUINT64_FORMAT
++             " MiB unchanged; %u ranges", total[0] >> 20,
++             same[0] >> 20, total[1] >> 20, same[1] >> 20, g_hash_table_size(last));
++    }
++}
++
+ static bool guest_to_arena_in(PVGExec *e, uint32_t task, uint64_t cva, uint64_t clen,
+                               uint64_t va, uint64_t off, uint64_t len)
+ {
+     VkBufferCopy r = { .srcOffset = off, .dstOffset = off, .size = len };
+ 
++    diag_redundant(e, task, va, len);
++
+     if (e->zc && e->zc_nram && len > e->bar_max &&
+         zc_copy(e, task, cva, clen, va, len, off, false)) {
+         return true;
+@@ -2460,11 +2508,95 @@ static char *spv_cache_key(const void *bc, size_t bclen, const A2SResult *r)
+     return g_strdup(g_checksum_get_string(ck));
+ }
+ 
++/*
++ * On-disk copy of the translation cache: one file per key, <cache_dir>/spv-<build>/<key>, holding
++ * the A2SResult (spirv pointer cleared) followed by the SPIR-V words. Read on a memory miss.
++ */
++#define SPV_FILE_MAGIC 0x31767370u      /* "psv1" */
++
++/*
++ * Cached translations are only valid for the translator that produced them, so the on-disk
++ * caches are keyed by the QEMU binary (size and mtime): any rebuild starts a new cache.
++ */
++static const char *cache_build_id(void)
++{
++    static char id[40];
++    struct stat st;
++
++    if (!id[0]) {
++        if (stat("/proc/self/exe", &st) == 0) {
++            snprintf(id, sizeof(id), "%llx-%llx", (unsigned long long)st.st_size,
++                     (unsigned long long)st.st_mtime);
++        } else {
++            snprintf(id, sizeof(id), "unknown");
++        }
++    }
++    return id;
++}
++
++static char *spv_cache_path(PVGExec *e, const char *key)
++{
++    return g_strdup_printf("%s/spv-%s/%s", e->cache_dir, cache_build_id(), key);
++}
++
++static const A2SResult *spv_cache_load(PVGExec *e, const char *key)
++{
++    g_autofree char *path = NULL;
++    g_autofree char *buf = NULL;
++    gsize len;
++    A2SResult *r;
++    uint32_t hdr[2];
++
++    if (!e->cache_dir) {
++        return NULL;
++    }
++    path = spv_cache_path(e, key);
++    if (!g_file_get_contents(path, &buf, &len, NULL) || len < 8 + sizeof(*r)) {
++        return NULL;
++    }
++    memcpy(hdr, buf, 8);
++    if (hdr[0] != SPV_FILE_MAGIC || hdr[1] != sizeof(*r)) {
++        return NULL;
++    }
++    r = g_memdup2(buf + 8, sizeof(*r));
++    if (len != 8 + sizeof(*r) + r->nwords * 4 || !r->nwords) {
++        g_free(r);
++        return NULL;
++    }
++    r->spirv = g_memdup2(buf + 8 + sizeof(*r), r->nwords * 4);
++    g_hash_table_replace(e->spv_cache, g_strdup(key), r);
++    e->stats.spv_disk_hits++;
++    return r;
++}
++
++static void spv_cache_save(PVGExec *e, const char *key, const A2SResult *r)
++{
++    g_autofree char *path = NULL;
++    g_autofree char *dir = NULL;
++    g_autofree char *buf = NULL;
++    size_t len = 8 + sizeof(*r) + r->nwords * 4;
++    uint32_t hdr[2] = { SPV_FILE_MAGIC, sizeof(*r) };
++    A2SResult flat = *r;
++
++    if (!e->cache_dir) {
++        return;
++    }
++    path = spv_cache_path(e, key);
++    dir = g_path_get_dirname(path);
++    g_mkdir_with_parents(dir, 0700);
++    flat.spirv = NULL;
++    buf = g_malloc(len);
++    memcpy(buf, hdr, 8);
++    memcpy(buf + 8, &flat, sizeof(flat));
++    memcpy(buf + 8 + sizeof(flat), r->spirv, r->nwords * 4);
++    g_file_set_contents(path, buf, len, NULL);
++}
++
+ static bool spv_cache_lookup(PVGExec *e, const char *key, A2SResult *r)
+ {
+     const A2SResult *hit = g_hash_table_lookup(e->spv_cache, key);
+ 
+-    if (!hit) {
++    if (!hit && !(hit = spv_cache_load(e, key))) {
+         return false;
+     }
+     *r = *hit;
+@@ -2484,6 +2616,7 @@ static void spv_cache_store(PVGExec *e, const char *key, const A2SResult *r)
+     copy = g_memdup2(r, sizeof(*r));
+     copy->spirv = g_memdup2(r->spirv, r->nwords * 4);
+     g_hash_table_replace(e->spv_cache, g_strdup(key), copy);
++    spv_cache_save(e, key, r);
+ }
+ 
+ static void spv_cache_free(gpointer p)
+@@ -5714,6 +5847,71 @@ static void exec_blit_segment(PVGExec *e, uint32_t task, const uint8_t *p, uint3
+     }
+ }
+ 
++/* caches of other QEMU builds are deleted once they are a week old */
++static void cache_prune(const char *dir)
++{
++    g_autoptr(GDir) d = g_dir_open(dir, 0, NULL);
++    const char *name;
++    time_t old = time(NULL) - 7 * 24 * 3600;
++
++    while (d && (name = g_dir_read_name(d))) {
++        g_autofree char *path = g_build_filename(dir, name, NULL);
++        struct stat st;
++
++        if (strstr(name, cache_build_id()) || stat(path, &st) || st.st_mtime > old) {
++            continue;
++        }
++        if (S_ISDIR(st.st_mode)) {
++            g_autoptr(GDir) sub = g_dir_open(path, 0, NULL);
++            const char *f;
++
++            while (sub && (f = g_dir_read_name(sub))) {
++                g_autofree char *fp = g_build_filename(path, f, NULL);
++
++                g_unlink(fp);
++            }
++            g_rmdir(path);
++        } else {
++            g_unlink(path);
++        }
++    }
++}
++
++static char *vk_cache_path(PVGExec *e)
++{
++    return g_strdup_printf("%s/pipelines-%s.bin", e->cache_dir, cache_build_id());
++}
++
++/*
++ * The VkPipelineCache is saved when new pipelines were created and 20 s passed since the last
++ * save (QEMU exits without freeing devices, so there is no reliable final save). The driver
++ * checks the data's header (device and driver UUID) when it is loaded again.
++ */
++static void vk_cache_maybe_save(PVGExec *e, bool force)
++{
++    static int64_t last;
++    int64_t now = g_get_monotonic_time();
++    g_autofree char *path = NULL;
++    g_autofree void *data = NULL;
++    size_t len = 0;
++
++    if (!e->cache_dir || !e->vk_cache || e->stats.pipelines == e->vk_cache_saved ||
++        (!force && now - last < 20 * G_USEC_PER_SEC)) {
++        return;
++    }
++    last = now;
++    e->vk_cache_saved = e->stats.pipelines;
++    if (vkGetPipelineCacheData(e->gpu->device, e->vk_cache, &len, NULL) != VK_SUCCESS || !len) {
++        return;
++    }
++    data = g_malloc(len);
++    if (vkGetPipelineCacheData(e->gpu->device, e->vk_cache, &len, data) == VK_SUCCESS) {
++        path = vk_cache_path(e);
++        g_mkdir_with_parents(e->cache_dir, 0700);
++        g_file_set_contents(path, data, len, NULL);
++    }
++}
++
+ void pvg_exec_cmdbuf(PVGExec *e, uint32_t task, const uint8_t *buf, uint64_t len)
+ {
+     uint64_t off = 0;
+@@ -5721,6 +5919,7 @@ void pvg_exec_cmdbuf(PVGExec *e, uint32_t task, const uint8_t *buf, uint64_t len
+     if (e->disabled) {
+         return;
+     }
++    vk_cache_maybe_save(e, false);
+     cache_sync(e);
+     if (e->dump_dir && !e->capture_left) {
+         /* frame capture on demand: touch <dump-dir>/capture */
+@@ -6008,10 +6207,31 @@ PVGExec *pvg_exec_new(PVGGpu *gpu, const PVGExecHost *host)
+     e->pool = g_ptr_array_new();
+     e->pipelines = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, pipeline_free);
+     e->spv_cache = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, spv_cache_free);
++    if (!g_getenv("PVG_NO_DISK_CACHE")) {
++        e->cache_dir = g_build_filename(g_get_user_cache_dir(), "pvg", NULL);
++        cache_prune(e->cache_dir);
++    }
+     {
+         VkPipelineCacheCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
++        g_autofree char *path = e->cache_dir ? vk_cache_path(e) : NULL;
++        g_autofree char *data = NULL;
++        gsize len = 0;
+ 
+-        vkCreatePipelineCache(gpu->device, &pci, NULL, &e->vk_cache);
++        if (path && g_file_get_contents(path, &data, &len, NULL)) {
++            pci.initialDataSize = len;
++            pci.pInitialData = data;
++        }
++        if (vkCreatePipelineCache(gpu->device, &pci, NULL, &e->vk_cache) != VK_SUCCESS &&
++            pci.initialDataSize) {
++            pci.initialDataSize = 0;
++            pci.pInitialData = NULL;
++            vkCreatePipelineCache(gpu->device, &pci, NULL, &e->vk_cache);
++        }
++        e->stats.vk_cache_loaded = len;
++        if (e->cache_dir) {
++            elog(e, "disk cache %s (build %s): %zu KiB of pipeline cache loaded", e->cache_dir,
++                 cache_build_id(), (size_t)len >> 10);
++        }
+     }
+     e->uploaded = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
+     e->samplers = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
+@@ -6082,6 +6302,8 @@ void pvg_exec_free(PVGExec *e)
+     g_array_free(e->pending, true);
+     g_hash_table_destroy(e->pipelines);
+     g_hash_table_destroy(e->spv_cache);
++    vk_cache_maybe_save(e, true);
++    g_free(e->cache_dir);
+     if (e->vk_cache) {
+         vkDestroyPipelineCache(e->gpu->device, e->vk_cache, NULL);
+     }
+diff --git a/hw/display/pvg/pvg-exec.h b/hw/display/pvg/pvg-exec.h
+index aa2caaa..fc6fe2c 100644
+--- a/hw/display/pvg/pvg-exec.h
++++ b/hw/display/pvg/pvg-exec.h
+@@ -52,6 +52,8 @@ typedef struct PVGExecStats {
+     uint64_t compute_segments, dispatches;
+     uint64_t gpu_wait_us;       /* since pvg_exec_reset_wait() */
+     uint64_t spv_cache_hits, pipeline_us;   /* translations reused; time building pipelines */
++    uint64_t spv_disk_hits;     /* translations read from the on-disk cache */
++    uint64_t vk_cache_loaded;   /* bytes of VkPipelineCache data loaded at start */
+     uint64_t damage_saved;      /* bytes not copied thanks to damage rectangles */
+     /* upload cache: textures reused, bytes not uploaded, entries dropped, time syncing */
+     uint64_t cache_hits, cache_saved, cache_invalidated, cache_sync_us;
+diff --git a/hw/display/trace-events b/hw/display/trace-events
+index dc3a1a3..9ee3f19 100644
+--- a/hw/display/trace-events
++++ b/hw/display/trace-events
+@@ -246,6 +246,7 @@ pvg_linux_efi_display(uint32_t on, uint32_t start, uint32_t len, uint32_t mode,
+ pvg_linux_efi_scanout(uint32_t w, uint32_t h, uint32_t px0) "efi scanout %ux%u first pixel 0x%x"
+ pvg_linux_object_list(uint32_t task, uint64_t va, uint32_t len) "task %u objects at va=0x%"PRIx64" len=0x%x"
+ pvg_linux_scanout(uint32_t surface, uint32_t w, uint32_t h, uint64_t va, uint32_t missing_rows, uint32_t nonzero_samples) "surface %u %ux%u va=0x%"PRIx64" unreadable_rows=%u nonzero_samples=%u"
++pvg_linux_present_shown(uint32_t y0, uint32_t y1, int64_t latency_us) "rows %u-%u, %"PRId64" us after the Transaction3"
+ pvg_linux_scanout_skip(uint32_t surface, const char *why) "surface %u: %s"
+ pvg_linux_cmdbuf(uint32_t task, uint32_t nres, uint64_t va, uint64_t len) "task %u resources=%u cmdbuf va=0x%"PRIx64" len=0x%"PRIx64
+ pvg_linux_segment(uint32_t task, uint64_t off, uint32_t len, const char *enc, uint32_t cont, uint32_t end) "task %u +0x%"PRIx64" len=0x%x %s cont=%u end=%u"
+@@ -255,7 +256,7 @@ pvg_linux_ref(uint32_t task, const char *cmd, uint32_t slot, uint32_t ref, uint3
+ pvg_linux_exec(const char *msg) "%s"
+ pvg_linux_exec_stats(uint64_t cmdbufs, uint64_t passes, uint64_t draws, uint64_t skipped, uint64_t pipelines, uint64_t pipe_fail, uint64_t writebacks, uint64_t blits, uint64_t feedback, uint64_t dispatches) "cmdbufs=%"PRIu64" passes=%"PRIu64" draws=%"PRIu64" skipped=%"PRIu64" pipelines=%"PRIu64" failed=%"PRIu64" writebacks=%"PRIu64" blits=%"PRIu64" feedback=%"PRIu64" dispatches=%"PRIu64
+ pvg_linux_exec_time(uint64_t cmdbufs, int64_t exec_ms, int64_t wall_ms, int64_t max_us, int64_t read_ms, uint64_t read_mb, int64_t write_ms, uint64_t write_mb, uint64_t wait_ms) "cmdbufs=%"PRIu64" exec %"PRId64" ms of %"PRId64" ms wall, slowest %"PRId64" us; guest read %"PRId64" ms %"PRIu64" MiB, write %"PRId64" ms %"PRIu64" MiB, gpu wait %"PRIu64" ms"
+-pvg_linux_exec_pipelines(uint64_t pipe_ms, uint64_t spv_hits, uint64_t damage_mb) "building pipelines %"PRIu64" ms, translations reused %"PRIu64", damage rectangles saved %"PRIu64" MiB"
++pvg_linux_exec_pipelines(uint64_t pipe_ms, uint64_t spv_hits, uint64_t spv_disk, uint64_t damage_mb) "building pipelines %"PRIu64" ms, translations reused %"PRIu64" (from disk %"PRIu64"), damage rectangles saved %"PRIu64" MiB"
+ pvg_linux_exec_cache(uint64_t hits, uint64_t saved_mb, uint64_t dropped, uint64_t sync_ms, int64_t kvm_ms) "upload cache: %"PRIu64" hits, %"PRIu64" MiB not uploaded, %"PRIu64" dropped, sync %"PRIu64" ms (KVM log %"PRId64" ms)"
+ pvg_linux_exec_private(uint64_t skipped_mb, uint64_t flushes, uint64_t gpu_mipmaps) "private textures: %"PRIu64" MiB not copied, %"PRIu64" flushes; %"PRIu64" GPU mipmaps"
+ pvg_linux_exec_zc(uint64_t gathered_mb, uint64_t scattered_mb, uint64_t fallbacks, uint64_t bar_mb) "zero-copy: %"PRIu64" MiB gathered, %"PRIu64" MiB scattered by the GPU, %"PRIu64" CPU fallbacks, %"PRIu64" MiB CPU-written to VRAM"
+-- 
+2.43.0
+

@@ -1,0 +1,92 @@
+From fa7dac0cd5a3eb17362b36e2b3fe2c8bfa5506c4 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 17:03:47 +0200
+Subject: [PATCH 29/54] hw/display/pvg-linux-pci: GetComputeInfo replies
+ (maxTotalThreadsPerThreadgroup, threadExecutionWidth,
+ staticThreadgroupMemoryLength)
+
+The guest waits for {key, value} pairs at the reply VA; the stub left
+zeros (execution width 0) and the user session's WindowServer died
+right after login.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-pci.c | 48 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 48 insertions(+)
+
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index be0973d..78412ad 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -69,6 +69,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(PVGLinuxPCIState, PVG_LINUX_PCI)
+ #define PVG_CMD_SET_OBJECT_LIST     0x33
+ #define PVG_CMD_EXEC_INDIRECT2      0x37
+ #define PVG_CMD_DELETE_TASK         0x20    /* {u32 task} */
++#define PVG_CMD_GET_COMPUTE_INFO    0x3b    /* {u32 task, u32 pipeline, u32 max_key, u32 count,
++                                               u64 reply va} */
+ #define PVG_CMD_DELETE_RESOURCE     0x25    /* {u32 task, u32 id} */
+ #define PVG_CMD_DELETE_OBJECT       0x28    /* {u32 task, serialized {u32 kind, u32 len, u32 id}} */
+ #define PVG_CMD_DEFINE_TASK2        0x38
+@@ -454,6 +456,49 @@ static void pvg_task_unmap(PVGLinuxPCIState *s, uint32_t task, uint64_t va,
+     }
+ }
+ 
++static bool pvg_task_write(PVGLinuxPCIState *s, uint32_t task, uint64_t va,
++                           const void *buf, uint64_t len);
++
++/*
++ * CmdGetComputeInfo (-[PGLocalTask getComputeInfo:maxKey:count:offset:]): the guest waits for
++ * {u32 key, u32 value} pairs at the reply VA of the task: 1 maxTotalThreadsPerThreadgroup,
++ * 3 threadExecutionWidth, 4 staticThreadgroupMemoryLength (only keys < max_key), then a zero
++ * pair if room. Without a reply the guest saw zeros (execution width 0).
++ */
++static void pvg_cmd_get_compute_info(PVGLinuxPCIState *s, const uint8_t *p, uint32_t len)
++{
++    uint32_t task, max_key, count, reply[16][2], n = 0;
++    uint64_t va;
++
++    if (len < 24) {
++        return;
++    }
++    task = ldl_le_p(p);
++    max_key = ldl_le_p(p + 8);
++    count = MIN(ldl_le_p(p + 12), 16);
++    va = ldq_le_p(p + 16);
++    if (!count || task >= PVG_MAX_TASKS) {
++        return;
++    }
++    if (n < count && max_key > 1) {
++        reply[n][0] = cpu_to_le32(1);
++        reply[n++][1] = cpu_to_le32(1024);
++    }
++    if (n < count && max_key > 3) {
++        reply[n][0] = cpu_to_le32(3);
++        reply[n++][1] = cpu_to_le32(32);
++    }
++    if (n < count && max_key > 4) {
++        reply[n][0] = cpu_to_le32(4);
++        reply[n++][1] = 0;
++    }
++    if (n < count) {
++        reply[n][0] = reply[n][1] = 0;
++        n++;
++    }
++    pvg_task_write(s, task, va, reply, n * 8);
++}
++
+ /* CmdMapMemory2 / CmdUnmapMemory {u32 task, u64 va, u64 len} */
+ static void pvg_cmd_map_memory(PVGLinuxPCIState *s, const uint8_t *p,
+                                uint32_t len, bool map)
+@@ -1399,6 +1444,9 @@ static void pvg_dispatch(PVGLinuxPCIState *s, const PVGCmdHeader *h,
+     case PVG_CMD_GET_DEVICE_INFO:
+         pvg_cmd_get_device_info(s, (const uint32_t *)payload, len);
+         break;
++    case PVG_CMD_GET_COMPUTE_INFO:
++        pvg_cmd_get_compute_info(s, payload, len);
++        break;
+     case PVG_CMD_DELETE_TASK:
+         if (len >= 4 && ldl_le_p(payload) && ldl_le_p(payload) < PVG_MAX_TASKS) {
+             uint32_t id = ldl_le_p(payload);
+-- 
+2.43.0
+

@@ -1,0 +1,219 @@
+From eff5c721e59d74a8b59f8b81da0c4432e96f79f5 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 00:27:41 +0200
+Subject: [PATCH 01/54] hw/display: add pvg-linux-pci tracer skeleton
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/Kconfig         |   5 ++
+ hw/display/meson.build     |   1 +
+ hw/display/pvg-linux-pci.c | 159 +++++++++++++++++++++++++++++++++++++
+ hw/display/trace-events    |   4 +
+ 4 files changed, 169 insertions(+)
+ create mode 100644 hw/display/pvg-linux-pci.c
+
+diff --git a/hw/display/Kconfig b/hw/display/Kconfig
+index b3593fe..7c54a79 100644
+--- a/hw/display/Kconfig
++++ b/hw/display/Kconfig
+@@ -153,3 +153,8 @@ config MAC_PVG_PCI
+     bool
+     depends on MAC_PVG && PCI
+     default y if PCI_DEVICES
++
++config PVG_LINUX_PCI
++    bool
++    default y if PCI_DEVICES
++    depends on PCI && MSI_NONBROKEN
+diff --git a/hw/display/meson.build b/hw/display/meson.build
+index ffecedb..6fe9784 100644
+--- a/hw/display/meson.build
++++ b/hw/display/meson.build
+@@ -64,6 +64,7 @@ system_ss.add(when: 'CONFIG_ATI_VGA', if_true: [files('ati.c', 'ati_2d.c', 'ati_
+ 
+ system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_PCI'],     if_true: [files('apple-gfx.m', 'apple-gfx-pci.m')])
+ system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_MMIO'],    if_true: [files('apple-gfx.m', 'apple-gfx-mmio.m')])
++system_ss.add(when: 'CONFIG_PVG_LINUX_PCI', if_true: files('pvg-linux-pci.c'))
+ 
+ if config_all_devices.has_key('CONFIG_VIRTIO_GPU')
+   virtio_gpu_ss = ss.source_set()
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+new file mode 100644
+index 0000000..e8bd84f
+--- /dev/null
++++ b/hw/display/pvg-linux-pci.c
+@@ -0,0 +1,159 @@
++/*
++ * Apple ParavirtualizedGraphics-compatible PCI display device for Linux hosts
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * The macOS-host apple-gfx-pci device delegates its whole guest protocol to
++ * Apple's closed ParavirtualizedGraphics.framework. This device is a
++ * from-scratch reimplementation of that host side for non-macOS hosts.
++ *
++ * Stage 1 ("tracer"): present the PCI identity the guest's AppleParavirtGPU
++ * kext matches on, back BAR0 with a plain register file, and trace every
++ * access so the protocol can be reverse-engineered from a live guest.
++ * PCI IDs, BAR size and MSI vector count are properties until the real
++ * values are pinned down from the guest driver.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qemu/units.h"
++#include "qapi/error.h"
++#include "hw/pci/pci_device.h"
++#include "hw/pci/msi.h"
++#include "hw/core/qdev-properties.h"
++#include "system/address-spaces.h"
++#include "system/dma.h"
++#include "qom/object.h"
++#include "trace.h"
++
++#define TYPE_PVG_LINUX_PCI "pvg-linux-pci"
++OBJECT_DECLARE_SIMPLE_TYPE(PVGLinuxPCIState, PVG_LINUX_PCI)
++
++#define PVG_MAX_MMIO_SIZE (64 * MiB)
++
++struct PVGLinuxPCIState {
++    PCIDevice parent_obj;
++
++    MemoryRegion mmio;
++    uint32_t *regs;
++
++    /* properties */
++    uint16_t vendor_id;
++    uint16_t device_id;
++    uint32_t mmio_size;
++    uint32_t msi_vectors;
++};
++
++static uint64_t pvg_linux_mmio_read(void *opaque, hwaddr addr, unsigned size)
++{
++    PVGLinuxPCIState *s = opaque;
++    uint64_t val = 0;
++
++    memcpy(&val, (uint8_t *)s->regs + addr, size);
++    trace_pvg_linux_mmio_read(addr, size, val);
++    return val;
++}
++
++static void pvg_linux_mmio_write(void *opaque, hwaddr addr, uint64_t val,
++                                 unsigned size)
++{
++    PVGLinuxPCIState *s = opaque;
++
++    trace_pvg_linux_mmio_write(addr, size, val);
++    memcpy((uint8_t *)s->regs + addr, &val, size);
++}
++
++static const MemoryRegionOps pvg_linux_mmio_ops = {
++    .read = pvg_linux_mmio_read,
++    .write = pvg_linux_mmio_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = {
++        .min_access_size = 1,
++        .max_access_size = 8,
++    },
++    .impl = {
++        .min_access_size = 1,
++        .max_access_size = 8,
++    },
++};
++
++static void pvg_linux_realize(PCIDevice *dev, Error **errp)
++{
++    PVGLinuxPCIState *s = PVG_LINUX_PCI(dev);
++
++    if (!is_power_of_2(s->mmio_size) || s->mmio_size < 4 * KiB ||
++        s->mmio_size > PVG_MAX_MMIO_SIZE) {
++        error_setg(errp, "mmio-size must be a power of two in [4KiB, 64MiB]");
++        return;
++    }
++
++    /* PCIDeviceClass IDs are per class; per-instance IDs go into config */
++    pci_set_word(dev->config + PCI_VENDOR_ID, s->vendor_id);
++    pci_set_word(dev->config + PCI_DEVICE_ID, s->device_id);
++    pci_set_word(dev->config + PCI_SUBSYSTEM_VENDOR_ID, s->vendor_id);
++    pci_set_word(dev->config + PCI_SUBSYSTEM_ID, s->device_id);
++
++    s->regs = g_malloc0(s->mmio_size);
++    memory_region_init_io(&s->mmio, OBJECT(s), &pvg_linux_mmio_ops, s,
++                          "pvg-linux-mmio", s->mmio_size);
++    pci_register_bar(dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mmio);
++
++    if (msi_init(dev, 0, s->msi_vectors, true, false, errp)) {
++        return;
++    }
++}
++
++static void pvg_linux_exit(PCIDevice *dev)
++{
++    PVGLinuxPCIState *s = PVG_LINUX_PCI(dev);
++
++    msi_uninit(dev);
++    g_free(s->regs);
++}
++
++static void pvg_linux_reset(DeviceState *dev)
++{
++    PVGLinuxPCIState *s = PVG_LINUX_PCI(dev);
++
++    memset(s->regs, 0, s->mmio_size);
++}
++
++static const Property pvg_linux_properties[] = {
++    DEFINE_PROP_UINT16("vendor-id", PVGLinuxPCIState, vendor_id, 0x106b),
++    DEFINE_PROP_UINT16("device-id", PVGLinuxPCIState, device_id, 0xeeee),
++    DEFINE_PROP_UINT32("mmio-size", PVGLinuxPCIState, mmio_size, 16 * KiB),
++    DEFINE_PROP_UINT32("msi-vectors", PVGLinuxPCIState, msi_vectors, 1),
++};
++
++static void pvg_linux_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    PCIDeviceClass *pci = PCI_DEVICE_CLASS(klass);
++
++    dc->desc = "Apple ParavirtualizedGraphics-compatible display (Linux host)";
++    dc->hotpluggable = false;
++    device_class_set_legacy_reset(dc, pvg_linux_reset);
++    set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
++
++    pci->vendor_id = 0x106b;
++    pci->device_id = 0xeeee;
++    pci->class_id = PCI_CLASS_DISPLAY_OTHER;
++    pci->realize = pvg_linux_realize;
++    pci->exit = pvg_linux_exit;
++
++    device_class_set_props(dc, pvg_linux_properties);
++}
++
++static const TypeInfo pvg_linux_types[] = {
++    {
++        .name          = TYPE_PVG_LINUX_PCI,
++        .parent        = TYPE_PCI_DEVICE,
++        .instance_size = sizeof(PVGLinuxPCIState),
++        .class_init    = pvg_linux_class_init,
++        .interfaces = (const InterfaceInfo[]) {
++            { INTERFACE_PCIE_DEVICE },
++            { },
++        },
++    }
++};
++DEFINE_TYPES(pvg_linux_types)
+diff --git a/hw/display/trace-events b/hw/display/trace-events
+index c5e7e42..1baf714 100644
+--- a/hw/display/trace-events
++++ b/hw/display/trace-events
+@@ -227,3 +227,7 @@ apple_gfx_iosfc_unmap_memory(void *a, void *b, void *c, void *d, void *e, void *
+ apple_gfx_iosfc_unmap_memory_region(void* mem, void *region) "unmapping @ %p from memory region %p"
+ apple_gfx_iosfc_raise_irq(uint32_t vector) "vector=0x%x"
+ 
++
++# pvg-linux-pci.c
++pvg_linux_mmio_read(uint64_t offset, unsigned size, uint64_t val) "offset=0x%"PRIx64" size=%u val=0x%"PRIx64
++pvg_linux_mmio_write(uint64_t offset, unsigned size, uint64_t val) "offset=0x%"PRIx64" size=%u val=0x%"PRIx64
+-- 
+2.43.0
+

@@ -1,0 +1,799 @@
+From 26cfa2b371ff412c55a5db6b34d7dad76db9ec1e Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Fri, 30 Oct 2026 10:49:32 +0200
+Subject: [PATCH 52/54] hw/display/pvg: depth clamp / line fill pipeline
+ variants, separate vertex-stage bindings, vertex-only pipelines, atomics and
+ SIMD-group ops
+
+- SetDepthClipMode / SetTriangleFillMode select pipeline variants
+  (depthClampEnable, polygonMode LINE).
+- Vertex-stage textures/samplers/constant samplers bind at +64, so both
+  stages can use the same Metal index with different resources.
+- Pipelines without a fragment function (depth/stencil-only) are built
+  with a single stage instead of failing silently.
+- air2spv: air.atomic.{global,local}.* -> OpAtomic* (device via physical
+  storage buffer pointers, threadgroup via word arrays); air.simd_* /
+  air.quad_* -> GroupNonUniform reductions, scans, shuffles, ballot, vote,
+  elect; int64 atomics features enabled.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/air2spv.c  | 299 +++++++++++++++++++++++++++++++++++++-
+ hw/display/pvg/air2spv.h  |   2 +
+ hw/display/pvg/pvg-exec.c | 188 ++++++++++++++----------
+ hw/display/pvg/pvg-gpu.c  |   1 +
+ hw/display/pvg/spv.h      |  26 ++++
+ 5 files changed, 437 insertions(+), 79 deletions(-)
+
+diff --git a/hw/display/pvg/air2spv.c b/hw/display/pvg/air2spv.c
+index f398af4..3184c74 100644
+--- a/hw/display/pvg/air2spv.c
++++ b/hw/display/pvg/air2spv.c
+@@ -550,6 +550,11 @@ static void decorate1(Ctx *c, uint32_t id, uint32_t dec, uint32_t v)
+ }
+ 
+ /* one variable per input builtin: an entry point may not list the same builtin twice */
++static uint32_t stage_binding_offset(const Ctx *c)
++{
++    return c->stage == A2S_STAGE_VERTEX ? A2S_VERTEX_BINDING_OFFSET : 0;
++}
++
+ static uint32_t builtin_var(Ctx *c, uint32_t sc, uint32_t type, uint32_t builtin)
+ {
+     bool memo = sc == SpvStorageInput && builtin < sizeof(c->builtin_in) / sizeof(c->builtin_in[0]);
+@@ -841,7 +846,7 @@ static int setup_interface(Ctx *c)
+             }
+             r->var = global_var(c, SpvStorageUniformConstant, r->type);
+             decorate1(c, r->var, SpvDecorationDescriptorSet, 0);
+-            decorate1(c, r->var, SpvDecorationBinding, A2S_TEXTURE_BINDING + a->index);
++            decorate1(c, r->var, SpvDecorationBinding, A2S_TEXTURE_BINDING + a->index + stage_binding_offset(c));
+             c->res->texture_mask |= 1u << a->index;
+             if (a->index < 32) {
+                 c->res->texture_view[a->index] =
+@@ -861,7 +866,7 @@ static int setup_interface(Ctx *c)
+             r->type = spv_type(&c->m, SpvOpTypeSampler, NULL, 0);
+             r->var = global_var(c, SpvStorageUniformConstant, r->type);
+             decorate1(c, r->var, SpvDecorationDescriptorSet, 0);
+-            decorate1(c, r->var, SpvDecorationBinding, A2S_SAMPLER_BINDING + a->index);
++            decorate1(c, r->var, SpvDecorationBinding, A2S_SAMPLER_BINDING + a->index + stage_binding_offset(c));
+             c->res->sampler_mask |= 1u << a->index;
+             break;
+         }
+@@ -939,7 +944,7 @@ static int setup_interface(Ctx *c)
+             r->type = spv_type(&c->m, SpvOpTypeSampler, NULL, 0);
+             r->var = global_var(c, SpvStorageUniformConstant, r->type);
+             decorate1(c, r->var, SpvDecorationDescriptorSet, 0);
+-            decorate1(c, r->var, SpvDecorationBinding, A2S_CONST_SAMPLER_BINDING + nconst);
++            decorate1(c, r->var, SpvDecorationBinding, A2S_CONST_SAMPLER_BINDING + nconst + stage_binding_offset(c));
+             init = LLVMGetInitializer(g);
+             c->res->const_sampler_state[nconst] =
+                 init && LLVMIsAConstantInt(init) ? LLVMConstIntGetZExtValue(init) :
+@@ -1662,6 +1667,285 @@ static int texture_call(Ctx *c, LLVMValueRef call, const char *name, uint32_t re
+     return 0;
+ }
+ 
++static int priv_find(Ctx *c, LLVMValueRef v);
++static uint32_t priv_word_ptr(Ctx *c, int pi, uint32_t k);
++
++/* air.atomic.fence(...): memory is coherent within our execution model; no barrier needed */
++static bool fence_like(const char *rest)
++{
++    return !strncmp(rest, "fence", 5);
++}
++
++/* this invocation's lane in the subgroup (for quad lane arithmetic) */
++static uint32_t kernel_lane_id(Ctx *c)
++{
++    uint32_t v = builtin_var(c, SpvStorageInput, c->t_u32, SpvBuiltInSubgroupLocalInvocationId);
++
++    spv_capability(&c->m, SpvCapabilityGroupNonUniform);
++    if (c->stage == A2S_STAGE_FRAGMENT) {
++        decorate1(c, v, SpvDecorationFlat, 0);
++    }
++    return emit(c, SpvOpLoad, c->t_u32, 0, &v, 1);
++}
++
++/*
++ * air.atomic.{global,local}.<op>[.s|.u].<type>: device memory through a physical storage
++ * buffer pointer (Device scope), threadgroup/private word arrays (Workgroup scope).
++ * Operands: (ptr, [value | expected ptr, desired], memory order, scope, volatile); all orders
++ * are relaxed in MSL except fences, so semantics are Relaxed.
++ */
++static int atomic_call(Ctx *c, LLVMValueRef call, const char *rest, uint32_t result)
++{
++    static const struct { const char *name; uint16_t s, u; } ops[] = {
++        { "add", SpvOpAtomicIAdd, SpvOpAtomicIAdd }, { "sub", SpvOpAtomicISub, SpvOpAtomicISub },
++        { "min", SpvOpAtomicSMin, SpvOpAtomicUMin }, { "max", SpvOpAtomicSMax, SpvOpAtomicUMax },
++        { "and", SpvOpAtomicAnd, SpvOpAtomicAnd }, { "or", SpvOpAtomicOr, SpvOpAtomicOr },
++        { "xor", SpvOpAtomicXor, SpvOpAtomicXor }, { "xchg", SpvOpAtomicExchange, SpvOpAtomicExchange },
++        { "load", SpvOpAtomicLoad, SpvOpAtomicLoad }, { "store", SpvOpAtomicStore, SpvOpAtomicStore },
++        { "cmpxchg", SpvOpAtomicCompareExchange, SpvOpAtomicCompareExchange },
++    };
++    LLVMValueRef p = LLVMGetOperand(call, 0);
++    const char *dot = strchr(rest, '.');
++    bool local = !strncmp(rest, "local.", 6);
++    char op[16];
++    int k = -1, pi;
++    LLVMTypeRef vt;
++    uint32_t vty, ptr, scope, sem = spv_const_u32(&c->m, 0), w[8];
++
++    if (fence_like(rest)) {
++        return 0;
++    }
++    if (!dot || (strncmp(rest, "global.", 7) && !local)) {
++        return fail(c, "unsupported atomic %s", rest);
++    }
++    snprintf(op, sizeof(op), "%.*s", (int)strcspn(dot + 1, "."), dot + 1);
++    for (size_t i = 0; i < sizeof(ops) / sizeof(ops[0]); i++) {
++        if (!strcmp(op, ops[i].name)) {
++            k = (int)i;
++        }
++    }
++    if (k < 0) {
++        return fail(c, "unsupported atomic operation %s", rest);
++    }
++    vt = !strcmp(op, "store") ? LLVMTypeOf(LLVMGetOperand(call, 1)) :
++         !strcmp(op, "cmpxchg") ? LLVMTypeOf(LLVMGetOperand(call, 2)) : LLVMTypeOf(call);
++    if (LLVMGetTypeKind(vt) == LLVMFloatTypeKind && strcmp(op, "xchg") && strcmp(op, "load") &&
++        strcmp(op, "store")) {
++        return fail(c, "unsupported float atomic %s", rest);
++    }
++    vty = ty(c, vt);
++    if (LLVMGetTypeKind(vt) == LLVMIntegerTypeKind && LLVMGetIntTypeWidth(vt) == 64) {
++        spv_capability(&c->m, SpvCapabilityInt64Atomics);
++    }
++    pi = priv_find(c, p);
++    if (pi >= 0) {
++        if (LLVMGetTypeKind(vt) == LLVMIntegerTypeKind && LLVMGetIntTypeWidth(vt) != 32) {
++            return fail(c, "64-bit threadgroup atomic");
++        }
++        ptr = priv_word_ptr(c, pi, 0);
++        if (vty != c->t_u32) {
++            /* word arrays hold u32: float exchange/load/store go through a u32 view */
++            return fail(c, "non-u32 threadgroup atomic");
++        }
++        scope = spv_const_u32(&c->m, SpvScopeWorkgroup);
++    } else {
++        ptr = psb_ptr(c, val(c, p), vty);
++        scope = spv_const_u32(&c->m, SpvScopeDevice);
++    }
++    if (!strcmp(op, "store")) {
++        w[0] = ptr; w[1] = scope; w[2] = sem; w[3] = val(c, LLVMGetOperand(call, 1));
++        spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpAtomicStore, w, 4);
++        return 0;
++    }
++    if (!strcmp(op, "load")) {
++        w[0] = ptr; w[1] = scope; w[2] = sem;
++        emit(c, SpvOpAtomicLoad, vty, result, w, 3);
++        return 0;
++    }
++    if (!strcmp(op, "cmpxchg")) {
++        /* (obj, expected*, desired, ...) -> bool; the old value goes back to *expected */
++        LLVMValueRef ep = LLVMGetOperand(call, 1);
++        int epi = priv_find(c, ep);
++        uint32_t eptr, expected, old, eq[2];
++
++        if (epi < 0 || vty != c->t_u32) {
++            return fail(c, "unsupported compare-exchange form");
++        }
++        eptr = priv_word_ptr(c, epi, 0);
++        expected = emit(c, SpvOpLoad, c->t_u32, 0, &eptr, 1);
++        w[0] = ptr; w[1] = scope; w[2] = sem; w[3] = sem;
++        w[4] = val(c, LLVMGetOperand(call, 2)); w[5] = expected;
++        old = emit(c, SpvOpAtomicCompareExchange, vty, 0, w, 6);
++        eq[0] = eptr;
++        eq[1] = old;
++        spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpStore, eq, 2);
++        eq[0] = old;
++        eq[1] = expected;
++        if (is_bool(LLVMTypeOf(call))) {
++            emit(c, SpvOpIEqual, c->t_bool, result, eq, 2);
++        } else {
++            uint32_t b = emit(c, SpvOpIEqual, c->t_bool, 0, eq, 2);
++            uint32_t sel[3] = { b, spv_const_u32(&c->m, 1), spv_const_u32(&c->m, 0) };
++
++            emit(c, SpvOpSelect, ty(c, LLVMTypeOf(call)), result, sel, 3);
++        }
++        return 0;
++    }
++    w[0] = ptr; w[1] = scope; w[2] = sem; w[3] = val(c, LLVMGetOperand(call, 1));
++    emit(c, strstr(dot, ".s.") ? ops[k].s : ops[k].u, vty, result, w, 4);
++    return 0;
++}
++
++/*
++ * air.simd_* / air.quad_*: subgroup operations (threadExecutionWidth 32 = the host subgroup).
++ * Quad reductions are clustered reductions of 4 lanes.
++ */
++static int simd_call(Ctx *c, LLVMValueRef call, const char *base, const char *rest,
++                     uint32_t result)
++{
++    static const struct { const char *name; uint16_t i, u, f; int gop; } red[] = {
++        { "sum", SpvOpGroupNonUniformIAdd, SpvOpGroupNonUniformIAdd, SpvOpGroupNonUniformFAdd, 0 },
++        { "product", SpvOpGroupNonUniformIMul, SpvOpGroupNonUniformIMul,
++          SpvOpGroupNonUniformFMul, 0 },
++        { "min", SpvOpGroupNonUniformSMin, SpvOpGroupNonUniformUMin, SpvOpGroupNonUniformFMin, 0 },
++        { "max", SpvOpGroupNonUniformSMax, SpvOpGroupNonUniformUMax, SpvOpGroupNonUniformFMax, 0 },
++        { "and", SpvOpGroupNonUniformBitwiseAnd, SpvOpGroupNonUniformBitwiseAnd, 0, 0 },
++        { "or", SpvOpGroupNonUniformBitwiseOr, SpvOpGroupNonUniformBitwiseOr, 0, 0 },
++        { "xor", SpvOpGroupNonUniformBitwiseXor, SpvOpGroupNonUniformBitwiseXor, 0, 0 },
++        { "prefix_inclusive_sum", SpvOpGroupNonUniformIAdd, SpvOpGroupNonUniformIAdd,
++          SpvOpGroupNonUniformFAdd, SpvGroupOperationInclusiveScan },
++        { "prefix_exclusive_sum", SpvOpGroupNonUniformIAdd, SpvOpGroupNonUniformIAdd,
++          SpvOpGroupNonUniformFAdd, SpvGroupOperationExclusiveScan },
++        { "prefix_inclusive_product", SpvOpGroupNonUniformIMul, SpvOpGroupNonUniformIMul,
++          SpvOpGroupNonUniformFMul, SpvGroupOperationInclusiveScan },
++        { "prefix_exclusive_product", SpvOpGroupNonUniformIMul, SpvOpGroupNonUniformIMul,
++          SpvOpGroupNonUniformFMul, SpvGroupOperationExclusiveScan },
++    };
++    bool quad = base[0] == 'q';
++    const char *name = base + 5;        /* after "simd_" / "quad_" */
++    LLVMTypeRef rt = LLVMTypeOf(call);
++    uint32_t rty = ty(c, rt), sg = spv_const_u32(&c->m, SpvScopeSubgroup), w[6];
++    unsigned nargs = LLVMGetNumArgOperands(call);
++
++    spv_capability(&c->m, SpvCapabilityGroupNonUniform);
++    for (size_t i = 0; i < sizeof(red) / sizeof(red[0]); i++) {
++        if (!strcmp(name, red[i].name)) {
++            LLVMTypeRef et = LLVMGetTypeKind(rt) == LLVMVectorTypeKind ? LLVMGetElementType(rt) : rt;
++            bool fl = LLVMGetTypeKind(et) == LLVMFloatTypeKind || LLVMGetTypeKind(et) == LLVMHalfTypeKind;
++            uint16_t opc = fl ? red[i].f : rest && !strncmp(rest, "u.", 2) ? red[i].u : red[i].i;
++
++            if (!opc) {
++                return fail(c, "unsupported %s on floats", base);
++            }
++            spv_capability(&c->m, SpvCapabilityGroupNonUniformArithmetic);
++            w[0] = sg;
++            w[1] = quad ? SpvGroupOperationClusteredReduce : (uint32_t)red[i].gop;
++            w[2] = val(c, LLVMGetOperand(call, 0));
++            if (quad) {
++                if (red[i].gop) {
++                    return fail(c, "unsupported %s", base);
++                }
++                spv_capability(&c->m, SpvCapabilityGroupNonUniformClustered);
++                w[3] = spv_const_u32(&c->m, 4);
++            }
++            emit(c, opc, rty, result, w, quad ? 4 : 3);
++            return 0;
++        }
++    }
++    if (!strcmp(name, "all") || !strcmp(name, "any")) {
++        spv_capability(&c->m, SpvCapabilityGroupNonUniformVote);
++        w[0] = sg;
++        w[1] = val(c, LLVMGetOperand(call, 0));
++        if (quad) {
++            return fail(c, "unsupported %s", base);
++        }
++        emit(c, name[1] == 'l' ? SpvOpGroupNonUniformAll : SpvOpGroupNonUniformAny, rty, result,
++             w, 2);
++        return 0;
++    }
++    if (!strcmp(name, "is_first") && !quad) {
++        w[0] = sg;
++        emit(c, SpvOpGroupNonUniformElect, rty, result, w, 1);
++        return 0;
++    }
++    if (!strcmp(name, "broadcast_first") && !quad) {
++        spv_capability(&c->m, SpvCapabilityGroupNonUniformBallot);
++        w[0] = sg;
++        w[1] = val(c, LLVMGetOperand(call, 0));
++        emit(c, SpvOpGroupNonUniformBroadcastFirst, rty, result, w, 2);
++        return 0;
++    }
++    if ((!strcmp(name, "ballot") || !strcmp(name, "active_threads_mask")) && !quad) {
++        /* uvec4 ballot -> the 64-bit (or narrower) mask Metal returns */
++        uint32_t uv4 = spv_type_vec(&c->m, c->t_u32, 4), b, lo, hi, t[2];
++
++        spv_capability(&c->m, SpvCapabilityGroupNonUniformBallot);
++        w[0] = sg;
++        w[1] = name[0] == 'b' && nargs ? val(c, LLVMGetOperand(call, 0)) : spv_const(&c->m, SpvOpConstantTrue, c->t_bool, NULL, 0);
++        b = emit(c, SpvOpGroupNonUniformBallot, uv4, 0, w, 2);
++        t[0] = b;
++        t[1] = 0;
++        lo = emit(c, SpvOpCompositeExtract, c->t_u32, 0, t, 2);
++        if (rty == c->t_u32) {
++            emit(c, SpvOpCopyObject, rty, result, &lo, 1);
++            return 0;
++        }
++        t[1] = 1;
++        hi = emit(c, SpvOpCompositeExtract, c->t_u32, 0, t, 2);
++        lo = emit(c, SpvOpUConvert, c->t_u64, 0, &lo, 1);
++        hi = emit(c, SpvOpUConvert, c->t_u64, 0, &hi, 1);
++        t[0] = hi;
++        t[1] = spv_const_u32(&c->m, 32);
++        hi = emit(c, SpvOpShiftLeftLogical, c->t_u64, 0, t, 2);
++        t[0] = hi;
++        t[1] = lo;
++        emit(c, SpvOpBitwiseOr, rty, result, t, 2);
++        return 0;
++    }
++    if (!strncmp(name, "shuffle", 7) || !strcmp(name, "broadcast")) {
++        uint32_t v = val(c, LLVMGetOperand(call, 0)), arg;
++        uint16_t opc;
++
++        if (nargs < 2) {
++            return fail(c, "%s without lane operand", base);
++        }
++        arg = val(c, LLVMGetOperand(call, 1));
++        if (LLVMGetIntTypeWidth(LLVMTypeOf(LLVMGetOperand(call, 1))) != 32) {
++            arg = emit(c, SpvOpUConvert, c->t_u32, 0, &arg, 1);
++        }
++        if (quad && (!strcmp(name, "broadcast") || !strcmp(name, "shuffle"))) {
++            /* quad lane -> subgroup lane: (lane & ~3) | quad_lane */
++            uint32_t id = kernel_lane_id(c), t[2];
++
++            t[0] = id;
++            t[1] = spv_const_u32(&c->m, ~3u);
++            id = emit(c, SpvOpBitwiseAnd, c->t_u32, 0, t, 2);
++            t[0] = id;
++            t[1] = arg;
++            arg = emit(c, SpvOpBitwiseOr, c->t_u32, 0, t, 2);
++        } else if (quad && strcmp(name, "shuffle_xor")) {
++            return fail(c, "unsupported %s", base);
++        }
++        opc = !strcmp(name, "shuffle_xor") ? SpvOpGroupNonUniformShuffleXor :
++              !strcmp(name, "shuffle_up") ? SpvOpGroupNonUniformShuffleUp :
++              !strcmp(name, "shuffle_down") ? SpvOpGroupNonUniformShuffleDown :
++              !strcmp(name, "shuffle") || !strcmp(name, "broadcast") ?
++              SpvOpGroupNonUniformShuffle : 0;
++        if (!opc) {
++            return fail(c, "unsupported %s", base);
++        }
++        spv_capability(&c->m, opc >= SpvOpGroupNonUniformShuffleUp ?
++                       SpvCapabilityGroupNonUniformShuffleRelative :
++                       SpvCapabilityGroupNonUniformShuffle);
++        w[0] = sg;
++        w[1] = v;
++        w[2] = arg;
++        emit(c, opc, rty, result, w, 3);
++        return 0;
++    }
++    return fail(c, "unsupported %s", base);
++}
++
+ static int call_inst(Ctx *c, LLVMValueRef call, uint32_t result)
+ {
+     LLVMValueRef callee = LLVMGetCalledValue(call);
+@@ -1749,6 +2033,12 @@ static int call_inst(Ctx *c, LLVMValueRef call, uint32_t result)
+             }
+         }
+     }
++    if (!strcmp(base, "atomic") && dot) {
++        return atomic_call(c, call, dot + 1, result);
++    }
++    if (!strncmp(base, "simd_", 5) || !strncmp(base, "quad_", 5)) {
++        return simd_call(c, call, base, dot ? dot + 1 : NULL, result);
++    }
+     if (!strcmp(base, "wg") && dot && !strncmp(dot + 1, "barrier", 7)) {
+         /* air.wg.barrier(i32 mem_flags: 1 device, 2 threadgroup, 4 texture; i32 scope) */
+         LLVMValueRef fl = nargs > 0 ? LLVMGetOperand(call, 0) : NULL;
+@@ -2425,7 +2715,8 @@ static int instruction(Ctx *c, Cfg *g, int bi, LLVMValueRef inst)
+         LLVMValueRef o = LLVMGetOperand(inst, i);
+ 
+         if (priv_find(c, o) >= 0 && !(op == LLVMCall && LLVMGetCalledValue(inst) &&
+-            !strncmp(vname(LLVMGetCalledValue(inst), NULL), "llvm.lifetime.", 14))) {
++            (!strncmp(vname(LLVMGetCalledValue(inst), NULL), "llvm.lifetime.", 14) ||
++             !strncmp(vname(LLVMGetCalledValue(inst), NULL), "air.atomic.", 11)))) {
+             return fail(c, "unsupported use of private memory (opcode %d)", op);
+         }
+     }
+diff --git a/hw/display/pvg/air2spv.h b/hw/display/pvg/air2spv.h
+index 24adc4d..e224bdf 100644
+--- a/hw/display/pvg/air2spv.h
++++ b/hw/display/pvg/air2spv.h
+@@ -15,6 +15,8 @@
+ #define A2S_TEXTURE_BINDING  16     /* binding = base + Metal texture index */
+ #define A2S_SAMPLER_BINDING  48
+ #define A2S_CONST_SAMPLER_BINDING 64
++/* vertex-stage resources use their own range (base + this), so both stages can bind index i */
++#define A2S_VERTEX_BINDING_OFFSET 64
+ #define A2S_MAX_BUFFERS      16     /* Metal buffer indices per stage in the push table */
+ 
+ enum { A2S_STAGE_VERTEX = 0, A2S_STAGE_FRAGMENT = 4, A2S_STAGE_COMPUTE = 5 };
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index 49ba6c9..1a6e3f6 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -111,9 +111,10 @@ typedef struct Pipeline {
+     VkPipelineLayout layout;
+     VkDescriptorSetLayout dsl;
+     uint32_t vs_buffers, fs_buffers, vs_textures, fs_textures, fs_samplers, vs_samplers;
+-    uint8_t texture_view[32];
++    uint8_t texture_view[32], vs_texture_view[32];
+     int fs_const_samplers, vs_const_samplers;
+     VkSampler const_smp[A2S_MAX_CONST_SAMP];  /* in-shader samplers (binding 64 + i) */
++    VkSampler vs_const_smp[A2S_MAX_CONST_SAMP];   /* vertex stage: 64 + 64 + i */
+     /* compute pipelines: kernel resources are kept in the fs_* fields */
+     bool compute;
+     uint32_t storage_mask, buffer_write_mask;
+@@ -1225,11 +1226,12 @@ static VkShaderModule shader_module(PVGExec *e, const A2SResult *r)
+ /* pipelines are specialised per render pass attachment formats (dynamic rendering needs a match) */
+ static Pipeline *pipeline_get(PVGExec *e, uint32_t task, uint32_t ref, const VkFormat *pass_formats,
+                               uint32_t npass, VkFormat dfmt, VkFormat sfmt,
+-                              const uint32_t unnorm[2], VkPrimitiveTopology topo)
++                              const uint32_t unnorm[2], VkPrimitiveTopology topo,
++                              uint32_t raster)
+ {
+     PVGGpu *g = e->gpu;
+-    g_autofree char *key = g_strdup_printf("%u:%u:%d,%d:%x,%x:t%d:%d,%d,%d,%d,%d,%d,%d,%d", task,
+-        ref, dfmt, sfmt, unnorm[0], unnorm[1], topo,
++    g_autofree char *key = g_strdup_printf("%u:%u:%d,%d:%x,%x:t%d:r%u:%d,%d,%d,%d,%d,%d,%d,%d",
++        task, ref, dfmt, sfmt, unnorm[0], unnorm[1], topo, raster,
+         pass_formats[0], npass > 1 ? pass_formats[1] : 0, npass > 2 ? pass_formats[2] : 0,
+         npass > 3 ? pass_formats[3] : 0, npass > 4 ? pass_formats[4] : 0,
+         npass > 5 ? pass_formats[5] : 0, npass > 6 ? pass_formats[6] : 0,
+@@ -1251,7 +1253,7 @@ static Pipeline *pipeline_get(PVGExec *e, uint32_t task, uint32_t ref, const VkF
+         .colorWriteMask = 0xf, .srcColorBlendFactor = VK_BLEND_FACTOR_ONE,
+         .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+     };
+-    VkDescriptorSetLayoutBinding dsb[64];
++    VkDescriptorSetLayoutBinding dsb[160];
+     uint32_t ndsb = 0;
+ 
+     if (p) {
+@@ -1402,13 +1404,15 @@ static Pipeline *pipeline_get(PVGExec *e, uint32_t task, uint32_t ref, const VkF
+ 
+     /* shaders: vertex first, then fragment with the vertex stage's varying names */
+     vs.push_base = 0;
+-    if (!vs_fn || !fs_fn || !function_spirv(e, task, vs_fn, &vs)) {
++    if (!vs_fn || !function_spirv(e, task, vs_fn, &vs)) {
++        elog(e, "task %u pipeline %u: no usable vertex function (%u)", task, ref, vs_fn);
+         goto fail;
+     }
+     fs.push_base = PUSH_FRAGMENT_BASE;
+     fs.nvaryings = vs.nvaryings;
+     memcpy(fs.varyings, vs.varyings, sizeof(vs.varyings));
+-    if (!function_spirv(e, task, fs_fn, &fs)) {
++    /* no fragment function: a depth/stencil-only pipeline (colour writes nothing) */
++    if (fs_fn && !function_spirv(e, task, fs_fn, &fs)) {
+         goto fail;
+     }
+     p->vs_buffers = vs.buffer_mask;
+@@ -1416,47 +1420,55 @@ static Pipeline *pipeline_get(PVGExec *e, uint32_t task, uint32_t ref, const VkF
+     p->vs_textures = vs.texture_mask;
+     p->fs_textures = fs.texture_mask;
+     for (int i = 0; i < 32; i++) {
+-        p->texture_view[i] = (fs.texture_mask & (1u << i)) ? fs.texture_view[i] :
+-                             vs.texture_view[i];
++        p->texture_view[i] = fs.texture_view[i];
++        p->vs_texture_view[i] = vs.texture_view[i];
+     }
+     p->vs_samplers = vs.sampler_mask;
+     p->fs_samplers = fs.sampler_mask;
+     p->vs_const_samplers = vs.nconst_samplers;
+     p->fs_const_samplers = fs.nconst_samplers;
+-    for (int i = 0; i < MAX(vs.nconst_samplers, fs.nconst_samplers); i++) {
+-        /* both stages share binding 64 + i; the fragment stage's state wins */
+-        p->const_smp[i] = const_sampler(e, i < fs.nconst_samplers ? fs.const_sampler_state[i] :
+-                                        vs.const_sampler_state[i]);
++    for (int i = 0; i < fs.nconst_samplers; i++) {
++        p->const_smp[i] = const_sampler(e, fs.const_sampler_state[i]);
++    }
++    for (int i = 0; i < vs.nconst_samplers; i++) {
++        p->vs_const_smp[i] = const_sampler(e, vs.const_sampler_state[i]);
+     }
+     p->push_size = MAX(MAX(vs.push_size, fs.push_size), 4);
+     vsm = shader_module(e, &vs);
+-    fsm = shader_module(e, &fs);
+-    if (!vsm || !fsm) {
++    fsm = fs_fn ? shader_module(e, &fs) : VK_NULL_HANDLE;
++    if (!vsm || (fs_fn && !fsm)) {
+         elog(e, "task %u pipeline %u: shader module creation failed", task, ref);
+         goto fail;
+     }
+ 
+-    /* descriptor layout: union of both stages' textures and samplers */
+-    for (int i = 0; i < 32; i++) {
+-        if ((p->vs_textures | p->fs_textures) & (1u << i)) {
+-            dsb[ndsb++] = (VkDescriptorSetLayoutBinding){
+-                .binding = A2S_TEXTURE_BINDING + i,
+-                .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .descriptorCount = 1,
+-                .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS };
++    /* descriptor layout: fragment resources at their base, vertex ones offset by 64 */
++    for (int st = 0; st < 2; st++) {
++        uint32_t tex = st ? p->vs_textures : p->fs_textures;
++        uint32_t smp = st ? p->vs_samplers : p->fs_samplers;
++        uint32_t off = st ? A2S_VERTEX_BINDING_OFFSET : 0;
++        VkShaderStageFlags stage = st ? VK_SHADER_STAGE_VERTEX_BIT : VK_SHADER_STAGE_FRAGMENT_BIT;
++
++        for (int i = 0; i < 32; i++) {
++            if (tex & (1u << i)) {
++                dsb[ndsb++] = (VkDescriptorSetLayoutBinding){
++                    .binding = A2S_TEXTURE_BINDING + off + i,
++                    .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .descriptorCount = 1,
++                    .stageFlags = stage };
++            }
++            if (smp & (1u << i)) {
++                dsb[ndsb++] = (VkDescriptorSetLayoutBinding){
++                    .binding = A2S_SAMPLER_BINDING + off + i,
++                    .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER, .descriptorCount = 1,
++                    .stageFlags = stage };
++            }
+         }
+-        if ((p->vs_samplers | p->fs_samplers) & (1u << i)) {
++        for (int i = 0; i < (st ? p->vs_const_samplers : p->fs_const_samplers); i++) {
+             dsb[ndsb++] = (VkDescriptorSetLayoutBinding){
+-                .binding = A2S_SAMPLER_BINDING + i,
++                .binding = A2S_CONST_SAMPLER_BINDING + off + i,
+                 .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER, .descriptorCount = 1,
+-                .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS };
++                .stageFlags = stage };
+         }
+     }
+-    for (int i = 0; i < MAX(p->vs_const_samplers, p->fs_const_samplers); i++) {
+-        dsb[ndsb++] = (VkDescriptorSetLayoutBinding){
+-            .binding = A2S_CONST_SAMPLER_BINDING + i,
+-            .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER, .descriptorCount = 1,
+-            .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS };
+-    }
+     {
+         VkDescriptorSetLayoutCreateInfo dci = {
+             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+@@ -1469,6 +1481,7 @@ static Pipeline *pipeline_get(PVGExec *e, uint32_t task, uint32_t ref, const VkF
+ 
+         if (vkCreateDescriptorSetLayout(g->device, &dci, NULL, &p->dsl) != VK_SUCCESS ||
+             vkCreatePipelineLayout(g->device, &lci, NULL, &p->layout) != VK_SUCCESS) {
++            elog(e, "task %u pipeline %u: layout creation failed (%u bindings)", task, ref, ndsb);
+             goto fail;
+         }
+     }
+@@ -1497,7 +1510,10 @@ static Pipeline *pipeline_get(PVGExec *e, uint32_t task, uint32_t ref, const VkF
+             .viewportCount = 1, .scissorCount = 1 };
+         VkPipelineRasterizationStateCreateInfo rs = {
+             .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+-            .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE,
++            /* raster: bit 0 MTLDepthClipModeClamp, bit 1 MTLTriangleFillModeLines */
++            .depthClampEnable = raster & 1,
++            .polygonMode = raster & 2 ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL,
++            .cullMode = VK_CULL_MODE_NONE,
+             .frontFace = VK_FRONT_FACE_CLOCKWISE, .lineWidth = 1.0f };
+         VkPipelineMultisampleStateCreateInfo ms = {
+             .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+@@ -1529,9 +1545,14 @@ static Pipeline *pipeline_get(PVGExec *e, uint32_t task, uint32_t ref, const VkF
+             .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+             .colorAttachmentCount = npass, .pColorAttachmentFormats = pass_formats,
+             .depthAttachmentFormat = dfmt, .stencilAttachmentFormat = sfmt };
+-        VkGraphicsPipelineCreateInfo gci = {
++        VkGraphicsPipelineCreateInfo gci;
++
++        for (uint32_t i = 0; !fsm && i < npass && i < MAX_COLOR; i++) {
++            blends[i].colorWriteMask = 0;   /* no fragment shader: colour stays untouched */
++        }
++        gci = (VkGraphicsPipelineCreateInfo){
+             .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri,
+-            .stageCount = 2, .pStages = stages, .pVertexInputState = &vi,
++            .stageCount = fsm ? 2 : 1, .pStages = stages, .pVertexInputState = &vi,
+             .pInputAssemblyState = &ia, .pViewportState = &vp, .pRasterizationState = &rs,
+             .pMultisampleState = &ms, .pDepthStencilState = &ds, .pColorBlendState = &cb,
+             .pDynamicState = &dy, .layout = p->layout };
+@@ -1655,6 +1676,7 @@ typedef struct RenderState {
+     float blend_color[4];
+     uint32_t cull, winding;         /* MTLCullMode: 0 none 1 front 2 back; MTLWinding: 0 CW 1 CCW */
+     float depth_bias[3];            /* constant, slope scale, clamp */
++    uint32_t depth_clamp, fill_lines;   /* MTLDepthClipMode clamp; MTLTriangleFillMode lines */
+ } RenderState;
+ 
+ static void set_bindings(Binding *b, const uint8_t *a, uint32_t alen)
+@@ -1698,11 +1720,11 @@ static double ldd(const uint8_t *p)
+ }
+ 
+ static bool bind_and_push(PVGExec *e, uint32_t task, RenderState *st, Pipeline *p,
+-                          HostImage **tex_images)
++                          HostImage **tex_images, HostImage **vtex_images)
+ {
+     uint8_t pc[256] = { 0 };
+-    VkWriteDescriptorSet w[64];
+-    VkDescriptorImageInfo ii[64];
++    VkWriteDescriptorSet w[160];
++    VkDescriptorImageInfo ii[160];
+     uint32_t nw = 0;
+ 
+     for (int i = 0; i < MAX_SLOTS; i++) {
+@@ -1736,41 +1758,49 @@ static bool bind_and_push(PVGExec *e, uint32_t task, RenderState *st, Pipeline *
+     vkCmdPushConstants(e->cmd, p->layout, VK_SHADER_STAGE_ALL_GRAPHICS, 0,
+                        (p->push_size + 3) & ~3u, pc);
+ 
+-    for (int i = 0; i < 32; i++) {
+-        if ((p->vs_textures | p->fs_textures) & (1u << i)) {
+-            HostImage *img = tex_images[i] && tex_images[i]->view_type == p->texture_view[i] ?
+-                             tex_images[i] : NULL;
++    for (int stg = 0; stg < 2; stg++) {
++        uint32_t tex = stg ? p->vs_textures : p->fs_textures;
++        uint32_t smp = stg ? p->vs_samplers : p->fs_samplers;
++        uint32_t off = stg ? A2S_VERTEX_BINDING_OFFSET : 0;
++        const uint8_t *views = stg ? p->vs_texture_view : p->texture_view;
++        HostImage **images = stg ? vtex_images : tex_images;
++        const uint32_t *smp_refs = stg ? st->vsmp : st->fsmp;
++        const VkSampler *csmp = stg ? p->vs_const_smp : p->const_smp;
++
++        for (int i = 0; i < 32; i++) {
++            if (tex & (1u << i)) {
++                HostImage *img = images[i] && images[i]->view_type == views[i] ? images[i] : NULL;
+ 
+-            if (!img) {
+-                img = dummy_image(e, p->texture_view[i]);
+                 if (!img) {
+-                    return false;
++                    img = dummy_image(e, views[i]);
++                    if (!img) {
++                        return false;
++                    }
+                 }
++                ii[nw] = (VkDescriptorImageInfo){ .imageView = img->view,
++                    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
++                w[nw] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
++                    .dstBinding = A2S_TEXTURE_BINDING + off + i, .descriptorCount = 1,
++                    .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .pImageInfo = &ii[nw] };
++                nw++;
++            }
++            if (smp & (1u << i)) {
++                ii[nw] = (VkDescriptorImageInfo){ .sampler = sampler_get(e, task,
++                    i < MAX_SLOTS ? smp_refs[i] : 0) };
++                w[nw] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
++                    .dstBinding = A2S_SAMPLER_BINDING + off + i, .descriptorCount = 1,
++                    .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER, .pImageInfo = &ii[nw] };
++                nw++;
+             }
+-            ii[nw] = (VkDescriptorImageInfo){ .imageView = img->view,
+-                .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+-            w[nw] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+-                .dstBinding = A2S_TEXTURE_BINDING + i, .descriptorCount = 1,
+-                .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .pImageInfo = &ii[nw] };
+-            nw++;
+         }
+-        if ((p->vs_samplers | p->fs_samplers) & (1u << i)) {
+-            ii[nw] = (VkDescriptorImageInfo){ .sampler = sampler_get(e, task,
+-                i < MAX_SLOTS ? ((p->fs_samplers >> i & 1) ? st->fsmp[i] : st->vsmp[i]) : 0) };
++        for (int i = 0; i < (stg ? p->vs_const_samplers : p->fs_const_samplers); i++) {
++            ii[nw] = (VkDescriptorImageInfo){ .sampler = csmp[i] ? csmp[i] : e->sampler };
+             w[nw] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+-                .dstBinding = A2S_SAMPLER_BINDING + i, .descriptorCount = 1,
++                .dstBinding = A2S_CONST_SAMPLER_BINDING + off + i, .descriptorCount = 1,
+                 .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER, .pImageInfo = &ii[nw] };
+             nw++;
+         }
+     }
+-    for (int i = 0; i < MAX(p->vs_const_samplers, p->fs_const_samplers); i++) {
+-        ii[nw] = (VkDescriptorImageInfo){ .sampler = p->const_smp[i] ? p->const_smp[i] :
+-                                                     e->sampler };
+-        w[nw] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+-            .dstBinding = A2S_CONST_SAMPLER_BINDING + i, .descriptorCount = 1,
+-            .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER, .pImageInfo = &ii[nw] };
+-        nw++;
+-    }
+     if (nw) {
+         e->push_descriptor(e->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->layout, 0, nw, w);
+     }
+@@ -2480,6 +2510,12 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                 }
+             }
+             break;
++        case 0x6d:      /* SetDepthClipMode {u64 MTLDepthClipMode: 0 clip, 1 clamp} */
++            st.depth_clamp = alen >= 4 && ldl(a) == 1;
++            break;
++        case 0x7c:      /* SetTriangleFillMode {u64: 0 fill, 1 lines} */
++            st.fill_lines = alen >= 4 && ldl(a) == 1;
++            break;
+         case 0x17:      /* RenderBarrierScope: commands execute in order here */
+         case 0x18:      /* RenderUpdateFence / wait: likewise */
+             break;
+@@ -2520,7 +2556,7 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+             bool indexed = id == 0x06 || id == 0x07 || id == 0x09;
+             uint32_t prim, count, first = 0, instances = 1, idx_size = 2;
+             Pipeline *pp;
+-            HostImage *draw_tex[32] = { NULL };
++            HostImage *draw_tex[32] = { NULL }, *draw_vtex[32] = { NULL };
+             uint32_t ib = 0, unnorm[2];
+             uint64_t ib_off = 0;
+ 
+@@ -2562,7 +2598,11 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+ 
+             pp = st.pipeline ? pipeline_get(e, task, st.pipeline, formats, natt, dfmt, sfmt,
+                                                    unnorm_masks(e, task, &st, unnorm),
+-                                                   topology_class(prim)) : NULL;
++                                                   topology_class(prim),
++                                                   st.depth_clamp | (st.fill_lines &&
++                                                   topology_class(prim) ==
++                                                   VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST) << 1)
++                               : NULL;
+             e->stats.pipeline_us += g_get_monotonic_time() - pt0;
+             if (pp && pp->draws_logged < 3) {
+                 pp->draws_logged++;
+@@ -2571,18 +2611,16 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                      instances, ib, ib_off, rw, rh, natt);
+             }
+             for (int i = 0; i < MAX_SLOTS; i++) {
+-                /*
+-                 * One binding (16 + index) per Metal texture index for both stages: a slot
+-                 * only the vertex shader samples takes the vertex binding
+-                 */
+-                uint32_t tref = pp && !(pp->fs_textures >> i & 1) && (pp->vs_textures >> i & 1) ?
+-                                st.vtex[i] : st.ftex[i];
+-
+-                if (tref && !is_attachment(att, natt, tref)) {
+-                    gint64 key = key_of(task, tref);
++                if (st.ftex[i] && !is_attachment(att, natt, st.ftex[i])) {
++                    gint64 key = key_of(task, st.ftex[i]);
+ 
+                     draw_tex[i] = g_hash_table_lookup(e->images, &key);
+                 }
++                if (st.vtex[i] && !is_attachment(att, natt, st.vtex[i])) {
++                    gint64 key = key_of(task, st.vtex[i]);
++
++                    draw_vtex[i] = g_hash_table_lookup(e->images, &key);
++                }
+             }
+             if (pp && pp->ok) {
+                 HostImage *snaps[MAX_COLOR] = { NULL };
+@@ -2605,7 +2643,7 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                 seg_pipes[nseg_pipes++] = st.pipeline;
+             }
+             for (int i = 0; pp && pp->ok && i < 32; i++) {
+-                if (((pp->vs_textures | pp->fs_textures) >> i & 1) &&
++                if ((pp->fs_textures >> i & 1) &&
+                     (!draw_tex[i] || draw_tex[i]->view_type != pp->texture_view[i])) {
+                     seg_dummy++;
+                     if (!(pp->dummy_logged >> i & 1)) {
+@@ -2618,7 +2656,7 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                     }
+                 }
+             }
+-            if (!pp || !pp->ok || !bind_and_push(e, task, &st, pp, draw_tex)) {
++            if (!pp || !pp->ok || !bind_and_push(e, task, &st, pp, draw_tex, draw_vtex)) {
+                 e->stats.skipped_draws++;
+                 seg_skipped++;
+                 break;
+diff --git a/hw/display/pvg/pvg-gpu.c b/hw/display/pvg/pvg-gpu.c
+index 8da62ed..9c9847c 100644
+--- a/hw/display/pvg/pvg-gpu.c
++++ b/hw/display/pvg/pvg-gpu.c
+@@ -65,6 +65,7 @@ int pvg_gpu_init(PVGGpu *g, bool validation, char *err, size_t errlen)
+     VkPhysicalDeviceVulkan12Features f12 = {
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &f13,
+         .bufferDeviceAddress = VK_TRUE, .scalarBlockLayout = VK_TRUE, .shaderInt8 = VK_TRUE,
++        .shaderBufferInt64Atomics = VK_TRUE, .shaderSharedInt64Atomics = VK_TRUE,
+         .shaderFloat16 = VK_TRUE, .storageBuffer8BitAccess = VK_TRUE,
+         .timelineSemaphore = VK_TRUE,
+     };
+diff --git a/hw/display/pvg/spv.h b/hw/display/pvg/spv.h
+index 04107c7..1a2cc5c 100644
+--- a/hw/display/pvg/spv.h
++++ b/hw/display/pvg/spv.h
+@@ -23,8 +23,34 @@ enum {
+     SpvCapabilityStorageImageWriteWithoutFormat = 56,
+     SpvCapabilityPhysicalStorageBufferAddresses = 5347,
+     SpvCapabilityDemoteToHelperInvocation = 5379,
++    SpvCapabilityInt64Atomics = 12, SpvCapabilityGroupNonUniformVote = 62,
++    SpvCapabilityGroupNonUniformArithmetic = 63, SpvCapabilityGroupNonUniformBallot = 64,
++    SpvCapabilityGroupNonUniformShuffle = 65, SpvCapabilityGroupNonUniformShuffleRelative = 66,
++    SpvCapabilityGroupNonUniformClustered = 67,
+ };
+ 
++/* atomics and subgroup (SIMD-group) operations */
++enum {
++    SpvOpAtomicLoad = 227, SpvOpAtomicStore = 228, SpvOpAtomicExchange = 229,
++    SpvOpAtomicCompareExchange = 230, SpvOpAtomicIAdd = 234, SpvOpAtomicISub = 235,
++    SpvOpAtomicSMin = 236, SpvOpAtomicUMin = 237, SpvOpAtomicSMax = 238, SpvOpAtomicUMax = 239,
++    SpvOpAtomicAnd = 240, SpvOpAtomicOr = 241, SpvOpAtomicXor = 242,
++    SpvOpGroupNonUniformElect = 333, SpvOpGroupNonUniformAll = 334,
++    SpvOpGroupNonUniformAny = 335, SpvOpGroupNonUniformBroadcastFirst = 338,
++    SpvOpGroupNonUniformBallot = 339, SpvOpGroupNonUniformShuffle = 345,
++    SpvOpGroupNonUniformShuffleXor = 346, SpvOpGroupNonUniformShuffleUp = 347,
++    SpvOpGroupNonUniformShuffleDown = 348, SpvOpGroupNonUniformIAdd = 349,
++    SpvOpGroupNonUniformFAdd = 350, SpvOpGroupNonUniformIMul = 351,
++    SpvOpGroupNonUniformFMul = 352, SpvOpGroupNonUniformSMin = 353,
++    SpvOpGroupNonUniformUMin = 354, SpvOpGroupNonUniformFMin = 355,
++    SpvOpGroupNonUniformSMax = 356, SpvOpGroupNonUniformUMax = 357,
++    SpvOpGroupNonUniformFMax = 358, SpvOpGroupNonUniformBitwiseAnd = 359,
++    SpvOpGroupNonUniformBitwiseOr = 360, SpvOpGroupNonUniformBitwiseXor = 361,
++};
++enum { SpvScopeDevice = 1, SpvScopeWorkgroup = 2, SpvScopeSubgroup = 3 };
++enum { SpvGroupOperationReduce = 0, SpvGroupOperationInclusiveScan = 1,
++       SpvGroupOperationExclusiveScan = 2, SpvGroupOperationClusteredReduce = 3 };
++
+ enum { SpvAddressingPhysicalStorageBuffer64 = 5348 };
+ enum { SpvMemoryModelGLSL450 = 1 };
+ enum { SpvExecutionModelVertex = 0, SpvExecutionModelFragment = 4, SpvExecutionModelGLCompute = 5 };
+-- 
+2.43.0
+

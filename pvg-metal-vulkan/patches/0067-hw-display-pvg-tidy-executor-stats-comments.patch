@@ -1,0 +1,33 @@
+From 110f631333dbf49635de9510c32b1ac03cfe6500 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Sat, 31 Oct 2026 11:22:23 +0200
+Subject: [PATCH 70/72] hw/display/pvg: tidy executor stats comments
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/pvg-exec.h | 7 +++----
+ 1 file changed, 3 insertions(+), 4 deletions(-)
+
+diff --git a/hw/display/pvg/pvg-exec.h b/hw/display/pvg/pvg-exec.h
+index ad6b633..ec38847 100644
+--- a/hw/display/pvg/pvg-exec.h
++++ b/hw/display/pvg/pvg-exec.h
+@@ -56,12 +56,11 @@ typedef struct PVGExecStats {
+     /* upload cache: textures reused, bytes not uploaded, entries dropped, time syncing */
+     uint64_t cache_hits, cache_saved, cache_invalidated, cache_sync_us;
+     uint64_t priv_skipped, priv_flushes;    /* private residency: bytes not copied, flushes */
+-    uint64_t gpu_mipmaps;
++    uint64_t gpu_mipmaps;       /* GenerateMipmaps done on the GPU (the rest: CPU fallback) */
+     uint64_t zc_gathered, zc_scattered, zc_fallbacks;  /* zero-copy bytes in / out, CPU fallbacks */
+-    uint64_t bar_written;
++    uint64_t bar_written;       /* bytes the CPU wrote straight into VRAM (resizable BAR) */
+     uint64_t image_creates, pool_hits;  /* host images created / reused from the pool */
+-    uint64_t queue_waits;
+-    uint64_t zc_record_us, zc_dirty_us, zc_regions, zc_copies;  /* TEMP diagnostics */       /* vkQueueWaitIdle actually needed */       /* bytes the CPU wrote straight into VRAM (resizable BAR) */       /* GenerateMipmaps done on the GPU (the rest: CPU fallback) */
++    uint64_t queue_waits;       /* vkQueueWaitIdle actually needed */
+ } PVGExecStats;
+ 
+ typedef struct PVGExec PVGExec;
+-- 
+2.43.0
+

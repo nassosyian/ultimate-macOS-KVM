@@ -1,0 +1,352 @@
+From b5872d4bb6667b2c134aa4990d4611ef82928db9 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Sat, 31 Oct 2026 11:11:45 +0200
+Subject: [PATCH 68/72] hw/display/pvg: retire and reuse host images instead of
+ waiting for the queue
+
+Replacing a host image (new shape) waited for the queue and destroyed the
+old one while the command buffer being recorded could still use it, and
+every deleted object freed its images, so new objects kept creating and
+allocating fresh ones (13k images in a short session). Replaced and deleted
+images are now retired, released after the next completed submission into
+a pool (512 MiB) and reused for the same shape. Object deletion and task
+reset wait for the queue only if a submission may still be running.
+
+Mission Control, per 500 cmdbufs: executor 208 -> 184 ms, presents/s
+11.8 -> 13.1; 109 images created vs 9124 reused; 0 queue waits.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-pci.c |   1 +
+ hw/display/pvg/pvg-exec.c  | 162 ++++++++++++++++++++++++++++++++++---
+ hw/display/pvg/pvg-exec.h  |   4 +-
+ hw/display/trace-events    |   1 +
+ 4 files changed, 157 insertions(+), 11 deletions(-)
+
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index 6994ffc..df3d067 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -1551,6 +1551,7 @@ static void pvg_exec_run_buf(PVGLinuxPCIState *s, uint32_t task, const uint8_t *
+         trace_pvg_linux_exec_private(st->priv_skipped >> 20, st->priv_flushes, st->gpu_mipmaps);
+         trace_pvg_linux_exec_zc(st->zc_gathered >> 20, st->zc_scattered >> 20, st->zc_fallbacks,
+                                 st->bar_written >> 20);
++        trace_pvg_linux_exec_alloc(st->image_creates, st->pool_hits, st->queue_waits);
+         trace_pvg_linux_exec_cache(st->cache_hits, st->cache_saved >> 20, st->cache_invalidated,
+                                    st->cache_sync_us / 1000, s->dirty_sync_us / 1000);
+         s->dirty_sync_us = 0;
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index bfebe74..1a1c046 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -122,6 +122,8 @@ typedef struct HostImage {
+     bool priv, resident, guest_stale;
+     GuestImage pgi;
+     VkImageView level_view[MAX_MIPS];   /* render-target views of single levels (mip chains) */
++    VkComponentMapping swizzle;         /* of view (recycled images must match) */
++    uint64_t bytes;                     /* memory size */
+     uint32_t c_task, nruns;
+     uint64_t c_va, c_len;
+     uint64_t (*runs)[2];
+@@ -189,7 +191,15 @@ struct PVGExec {
+     VkBufferCopy *zc_regs;
+     uint32_t zc_regs_max;
+     GHashTable *zc_cache;
+-    const char *flush_why;      /* diagnostics: why private images are being flushed */       /* ZCKey -> ZCRuns: RAM runs of task ranges, until remapped */
++    const char *flush_why;      /* diagnostics: why private images are being flushed */
++    /*
++     * Replaced host images may still be used by the command buffer being recorded: they are
++     * retired here and released after the next submission completed, into a pool of images
++     * reused for the same shape (no vkCreateImage / vkAllocateMemory churn)
++     */
++    GPtrArray *retired, *pool;
++    bool in_flight;             /* a submission may still be running (its fence not waited) */
++    uint64_t pool_bytes;       /* ZCKey -> ZCRuns: RAM runs of task ranges, until remapped */
+     uint64_t arena_used;
+ 
+     VkSampler sampler;
+@@ -1360,6 +1370,94 @@ static bool format_storage_ok(PVGExec *e, VkFormat f)
+     return fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+ }
+ 
++#define POOL_MAX_BYTES  (512ull << 20)
++
++static void image_free(gpointer v);
++
++/* wait for the GPU only if something may still run (submissions are normally waited for) */
++static void queue_idle(PVGExec *e)
++{
++    if (e->in_flight) {
++        vkQueueWaitIdle(e->gpu->queue);
++        e->in_flight = false;
++        e->stats.queue_waits++;
++    }
++}
++
++/* take the image of key out of the table; released once no submission can use it */
++static void image_retire(PVGExec *e, gint64 key)
++{
++    gpointer k, v;
++
++    if (g_hash_table_steal_extended(e->images, &key, &k, &v)) {
++        HostImage *hi = v;
++
++        g_free(k);
++        /* no longer a copy of anything: never flushed or checked again */
++        if (hi->cached) {
++            g_ptr_array_remove_fast(e->cached, hi);
++            g_free(hi->runs);
++            hi->runs = NULL;
++            hi->nruns = 0;
++            hi->cached = false;
++        }
++        if (hi->priv) {
++            g_ptr_array_remove_fast(e->priv_imgs, hi);
++            hi->priv = false;
++        }
++        g_ptr_array_add(e->retired, hi);
++    }
++}
++
++/* after a completed submission: retired images go to the pool (or are freed) */
++static void images_release(PVGExec *e)
++{
++    for (guint i = 0; i < e->retired->len; i++) {
++        HostImage *hi = g_ptr_array_index(e->retired, i);
++
++        while (e->pool_bytes + hi->bytes > POOL_MAX_BYTES && e->pool->len) {
++            HostImage *old = g_ptr_array_steal_index(e->pool, 0);   /* oldest first */
++
++            e->pool_bytes -= old->bytes;
++            image_free(old);
++        }
++        if (hi->bytes > POOL_MAX_BYTES) {
++            image_free(hi);
++            continue;
++        }
++        hi->resident = hi->guest_stale = hi->initialized = false;
++        hi->layout = VK_IMAGE_LAYOUT_UNDEFINED;
++        e->pool_bytes += hi->bytes;
++        g_ptr_array_add(e->pool, hi);
++    }
++    g_ptr_array_set_size(e->retired, 0);
++}
++
++static bool swizzle_eq(VkComponentMapping a, VkComponentMapping b)
++{
++    return a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a;
++}
++
++/* a pooled image of exactly this shape, or NULL */
++static HostImage *pool_take(PVGExec *e, VkFormat fmt, uint32_t w, uint32_t h, uint32_t d,
++                            uint32_t layers, uint32_t mips, uint32_t samples,
++                            VkImageViewType vt, VkComponentMapping swz)
++{
++    for (guint i = e->pool->len; i-- > 0;) {
++        HostImage *hi = g_ptr_array_index(e->pool, i);
++
++        if (hi->format == fmt && hi->width == w && hi->height == h && hi->depth == d &&
++            hi->layers == layers && hi->mips == mips && hi->samples == samples &&
++            hi->view_type == vt && swizzle_eq(hi->swizzle, swz)) {
++            g_ptr_array_remove_index(e->pool, i);
++            e->pool_bytes -= hi->bytes;
++            e->stats.pool_hits++;
++            return hi;
++        }
++    }
++    return NULL;
++}
++
+ static HostImage *host_image(PVGExec *e, uint32_t task, uint32_t ref, const GuestImage *gi,
+                              bool render_target)
+ {
+@@ -1402,11 +1500,16 @@ static HostImage *host_image(PVGExec *e, uint32_t task, uint32_t ref, const Gues
+         return hi;
+     }
+     if (hi) {
+-        /* wrong size/format: the table's destroy notify frees the old image */
+-        vkQueueWaitIdle(g->queue);
+-        g_hash_table_remove(e->images, &key);
++        image_retire(e, key);   /* wrong size/format */
++    }
++    hi = pool_take(e, gi->format, gi->width, gi->height, gi->depth, gi->layers, gi->mips,
++                   MAX(gi->samples, 1), gi->view_type, gi->swizzle);
++    if (hi) {
++        g_hash_table_insert(e->images, key_new(task, ref), hi);
++        return hi;
+     }
+     hi = g_new0(HostImage, 1);
++    e->stats.image_creates++;
+     if (vkCreateImage(g->device, &ici, NULL, &hi->image) != VK_SUCCESS) {
+         g_free(hi);
+         return NULL;
+@@ -1431,6 +1534,8 @@ static HostImage *host_image(PVGExec *e, uint32_t task, uint32_t ref, const Gues
+     hi->mips = gi->mips;
+     hi->samples = MAX(gi->samples, 1);
+     hi->view_type = gi->view_type;
++    hi->swizzle = gi->swizzle;
++    hi->bytes = req.size;
+     g_hash_table_insert(e->images, key_new(task, ref), hi);
+     return hi;
+ }
+@@ -3011,8 +3116,10 @@ static bool submit_wait(PVGExec *e, const VkSubmitInfo *si)
+ 
+     r = vkQueueSubmit(e->gpu->queue, 1, si, e->fence);
+     if (r == VK_SUCCESS) {
++        e->in_flight = true;
+         r = vkWaitForFences(d, 1, &e->fence, VK_TRUE, 2000000000ull);
+     }
++    e->in_flight = r != VK_SUCCESS && e->in_flight;
+     e->stats.gpu_wait_us += g_get_monotonic_time() - t0;
+     if (r != VK_SUCCESS) {
+         /* the host GPU also drives the host desktop: never risk a second hang */
+@@ -3021,6 +3128,7 @@ static bool submit_wait(PVGExec *e, const VkSubmitInfo *si)
+         return false;
+     }
+     vkResetFences(d, 1, &e->fence);
++    images_release(e);          /* nothing submitted can use retired images any more */
+     return true;
+ }
+ 
+@@ -3129,11 +3237,17 @@ static HostImage *ds_image(PVGExec *e, uint32_t task, uint32_t ref, uint32_t w,
+         return hi;
+     }
+     if (hi) {
+-        vkQueueWaitIdle(g->queue);
+-        g_hash_table_remove(e->images, &key);
++        image_retire(e, key);
++    }
++    hi = pool_take(e, DS_FORMAT, w, h, 1, 1, 0, samples, VK_IMAGE_VIEW_TYPE_2D,
++                   (VkComponentMapping){ 0 });
++    if (hi) {
++        g_hash_table_insert(e->images, key_new(task, ref | 0x40000000u), hi);
++        return hi;
+     }
+     hi = g_new0(HostImage, 1);
+     hi->samples = samples;
++    e->stats.image_creates++;
+     if (vkCreateImage(g->device, &ici, NULL, &hi->image) != VK_SUCCESS) {
+         g_free(hi);
+         return NULL;
+@@ -3155,6 +3269,7 @@ static HostImage *ds_image(PVGExec *e, uint32_t task, uint32_t ref, uint32_t w,
+     hi->height = h;
+     hi->depth = hi->layers = 1;
+     hi->view_type = VK_IMAGE_VIEW_TYPE_2D;
++    hi->bytes = req.size;
+     g_hash_table_insert(e->images, key_new(task, ref | 0x40000000u), hi);
+     return hi;
+ }
+@@ -5473,6 +5588,24 @@ static gboolean match_task(gpointer key, gpointer value, gpointer task)
+     return KEY_TASK(*(gint64 *)key) == GPOINTER_TO_UINT(task);
+ }
+ 
++/* retire (into the pool, after the next submission) the images whose keys match */
++static void images_retire_matching(PVGExec *e, GHRFunc match, gpointer data)
++{
++    g_autoptr(GArray) keys = g_array_new(false, false, sizeof(gint64));
++    GHashTableIter it;
++    gpointer k, v;
++
++    g_hash_table_iter_init(&it, e->images);
++    while (g_hash_table_iter_next(&it, &k, &v)) {
++        if (match(k, v, data)) {
++            g_array_append_val(keys, *(gint64 *)k);
++        }
++    }
++    for (guint i = 0; i < keys->len; i++) {
++        image_retire(e, g_array_index(keys, gint64, i));
++    }
++}
++
+ /* every host image of object id (all variants, all levels and slices) */
+ static gboolean match_object(gpointer key, gpointer value, gpointer data)
+ {
+@@ -5505,7 +5638,7 @@ void pvg_exec_object_deleted(PVGExec *e, uint32_t task, uint32_t id)
+     if (!id) {
+         return;
+     }
+-    vkQueueWaitIdle(e->gpu->queue);
++    queue_idle(e);
+     g_hash_table_iter_init(&it, e->pipelines);
+     while (g_hash_table_iter_next(&it, &k, &v)) {
+         if (g_str_has_prefix(k, prefix)) {
+@@ -5522,7 +5655,7 @@ void pvg_exec_object_deleted(PVGExec *e, uint32_t task, uint32_t id)
+     {
+         uint32_t ti[2] = { task, id };
+ 
+-        g_hash_table_foreach_remove(e->images, match_object, ti);
++        images_retire_matching(e, match_object, ti);
+     }
+ }
+ 
+@@ -5532,7 +5665,7 @@ void pvg_exec_task_reset(PVGExec *e, uint32_t task)
+     GHashTableIter it;
+     gpointer k, v;
+ 
+-    vkQueueWaitIdle(e->gpu->queue);
++    queue_idle(e);
+     g_hash_table_iter_init(&it, e->samplers);
+     while (g_hash_table_iter_next(&it, &k, &v)) {
+         if ((uint32_t)(*(gint64 *)k >> 32) == task) {
+@@ -5543,7 +5676,7 @@ void pvg_exec_task_reset(PVGExec *e, uint32_t task)
+         }
+     }
+     g_hash_table_foreach_remove(e->unnorm, match_task, GUINT_TO_POINTER(task));
+-    g_hash_table_foreach_remove(e->images, match_task, GUINT_TO_POINTER(task));
++    images_retire_matching(e, match_task, GUINT_TO_POINTER(task));
+     g_hash_table_foreach_remove(e->pipelines, match_task_str, GUINT_TO_POINTER(task));
+ }
+ 
+@@ -5649,6 +5782,8 @@ PVGExec *pvg_exec_new(PVGGpu *gpu, const PVGExecHost *host)
+     e->priv_imgs = g_ptr_array_new();
+     e->pending = g_array_new(false, false, sizeof(uint64_t) * 4);
+     e->images = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, image_free);
++    e->retired = g_ptr_array_new();
++    e->pool = g_ptr_array_new();
+     e->pipelines = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, pipeline_free);
+     e->spv_cache = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, spv_cache_free);
+     {
+@@ -5697,6 +5832,13 @@ void pvg_exec_free(PVGExec *e)
+     VkDevice d = e->gpu->device;
+ 
+     vkDeviceWaitIdle(d);
++    free_ctx = e;
++    images_release(e);
++    for (guint i = 0; i < e->pool->len; i++) {
++        image_free(g_ptr_array_index(e->pool, i));
++    }
++    g_ptr_array_free(e->pool, true);
++    g_ptr_array_free(e->retired, true);
+     zc_fini(e);
+     g_free(e->zc_runs);
+     g_free(e->zc_regs);
+diff --git a/hw/display/pvg/pvg-exec.h b/hw/display/pvg/pvg-exec.h
+index 9f8a20d..a8bfb35 100644
+--- a/hw/display/pvg/pvg-exec.h
++++ b/hw/display/pvg/pvg-exec.h
+@@ -58,7 +58,9 @@ typedef struct PVGExecStats {
+     uint64_t priv_skipped, priv_flushes;    /* private residency: bytes not copied, flushes */
+     uint64_t gpu_mipmaps;
+     uint64_t zc_gathered, zc_scattered, zc_fallbacks;  /* zero-copy bytes in / out, CPU fallbacks */
+-    uint64_t bar_written;       /* bytes the CPU wrote straight into VRAM (resizable BAR) */       /* GenerateMipmaps done on the GPU (the rest: CPU fallback) */
++    uint64_t bar_written;
++    uint64_t image_creates, pool_hits;  /* host images created / reused from the pool */
++    uint64_t queue_waits;       /* vkQueueWaitIdle actually needed */       /* bytes the CPU wrote straight into VRAM (resizable BAR) */       /* GenerateMipmaps done on the GPU (the rest: CPU fallback) */
+ } PVGExecStats;
+ 
+ typedef struct PVGExec PVGExec;
+diff --git a/hw/display/trace-events b/hw/display/trace-events
+index 0d00862..41e7a05 100644
+--- a/hw/display/trace-events
++++ b/hw/display/trace-events
+@@ -259,6 +259,7 @@ pvg_linux_exec_pipelines(uint64_t pipe_ms, uint64_t spv_hits, uint64_t damage_mb
+ pvg_linux_exec_cache(uint64_t hits, uint64_t saved_mb, uint64_t dropped, uint64_t sync_ms, int64_t kvm_ms) "upload cache: %"PRIu64" hits, %"PRIu64" MiB not uploaded, %"PRIu64" dropped, sync %"PRIu64" ms (KVM log %"PRId64" ms)"
+ pvg_linux_exec_private(uint64_t skipped_mb, uint64_t flushes, uint64_t gpu_mipmaps) "private textures: %"PRIu64" MiB not copied, %"PRIu64" flushes; %"PRIu64" GPU mipmaps"
+ pvg_linux_exec_zc(uint64_t gathered_mb, uint64_t scattered_mb, uint64_t fallbacks, uint64_t bar_mb) "zero-copy: %"PRIu64" MiB gathered, %"PRIu64" MiB scattered by the GPU, %"PRIu64" CPU fallbacks, %"PRIu64" MiB CPU-written to VRAM"
++pvg_linux_exec_alloc(uint64_t creates, uint64_t pool_hits, uint64_t queue_waits) "host images: %"PRIu64" created, %"PRIu64" reused; %"PRIu64" queue waits"
+ pvg_linux_child_poke(uint32_t index, uint32_t written, uint32_t read, uint32_t length) "child FIFO %u written=0x%x read=0x%x length=0x%x"
+ pvg_linux_cmd_stub(uint32_t op) "op=0x%02x not implemented, completed"
+ pvg_linux_signal_stamp(uint32_t index, uint32_t value) "stamps[%u]=%u"
+-- 
+2.43.0
+

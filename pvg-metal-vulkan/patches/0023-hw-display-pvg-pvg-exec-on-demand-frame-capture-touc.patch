@@ -1,0 +1,123 @@
+From 209252803bb341f53d3448144d260166529b4538 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 14:40:49 +0200
+Subject: [PATCH 23/54] hw/display/pvg/pvg-exec: on-demand frame capture (touch
+ <dump-dir>/capture)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/pvg-exec.c | 56 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 56 insertions(+)
+
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index 6d6addf..e022f7a 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -10,6 +10,7 @@
+  * SPDX-License-Identifier: GPL-2.0-or-later
+  */
+ #include <glib.h>
++#include <glib/gstdio.h>
+ #include <stdarg.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -104,6 +105,7 @@ typedef struct Pipeline {
+     uint32_t vertex_bindings;           /* Metal buffer indices fetched as vertex buffers */
+     uint32_t push_size;
+     uint32_t draws_logged;
++    char vs_name[64], fs_name[64];  /* entry points, for frame captures */
+     uint32_t dummy_logged;      /* texture slots already reported as placeholder-bound */
+ } Pipeline;
+ 
+@@ -146,6 +148,7 @@ struct PVGExec {
+     GHashTable *written;
+     GHashTable *census;     /* diagnostics: textures already reported by tex_census */
+     uint32_t census_count;
++    uint32_t capture_left, capture_seq;     /* frame capture: segments still to record */
+     GHashTable *unnorm;     /* (task, sampler ref) with unnormalised coordinates */    /* diagnostics: guest-physical page -> writer kind */
+     bool creating_dummies;
+ };
+@@ -1205,6 +1208,8 @@ static Pipeline *pipeline_get(PVGExec *e, uint32_t task, uint32_t ref, const VkF
+     free(vs.spirv);
+     free(fs.spirv);
+     p->ok = true;
++    g_strlcpy(p->vs_name, vs.entry, sizeof(p->vs_name));
++    g_strlcpy(p->fs_name, fs.entry, sizeof(p->fs_name));
+     elog(e, "task %u pipeline %u: vertex %s / fragment %s (bufs %#x/%#x tex %#x)", task, ref,
+          vs.entry, fs.entry, p->vs_buffers, p->fs_buffers, p->fs_textures);
+     for (uint32_t i = 0; i < npass && e->blends_logged < 400; i++, e->blends_logged++) {
+@@ -2089,6 +2094,25 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                 break;
+             }
+             seg_draws++;
++            if (e->capture_left) {
++                GString *t = g_string_new(NULL);
++
++                for (int i = 0; i < MAX_SLOTS; i++) {
++                    if ((pp->fs_textures >> i & 1) && st.ftex[i]) {
++                        g_string_append_printf(t, " t%d=%u(%ux%u%s)", i, st.ftex[i],
++                                               draw_tex[i] ? draw_tex[i]->width : 0,
++                                               draw_tex[i] ? draw_tex[i]->height : 0,
++                                               draw_tex[i] ? "" : " missing");
++                    }
++                }
++                elog(e, "cap %u   draw p%u %s/%s prim %u count %u inst %u ds %#x ref %u "
++                     "vp %.0f,%.0f %.0fx%.0f sc %d,%d %ux%u%s", e->capture_seq, st.pipeline,
++                     pp->vs_name, pp->fs_name, prim, count, instances, st.ds_w0,
++                     st.stencil_ref[0], st.viewport.x, st.viewport.y, st.viewport.width,
++                     st.viewport.height, st.scissor.offset.x, st.scissor.offset.y,
++                     st.scissor.extent.width, st.scissor.extent.height, t->str);
++                g_string_free(t, TRUE);
++            }
+             if (bound != pp) {
+                 vkCmdBindPipeline(e->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pipe);
+                 bound = pp;
+@@ -2154,6 +2178,27 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+     if (!submit_wait(e, &si)) {
+         return;
+     }
++    if (e->capture_left) {
++        for (uint32_t i = 0; i < natt; i++) {
++            elog(e, "cap %u   att%u ref %u level %u slice %u task %u va 0x%" G_GINT64_MODIFIER
++                 "x %ux%u fmt %d load %u store %u", e->capture_seq, i, att[i].ref, att[i].level,
++                 att[i].slice, att[i].gi.task, att[i].gi.va, att[i].gi.width, att[i].gi.height,
++                 att[i].gi.format, att[i].load, att[i].store);
++            if (att[i].wb_off != UINT64_MAX) {
++                g_autofree char *path = g_strdup_printf(
++                    "%s/cap-%04u-t%u-r%u-att%u-fmt%d-%ux%u-s%u.raw", e->dump_dir,
++                    e->capture_seq, task, att[i].ref, i, att[i].gi.format, att[i].gi.width,
++                    att[i].gi.height, att[i].gi.row_bytes);
++
++                g_file_set_contents(path, (const char *)(e->arena_ptr + att[i].wb_off),
++                                    (gssize)att[i].gi.row_bytes * att[i].gi.height, NULL);
++            }
++        }
++        elog(e, "cap %u end segment task %u %ux%u draws %u skipped %u", e->capture_seq, task,
++             rw, rh, seg_draws, seg_skipped);
++        e->capture_seq++;
++        e->capture_left--;
++    }
+     /* diagnostics: what passes with depth/stencil attachments produce */
+     if (e->dump_dir && (has_depth || has_stencil) && e->ds_dumps < 30) {
+         e->ds_dumps++;
+@@ -2339,6 +2384,17 @@ void pvg_exec_cmdbuf(PVGExec *e, uint32_t task, const uint8_t *buf, uint64_t len
+     if (e->disabled) {
+         return;
+     }
++    if (e->dump_dir && !e->capture_left) {
++        /* frame capture on demand: touch <dump-dir>/capture */
++        g_autofree char *trig = g_build_filename(e->dump_dir, "capture", NULL);
++
++        if (g_file_test(trig, G_FILE_TEST_EXISTS)) {
++            g_unlink(trig);
++            e->capture_left = 400;
++            elog(e, "capture: recording %u segments from seq %u", e->capture_left,
++                 e->capture_seq);
++        }
++    }
+     e->arena_used = 0;
+     g_hash_table_remove_all(e->uploaded);
+     while (off + 8 <= len && !e->disabled) {
+-- 
+2.43.0
+

@@ -1,0 +1,702 @@
+From 190fb75d518dd86bc8a44159fa48bc98a173dc0b Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 10:52:01 +0200
+Subject: [PATCH 06/54] hw/display/pvg-linux-pci: task mappings, object table,
+ backing scanout, Metal stream parser
+
+MapMemory2/UnmapMemory keep host-side page snapshots per task;
+SetObjectList records each task's object table; Transaction3 resolves the
+presented surface (a BGRA Backing object) and copies it into the console.
+ExecIndirect2 command buffers are read from user task memory, split into
+encoder segments, traced, and optionally dumped (dump-dir) for analysis.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-cmds.h | 192 ++++++++++++++++++++
+ hw/display/pvg-linux-pci.c  | 344 ++++++++++++++++++++++++++++++++++--
+ hw/display/trace-events     |   6 +
+ 3 files changed, 527 insertions(+), 15 deletions(-)
+ create mode 100644 hw/display/pvg-linux-cmds.h
+
+diff --git a/hw/display/pvg-linux-cmds.h b/hw/display/pvg-linux-cmds.h
+new file mode 100644
+index 0000000..21d42a5
+--- /dev/null
++++ b/hw/display/pvg-linux-cmds.h
+@@ -0,0 +1,192 @@
++/* Generated from docs/pvg-decoder-tables.txt (scripts/decoder_tables.py). */
++#ifndef PVG_LINUX_CMDS_H
++#define PVG_LINUX_CMDS_H
++
++typedef struct PVGCmdName {
++    uint16_t id;
++    const char *name;
++} PVGCmdName;
++
++static const PVGCmdName pvg_compute_cmds[] = {
++    { 0x00c8, "DispatchThreadgroups" },
++    { 0x00c9, "DispatchThreadgroupsIndirect" },
++    { 0x00ca, "DispatchThreads" },
++    { 0x00cb, "SetBuffers" },
++    { 0x00cc, "SetSamplers" },
++    { 0x00cd, "SetSamplersLODClamp" },
++    { 0x00ce, "SetTextures" },
++    { 0x00cf, "SetBufferOffset" },
++    { 0x00d0, "SetPipelineState" },
++    { 0x00d1, "SetStageInRegion" },
++    { 0x00d2, "SetStageInRegionIndirect" },
++    { 0x00d3, "SetThreadgroupMemoryLength" },
++    { 0x00d4, "UpdateFence" },
++    { 0x00d5, "WaitForFence" },
++    { 0x00d6, "BarrierResources" },
++    { 0x00d7, "BarrierScope" },
++    { 0x00d8, "SetImageblockWidth" },
++    { 0x00d9, "SetBuffersWithStride" },
++    { 0x00da, "SetBufferOffsetWithStride" },
++    { 0x00db, "EncodeStartDoWhile" },
++    { 0x00dc, "EncodeStartDoWhile" },
++    { 0x00dd, "EncodeEndDoWhile" },
++    { 0x00de, "EncodeStartWhile" },
++    { 0x00df, "EncodeEndWhile" },
++    { 0x00e0, "EncodeStartIf" },
++    { 0x00e1, "EncodeStartElse" },
++    { 0x00e2, "EncodeEndIf" },
++    { 0x00e3, "InsertCompressedTextureReinterpretationFlush" },
++    { 0x00e4, "ExecuteCommandInBufferRanged" },
++    { 0x00e5, "ExecuteCommandInBuffer" },
++    { 0x00e6, "DispatchThreadsIndirect" },
++};
++
++static const PVGCmdName pvg_render_cmds[] = {
++    { 0x0000, "DrawPrimitives64" },
++    { 0x0001, "DrawPrimitives16" },
++    { 0x0002, "DrawInstancedPrimitives64" },
++    { 0x0003, "DrawInstancedPrimitives16" },
++    { 0x0004, "DrawInstancedBasePrimitives64" },
++    { 0x0005, "DrawInstancedBasePrimitives16" },
++    { 0x0006, "DrawIndexedPrimitives64" },
++    { 0x0007, "DrawIndexedPrimitives16" },
++    { 0x0008, "DrawIndexedInstancedPrimitives64" },
++    { 0x0009, "DrawIndexedInstancedPrimitives16" },
++    { 0x000a, "DrawIndexedInstancedBasePrimitives64" },
++    { 0x000b, "DrawIndexedInstancedBasePrimitives16" },
++    { 0x000c, "DrawPatches64" },
++    { 0x000d, "DrawPatches16" },
++    { 0x000e, "DrawIndexedPatches64" },
++    { 0x000f, "DrawIndexedPatches16" },
++    { 0x0010, "DrawPrimitivesIndirect" },
++    { 0x0011, "DrawIndexedPrimitivesIndirect" },
++    { 0x0012, "DrawPatchesIndirect" },
++    { 0x0013, "DrawIndexedPatchesIndirect" },
++    { 0x0014, "ExecuteCommandsInBuffer" },
++    { 0x0015, "ExecuteCommandsInBufferRanged" },
++    { 0x0016, "RenderBarrierResources" },
++    { 0x0017, "RenderBarrierScope" },
++    { 0x0018, "RenderUpdateFence" },
++    { 0x0019, "RenderWaitForFence" },
++    { 0x001b, "UseHeapsWithStages" },
++    { 0x001c, "DrawIndexedInstancedBasePrimitives64_2" },
++    { 0x001d, "DrawIndexedInstancedBasePrimitives16_2" },
++    { 0x0065, "SetBlendColor" },
++    { 0x0066, "SetColorStoreAction" },
++    { 0x0067, "SetColorStoreActionOptions" },
++    { 0x0068, "SetDepthStencilState" },
++    { 0x0069, "SetDepthStoreAction" },
++    { 0x006a, "SetDepthStoreAction" },
++    { 0x006b, "SetCullMode" },
++    { 0x006c, "SetDepthBias" },
++    { 0x006d, "SetDepthClipMode" },
++    { 0x006e, "SetFragmentBuffers" },
++    { 0x006f, "SetFragmentBufferOffset" },
++    { 0x0070, "SetFragmentSamplerStates" },
++    { 0x0071, "SetFragmentSamplerStatesLODClamp" },
++    { 0x0072, "SetFragmentTextures" },
++    { 0x0073, "SetFrontFacingWinding" },
++    { 0x0074, "SetRenderPipelineState" },
++    { 0x0075, "SetScissorRect" },
++    { 0x0076, "SetScissorRects" },
++    { 0x0077, "SetStencilRef" },
++    { 0x0078, "SetStencilStoreAction" },
++    { 0x0079, "SetStencilStoreActionOptions" },
++    { 0x007a, "SetTesselationFactorBuffer" },
++    { 0x007b, "SetTesselationFactorScale" },
++    { 0x007c, "SetTriangleFillMode" },
++    { 0x007d, "SetVertexBuffers" },
++    { 0x007e, "SetVertexBufferOffset" },
++    { 0x007f, "SetVertexSamplerStates" },
++    { 0x0080, "SetVertexSamplerStatesLODClamp" },
++    { 0x0081, "SetVertexTextures" },
++    { 0x0082, "SetViewport" },
++    { 0x0083, "SetViewports" },
++    { 0x0084, "SetVisibilityResultMode" },
++    { 0x0085, "TextureBarrier" },
++    { 0x0086, "UseHeaps" },
++    { 0x0087, "UseResources" },
++    { 0x0088, "SetLineWidth" },
++    { 0x0089, "UseResourcesWithStages" },
++    { 0x008a, "SetAlphaTestReferenceValue" },
++    { 0x008b, "SetPointSize" },
++    { 0x008c, "SetClipPlane" },
++    { 0x008d, "SetVertexSamplerState" },
++    { 0x008e, "SetFragmentSamplerState" },
++    { 0x008f, "SetViewportTransformEnabled" },
++    { 0x0090, "SetProvokingVertexMode" },
++    { 0x0091, "SetPrimitiveRestartIndexEnabled" },
++    { 0x0092, "SetTriangleFillModeFrontBack" },
++    { 0x0093, "SetTransformFeedbackState" },
++    { 0x0094, "SetDepthCleared" },
++    { 0x0095, "SetStencilCleared" },
++    { 0x0096, "SetColorResolveTexture" },
++    { 0x0097, "SetDepthResolveTexture" },
++    { 0x0098, "SetStencilResolveTexture" },
++    { 0x0099, "SetVertexAmplificationMode" },
++    { 0x009a, "SetVertexAmplificationCount" },
++    { 0x009b, "DispatchThreadsPerTile" },
++    { 0x009c, "SetRenderThreadgroupMemoryLength" },
++    { 0x009d, "SetTileBuffers" },
++    { 0x009e, "SetTileBufferOffset" },
++    { 0x009f, "SetTileSamplerStates" },
++    { 0x00a0, "SetTileSamplerStatesLODClamp" },
++    { 0x00a1, "SetTileTextures" },
++    { 0x00a2, "DispatchThreadsPerTileInRegion" },
++    { 0x00a3, "DispatchThreadsPerTileInRegionWithIndex" },
++    { 0x00a4, "GetTileDimensions" },
++    { 0x00a5, "SetVertexBuffersWithStride" },
++    { 0x00a6, "SetVertexBufferOffsetWithStride" },
++};
++
++static const PVGCmdName pvg_blit_cmds[] = {
++    { 0x012c, "CopyFromBufferToTexture" },
++    { 0x012d, "CopyFromBufferToBuffer" },
++    { 0x012e, "CopyFromTextureToBuffer" },
++    { 0x012f, "CopyFromTextureToTexture" },
++    { 0x0130, "CopyFromTextureToTextureWithOptions" },
++    { 0x0131, "CopyIndirectCommandBuffer" },
++    { 0x0132, "FillBuffer" },
++    { 0x0133, "GenerateMipmaps" },
++    { 0x0134, "OptimizeForCPUAccess" },
++    { 0x0135, "OptimizeForGPUAccess" },
++    { 0x0136, "OptimizeImageForCPUAccess" },
++    { 0x0137, "OptimizeImageForGPUAccess" },
++    { 0x0138, "OptimizeIndirectCommandBuffer" },
++    { 0x0139, "ResetCommandsInCommandBuffer" },
++    { 0x013a, "SynchronizeResource" },
++    { 0x013b, "SynchronizeTextureImage" },
++    { 0x013c, "BlitUpdateFence" },
++    { 0x013d, "BlitWaitForFence" },
++    { 0x013e, "CopyFromTextureToTextureWithNumSliceLevel" },
++    { 0x013f, "FillBufferWithPattern" },
++    { 0x0140, "FillTextureWithBytes" },
++    { 0x0141, "FillTextureWithColor" },
++    { 0x0142, "InvalidateCompressedTexture" },
++    { 0x0143, "InvalidateCompressedTextureImage" },
++};
++
++static const PVGCmdName pvg_info_cmds[] = {
++    { 0x01c2, "ComputePipelineStateInfo" },
++    { 0x01c3, "HeapTextureDescriptorSizeAndAlign" },
++    { 0x01c4, "GetRasterizationRateMapInfo" },
++    { 0x01c5, "CopyRasterizationRateParameterBuffer" },
++    { 0x01c6, "MapScreenToPhysicalCoordinates" },
++    { 0x01c7, "MapPhysicalToScreenCoordinates" },
++    { 0x01c8, "MapPhysicalToScreenCoordinatesMultiple" },
++    { 0x01c9, "RenderPipelineStateInfo" },
++    { 0x01ca, "RenderPipelineImageBlockMemoryLength" },
++    { 0x01cb, "ComputePipelineImageBlockMemoryLength" },
++    { 0x01cc, "ObjectUniqueIdentifier" },
++    { 0x01cd, "BufferHostResourceInfo" },
++    { 0x01ce, "TextureHostResourceInfo" },
++    { 0x01cf, "HeapHostResourceInfo" },
++    { 0x01d0, "SamplerStateHostResourceInfo" },
++    { 0x01d1, "ICBHostResourceInfo" },
++    { 0x01d2, "RenderPipelineHostResourceInfo" },
++    { 0x01d3, "ComputePipelineHostResourceInfo" },
++    { 0x01d4, "DepthStencilHostResourceInfo" },
++    { 0x01d5, "HeapTextureDescriptorSizeAndAlign2" },
++};
++
++#endif
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index bb97941..546ecd0 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -26,6 +26,7 @@
+ #include "system/dma.h"
+ #include "qom/object.h"
+ #include "trace.h"
++#include "pvg-linux-cmds.h"
+ 
+ #define TYPE_PVG_LINUX_PCI "pvg-linux-pci"
+ OBJECT_DECLARE_SIMPLE_TYPE(PVGLinuxPCIState, PVG_LINUX_PCI)
+@@ -60,9 +61,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(PVGLinuxPCIState, PVG_LINUX_PCI)
+ #define PVG_CMD_DISPLAY_CURSOR_GLYPH 0x04
+ #define PVG_CMD_DISPLAY_CURSOR_SHOW 0x05
+ #define PVG_CMD_DISPLAY_TRANSACTION3 0x07
++#define PVG_CMD_UNMAP_MEMORY        0x22
+ #define PVG_CMD_DEFINE_CHILD_FIFO   0x30
+ #define PVG_CMD_SET_OBJECT_LIST     0x33
++#define PVG_CMD_EXEC_INDIRECT2      0x37
+ #define PVG_CMD_DEFINE_TASK2        0x38
++#define PVG_CMD_MAP_MEMORY2         0x39
+ #define PVG_CMD_GET_DEVICE_INFO     0x3a
+ 
+ #define PVG_ROOT_STAMP_INDEX    0
+@@ -106,6 +110,31 @@ OBJECT_DECLARE_SIMPLE_TYPE(PVGLinuxPCIState, PVG_LINUX_PCI)
+ #define DS_EVENT_CONFIG         0x4
+ #define DS_EVENT_DONE           0x8
+ 
++/* Object table entry in task memory: {u8 type, u24 length, u64 va} */
++#define PVG_OBJ_ENTRY_SIZE      12
++#define PVG_OBJ_BACKING         0x04
++
++/*
++ * APVObjectBacking: {u64 alloc_len, u32 virtual_page, u32 fourcc, u32 planes}
++ * then planes of {u32 offset, u32 width, u32 height, u32 bpp << 24 | row_bytes}
++ * (PGResourceManager::createBacking, +[PGBackingResource validateBacking...]).
++ */
++#define PVG_FOURCC_BGRA         0x42475241
++
++/* Host-side mapping of a task range, taken at MapMemory2 (mapMemoryAtOffset:) */
++typedef struct PVGTaskMapping {
++    uint64_t va;
++    uint64_t len;
++    uint64_t *gpa;          /* one guest-physical page per 4 KiB, 0 = hole */
++} PVGTaskMapping;
++
++typedef struct PVGTask {
++    uint32_t root;          /* task root PFN, 0 = no task */
++    uint64_t object_list_va;
++    uint32_t object_list_len;
++    GArray *mappings;       /* PVGTaskMapping */
++} PVGTask;
++
+ typedef struct PVGDisplayMode {
+     uint16_t width;
+     uint16_t height;
+@@ -194,7 +223,7 @@ struct PVGLinuxPCIState {
+     uint32_t stamp_status;
+     uint8_t *payload;
+     PVGFifoView *view;
+-    uint32_t task_root[PVG_MAX_TASKS];  /* PFN of each task's root, 0 = none */
++    PVGTask tasks[PVG_MAX_TASKS];
+ 
+     /* display port 0 */
+     QemuConsole *con;
+@@ -204,6 +233,7 @@ struct PVGLinuxPCIState {
+     bool modes_pending;
+     bool cursor_show;
+     int16_t cursor_x, cursor_y;     /* signed: the guest parks it off-screen */
++    bool scanout_valid;             /* console holds a presented frame */
+ 
+     /* properties */
+     uint16_t vendor_id;
+@@ -211,6 +241,9 @@ struct PVGLinuxPCIState {
+     uint32_t mmio_size;
+     uint32_t msi_vectors;
+     uint32_t display_ports;
++    char *dump_dir;         /* raw ExecIndirect2 command buffers, for RE */
++    uint32_t dump_max;
++    uint32_t dumped;
+ };
+ 
+ static uint32_t pvg_reg(PVGLinuxPCIState *s, hwaddr off)
+@@ -315,6 +348,8 @@ static void pvg_cmd_get_device_info(PVGLinuxPCIState *s, const uint32_t *p,
+     trace_pvg_linux_device_info(version, n, dst);
+ }
+ 
++static void pvg_display_ensure_surface(PVGLinuxPCIState *s, int w, int h);
++
+ /* ---- guest task address spaces (PGLocalTask, PGPageTableIterator) ---- */
+ 
+ /*
+@@ -322,20 +357,16 @@ static void pvg_cmd_get_device_info(PVGLinuxPCIState *s, const uint32_t *p,
+  * page table level is a page of 1024 u32 entries: PFN in bits 0..30, bit 31
+  * a flag, 0 = hole.
+  */
+-static bool pvg_task_translate(PVGLinuxPCIState *s, uint32_t task,
+-                               uint64_t va, uint64_t *gpa)
++static bool pvg_task_walk(PVGLinuxPCIState *s, uint32_t task, uint64_t va,
++                          uint64_t *gpa)
+ {
+     PCIDevice *d = PCI_DEVICE(s);
+     uint32_t table, depth, entry;
+     uint64_t vpn = va >> 12;
++    uint64_t root = (uint64_t)s->tasks[task].root << 12;
+ 
+-    if (task >= PVG_MAX_TASKS || !s->task_root[task]) {
+-        return false;
+-    }
+-    ldl_le_pci_dma(d, (uint64_t)s->task_root[task] << 12, &table,
+-                   MEMTXATTRS_UNSPECIFIED);
+-    ldl_le_pci_dma(d, ((uint64_t)s->task_root[task] << 12) + 4, &depth,
+-                   MEMTXATTRS_UNSPECIFIED);
++    ldl_le_pci_dma(d, root, &table, MEMTXATTRS_UNSPECIFIED);
++    ldl_le_pci_dma(d, root + 4, &depth, MEMTXATTRS_UNSPECIFIED);
+     if (depth < 1 || depth > 4) {
+         return false;
+     }
+@@ -353,6 +384,95 @@ static bool pvg_task_translate(PVGLinuxPCIState *s, uint32_t task,
+     return true;
+ }
+ 
++/* Host mappings first (the guest may drop PTEs after MapMemory2), then a walk */
++static bool pvg_task_translate(PVGLinuxPCIState *s, uint32_t task,
++                               uint64_t va, uint64_t *gpa)
++{
++    PVGTask *t;
++
++    if (task >= PVG_MAX_TASKS || !s->tasks[task].root) {
++        return false;
++    }
++    t = &s->tasks[task];
++    for (guint i = 0; t->mappings && i < t->mappings->len; i++) {
++        PVGTaskMapping *m = &g_array_index(t->mappings, PVGTaskMapping, i);
++
++        if (va >= m->va && va - m->va < m->len) {
++            uint64_t page = m->gpa[(va - m->va) >> 12];
++
++            if (page) {
++                *gpa = page | (va & 0xfff);
++                return true;
++            }
++            break;
++        }
++    }
++    return pvg_task_walk(s, task, va, gpa);
++}
++
++static void pvg_task_mapping_free(gpointer p)
++{
++    g_free(((PVGTaskMapping *)p)->gpa);
++}
++
++static void pvg_task_unmap(PVGLinuxPCIState *s, uint32_t task, uint64_t va,
++                           uint64_t len)
++{
++    GArray *maps = s->tasks[task].mappings;
++
++    for (guint i = 0; maps && i < maps->len;) {
++        PVGTaskMapping *m = &g_array_index(maps, PVGTaskMapping, i);
++
++        if (m->va >= va && m->va + m->len <= va + len) {
++            g_array_remove_index_fast(maps, i);
++        } else {
++            i++;
++        }
++    }
++}
++
++/* CmdMapMemory2 / CmdUnmapMemory {u32 task, u64 va, u64 len} */
++static void pvg_cmd_map_memory(PVGLinuxPCIState *s, const uint8_t *p,
++                               uint32_t len, bool map)
++{
++    uint32_t task;
++    uint64_t va, size;
++    PVGTaskMapping m;
++
++    if (len < 20) {
++        return;
++    }
++    task = ldl_le_p(p);
++    va = ldq_le_p(p + 4);
++    size = ldq_le_p(p + 12);
++    if (task >= PVG_MAX_TASKS || !s->tasks[task].root || (va | size) & 0xfff ||
++        size > 4 * GiB) {
++        qemu_log_mask(LOG_GUEST_ERROR, "pvg: bad map task %u va 0x%" PRIx64
++                      " len 0x%" PRIx64 "\n", task, va, size);
++        return;
++    }
++    pvg_task_unmap(s, task, va, size);
++    if (!map) {
++        return;
++    }
++    m.va = va;
++    m.len = size;
++    m.gpa = g_new0(uint64_t, size >> 12);
++    for (uint64_t off = 0; off < size; off += 0x1000) {
++        uint64_t gpa;
++
++        if (pvg_task_walk(s, task, va + off, &gpa)) {
++            m.gpa[off >> 12] = gpa;
++        }
++    }
++    if (!s->tasks[task].mappings) {
++        s->tasks[task].mappings = g_array_new(false, false,
++                                              sizeof(PVGTaskMapping));
++        g_array_set_clear_func(s->tasks[task].mappings, pvg_task_mapping_free);
++    }
++    g_array_append_val(s->tasks[task].mappings, m);
++}
++
+ static bool pvg_task_read(PVGLinuxPCIState *s, uint32_t task, uint64_t va,
+                           void *buf, uint64_t len)
+ {
+@@ -388,7 +508,10 @@ static void pvg_cmd_define_task2(PVGLinuxPCIState *s, const uint8_t *p,
+         qemu_log_mask(LOG_GUEST_ERROR, "pvg: task id %u out of range\n", id);
+         return;
+     }
+-    s->task_root[id] = root;
++    s->tasks[id].root = root;
++    if (s->tasks[id].mappings) {
++        g_array_set_size(s->tasks[id].mappings, 0);
++    }
+     /* -[_PGDevice createTaskID:...] mirrors the root into the root page */
+     if (pvg_reg(s, PVG_REG_ROOT_PAGE)) {
+         stl_le_pci_dma(PCI_DEVICE(s),
+@@ -668,6 +791,10 @@ static void pvg_display_redraw(PVGLinuxPCIState *s)
+     if (!s->con) {
+         return;
+     }
++    if (s->scanout_valid) {
++        /* frames come from Transaction3; the UI draws the cursor itself */
++        return;
++    }
+     pvg_display_ensure_surface(s, pvg_display_modes[0].width,
+                                pvg_display_modes[0].height);
+     fb = surface_data(s->surface);
+@@ -791,6 +918,173 @@ static void pvg_display_doorbell(PVGLinuxPCIState *s, uint32_t port)
+     pvg_display_cursor_changed(s);
+ }
+ 
++/* CmdSetObjectList {u32 task, u32 list_page, u32 list_len} */
++static void pvg_cmd_set_object_list(PVGLinuxPCIState *s, const uint8_t *p,
++                                    uint32_t len)
++{
++    uint32_t task;
++
++    if (len < 12) {
++        return;
++    }
++    task = ldl_le_p(p);
++    if (task >= PVG_MAX_TASKS) {
++        return;
++    }
++    s->tasks[task].object_list_va = (uint64_t)ldl_le_p(p + 4) << 12;
++    s->tasks[task].object_list_len = ldl_le_p(p + 8);
++    trace_pvg_linux_object_list(task, s->tasks[task].object_list_va,
++                                s->tasks[task].object_list_len);
++}
++
++/* Read object 'id' of a task into buf; returns its type (0 = invalid) */
++static uint8_t pvg_task_object(PVGLinuxPCIState *s, uint32_t task, uint32_t id,
++                               void *buf, uint32_t bufsize, uint32_t *objlen)
++{
++    PVGTask *t = &s->tasks[task];
++    uint8_t entry[PVG_OBJ_ENTRY_SIZE];
++    uint32_t head;
++
++    if (!t->object_list_va ||
++        (uint64_t)(id + 1) * PVG_OBJ_ENTRY_SIZE > t->object_list_len ||
++        !pvg_task_read(s, task, t->object_list_va + id * PVG_OBJ_ENTRY_SIZE,
++                       entry, sizeof(entry))) {
++        return 0;
++    }
++    head = ldl_le_p(entry);
++    *objlen = head >> 8;
++    if (!(head & 0xff) || *objlen > bufsize ||
++        !pvg_task_read(s, task, ldq_le_p(entry + 4), buf, *objlen)) {
++        return 0;
++    }
++    return head & 0xff;
++}
++
++/* Copy a presented BGRA backing (kernel task) into the console */
++static void pvg_display_scanout(PVGLinuxPCIState *s, uint32_t surface_id)
++{
++    uint8_t obj[0x100];
++    uint32_t objlen, fourcc, offset, width, height, row_bytes, *fb;
++    uint64_t base;
++    uint32_t missing = 0, nonzero = 0;
++    int stride;
++
++    if (!s->con) {
++        return;
++    }
++    if (pvg_task_object(s, 0, surface_id, obj, sizeof(obj), &objlen) !=
++        PVG_OBJ_BACKING || objlen < 0x24 || ldl_le_p(obj + 0x10) < 1) {
++        trace_pvg_linux_scanout_skip(surface_id, "not a backing");
++        return;
++    }
++    fourcc = ldl_le_p(obj + 0x0c);
++    base = (uint64_t)ldl_le_p(obj + 0x08) << 12;
++    offset = ldl_le_p(obj + 0x14);
++    width = ldl_le_p(obj + 0x18);
++    height = ldl_le_p(obj + 0x1c);
++    row_bytes = ldl_le_p(obj + 0x20) & 0xffffff;
++    if (fourcc != PVG_FOURCC_BGRA || (ldl_le_p(obj + 0x20) >> 24) != 4 ||
++        !width || !height || width > 8192 || height > 8192 ||
++        row_bytes < width * 4) {
++        trace_pvg_linux_scanout_skip(surface_id, "unsupported format");
++        return;
++    }
++    pvg_display_ensure_surface(s, width, height);
++    fb = surface_data(s->surface);
++    stride = surface_stride(s->surface);
++    for (uint32_t y = 0; y < height; y++) {
++        uint32_t *row = (uint32_t *)((uint8_t *)fb + y * stride);
++
++        if (!pvg_task_read(s, 0, base + offset + (uint64_t)y * row_bytes,
++                           row, width * 4)) {
++            memset(row, 0, width * 4);
++            missing++;
++        } else if (y % 64 == 0) {
++            for (uint32_t x = 0; x < width; x += 16) {
++                nonzero += (row[x] & 0xffffff) != 0;
++            }
++        }
++    }
++    s->scanout_valid = true;
++    trace_pvg_linux_scanout(surface_id, width, height, base, missing, nonzero);
++    qemu_console_update_full(s->con);
++}
++
++/* ---- Metal command stream (ExecIndirect2 -> _PGDeserializer) ---- */
++
++#define PVG_MAX_CMDBUF          (4 * MiB)
++#define PVG_SEG_HDR_SIZE        8   /* u32 length, u8 encoder, u8 continuation, u8 end, u8 */
++
++static const char *const pvg_encoder_names[] = {
++    [0] = "render", [1] = "compute", [2] = "blit", [4] = "info", [5] = "protection",
++};
++
++static void pvg_parse_cmdbuf(PVGLinuxPCIState *s, uint32_t task,
++                             const uint8_t *buf, uint64_t len)
++{
++    uint64_t off = 0;
++
++    while (off + PVG_SEG_HDR_SIZE <= len) {
++        uint32_t seglen = ldl_le_p(buf + off);
++        uint8_t enc = buf[off + 4];
++        const char *name = enc < ARRAY_SIZE(pvg_encoder_names) &&
++                           pvg_encoder_names[enc] ? pvg_encoder_names[enc] : "?";
++
++        if (seglen < PVG_SEG_HDR_SIZE || off + seglen > len) {
++            trace_pvg_linux_segment_bad(task, off, seglen, len);
++            return;
++        }
++        trace_pvg_linux_segment(task, off, seglen, name, buf[off + 5],
++                                buf[off + 6]);
++        off += seglen;
++    }
++}
++
++/*
++ * CmdExecIndirect2 {u32 user task, u32 resource count, u32 cmd buffer count,
++ * resources[] (24 B), cmd buffers[] {u64 va, u64 len}}
++ * (-[PGLocalTask doExecIndirect:cmdBuffers:resourceList:...]).
++ */
++static void pvg_cmd_exec_indirect2(PVGLinuxPCIState *s, const uint8_t *p,
++                                   uint32_t len)
++{
++    uint32_t task, nres, ncb;
++    const uint8_t *cbs;
++
++    if (len < 12) {
++        return;
++    }
++    task = ldl_le_p(p);
++    nres = ldl_le_p(p + 4);
++    ncb = ldl_le_p(p + 8);
++    if (task >= PVG_MAX_TASKS || nres > len / 24 || ncb > len / 16 ||
++        12 + 24ull * nres + 16ull * ncb > len) {
++        return;
++    }
++    cbs = p + 12 + 24 * nres;
++    for (uint32_t i = 0; i < ncb; i++) {
++        uint64_t va = ldq_le_p(cbs + 16 * i), cblen = ldq_le_p(cbs + 16 * i + 8);
++        g_autofree uint8_t *buf = NULL;
++
++        if (!cblen || cblen > PVG_MAX_CMDBUF) {
++            continue;
++        }
++        buf = g_malloc(cblen);
++        if (!pvg_task_read(s, task, va, buf, cblen)) {
++            trace_pvg_linux_task_fault(task, va);
++            continue;
++        }
++        trace_pvg_linux_cmdbuf(task, nres, va, cblen);
++        if (s->dump_dir && s->dumped < s->dump_max) {
++            g_autofree char *path = g_strdup_printf("%s/cb-%05u-t%u.bin",
++                                                    s->dump_dir, s->dumped++,
++                                                    task);
++            g_file_set_contents(path, (const char *)buf, cblen, NULL);
++        }
++        pvg_parse_cmdbuf(s, task, buf, cblen);
++    }
++}
++
+ /* CmdDefineChildFIFO, non-restoring path of -[PGChildFIFO initWithDevice:...] */
+ static void pvg_cmd_define_child_fifo(PVGLinuxPCIState *s, const uint8_t *p,
+                                       uint32_t len)
+@@ -830,11 +1124,23 @@ static void pvg_dispatch(PVGLinuxPCIState *s, const PVGCmdHeader *h,
+         }
+         break;
+     case PVG_CMD_DISPLAY_TRANSACTION3:
+-        if (len >= 0x24) {
+-            trace_pvg_linux_present(ldl_le_p(payload), ldl_le_p(payload + 4),
+-                                    ldl_le_p(payload + 8));
++        if (len >= 0x24 && ldl_le_p(payload) == 0 && ldl_le_p(payload + 4) == 0) {
++            trace_pvg_linux_present(0, 0, ldl_le_p(payload + 8));
++            pvg_display_scanout(s, ldl_le_p(payload + 8));
+         }
+         break;
++    case PVG_CMD_SET_OBJECT_LIST:
++        pvg_cmd_set_object_list(s, payload, len);
++        break;
++    case PVG_CMD_EXEC_INDIRECT2:
++        pvg_cmd_exec_indirect2(s, payload, len);
++        break;
++    case PVG_CMD_MAP_MEMORY2:
++        pvg_cmd_map_memory(s, payload, len, true);
++        break;
++    case PVG_CMD_UNMAP_MEMORY:
++        pvg_cmd_map_memory(s, payload, len, false);
++        break;
+     case PVG_CMD_DEFINE_TASK2:
+         pvg_cmd_define_task2(s, payload, len);
+         break;
+@@ -1076,8 +1382,14 @@ static void pvg_linux_reset(DeviceState *dev)
+     memset(s->regs, 0, s->mmio_size);
+     s->irq_status = 0;
+     s->stamp_status = 0;
+-    memset(s->task_root, 0, sizeof(s->task_root));
++    for (int i = 0; i < PVG_MAX_TASKS; i++) {
++        if (s->tasks[i].mappings) {
++            g_array_free(s->tasks[i].mappings, true);
++        }
++    }
++    memset(s->tasks, 0, sizeof(s->tasks));
+     s->ds_gpa = 0;
++    s->scanout_valid = false;
+     s->cursor_show = false;
+ }
+ 
+@@ -1088,6 +1400,8 @@ static const Property pvg_linux_properties[] = {
+     DEFINE_PROP_UINT32("msi-vectors", PVGLinuxPCIState, msi_vectors, 1),
+     /* guestDisplayPortCount (0x122c); only port 0 is implemented */
+     DEFINE_PROP_UINT32("display-ports", PVGLinuxPCIState, display_ports, 1),
++    DEFINE_PROP_STRING("dump-dir", PVGLinuxPCIState, dump_dir),
++    DEFINE_PROP_UINT32("dump-max", PVGLinuxPCIState, dump_max, 256),
+ };
+ 
+ static void pvg_linux_class_init(ObjectClass *klass, const void *data)
+diff --git a/hw/display/trace-events b/hw/display/trace-events
+index 904e660..be5b352 100644
+--- a/hw/display/trace-events
++++ b/hw/display/trace-events
+@@ -240,6 +240,12 @@ pvg_linux_display_state(uint32_t state, uint32_t events, uint32_t gen) "state=%u
+ pvg_linux_cursor_glyph(uint64_t va, uint64_t stride, uint32_t w, uint32_t h, uint32_t hx, uint32_t hy) "va=0x%"PRIx64" stride=%"PRIu64" %ux%u hot=%u,%u"
+ pvg_linux_doorbell(uint32_t port, uint32_t show, int x, int y) "port %u show=%u pos=%d,%d"
+ pvg_linux_present(uint32_t port, uint32_t task, uint32_t surface) "port %u task %u surface %u"
++pvg_linux_object_list(uint32_t task, uint64_t va, uint32_t len) "task %u objects at va=0x%"PRIx64" len=0x%x"
++pvg_linux_scanout(uint32_t surface, uint32_t w, uint32_t h, uint64_t va, uint32_t missing_rows, uint32_t nonzero_samples) "surface %u %ux%u va=0x%"PRIx64" unreadable_rows=%u nonzero_samples=%u"
++pvg_linux_scanout_skip(uint32_t surface, const char *why) "surface %u: %s"
++pvg_linux_cmdbuf(uint32_t task, uint32_t nres, uint64_t va, uint64_t len) "task %u resources=%u cmdbuf va=0x%"PRIx64" len=0x%"PRIx64
++pvg_linux_segment(uint32_t task, uint64_t off, uint32_t len, const char *enc, uint32_t cont, uint32_t end) "task %u +0x%"PRIx64" len=0x%x %s cont=%u end=%u"
++pvg_linux_segment_bad(uint32_t task, uint64_t off, uint32_t seglen, uint64_t len) "task %u +0x%"PRIx64" bad segment length 0x%x (buffer 0x%"PRIx64")"
+ pvg_linux_child_poke(uint32_t index, uint32_t written, uint32_t read, uint32_t length) "child FIFO %u written=0x%x read=0x%x length=0x%x"
+ pvg_linux_cmd_stub(uint32_t op) "op=0x%02x not implemented, completed"
+ pvg_linux_signal_stamp(uint32_t index, uint32_t value) "stamps[%u]=%u"
+-- 
+2.43.0
+

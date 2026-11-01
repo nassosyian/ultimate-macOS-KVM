@@ -1,0 +1,1153 @@
+From 63080de577886c45019d355e21e58e3f7e69e991 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Fri, 30 Oct 2026 23:31:47 +0200
+Subject: [PATCH 60/60] hw/display/pvg: zero-copy uploads and write-backs
+ through imported guest RAM
+
+Guest RAM is imported into Vulkan (host pointer import, 1 GiB pieces) and
+the GPU works on a device-local twin of the staging arena. Uploads of
+buffers and textures are GPU gathers from guest RAM recorded into a
+command buffer submitted before the main one; write-backs of attachments,
+compute outputs, private flushes and mip levels are GPU scatters in one
+submitted after it. Ranges outside imported RAM fall back to CPU copies.
+GPU writes are marked dirty. Page runs are cached per range until the
+range is remapped (Map/Unmap/ReplacePhysical/task reset).
+
+Property zero-copy (default on; off with dump-dir). Mission Control,
+per 500 cmdbufs: executor 265 -> 228 ms, slowest cmdbuf 7.2 -> 4.5 ms,
+CPU guest copies 99 -> 0 ms, GPU wait 102 -> 135 ms. Costs: guest RAM
+stays pinned.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-pci.c |  45 +++
+ hw/display/pvg/pvg-exec.c  | 684 ++++++++++++++++++++++++++++++++++---
+ hw/display/pvg/pvg-exec.h  |  18 +-
+ hw/display/trace-events    |   1 +
+ 4 files changed, 708 insertions(+), 40 deletions(-)
+
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index bb1fd30..5c9841c 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -28,6 +28,7 @@
+ #include "system/memory.h"
+ #include "system/physmem.h"
+ #include "system/ramlist.h"
++#include "system/ramblock.h"
+ #include "hw/core/boards.h"
+ #include "qom/object.h"
+ #include "trace.h"
+@@ -275,6 +276,7 @@ struct PVGLinuxPCIState {
+     bool damage_limit;
+     bool msaa;
+     bool upload_cache;
++    bool zero_copy;
+     bool private_resident;
+     MemoryRegion *dirty_ram;        /* guest RAM with dirty logging on (upload cache) */
+     int64_t dirty_sync_us;          /* of the upload cache sync time: the KVM log sync */
+@@ -587,6 +589,7 @@ static void pvg_cmd_map_memory(PVGLinuxPCIState *s, const uint8_t *p,
+     if (s->exec) {
+         /* other pages may back these addresses from now on */
+         pvg_exec_cache_invalidate(s->exec, task, va, size);
++        pvg_exec_mapping_changed(s->exec, task, va, size);
+     }
+     if (!map) {
+         return;
+@@ -1311,6 +1314,40 @@ static void pvg_exec_dirty_sync(void *opaque)
+     s->dirty_sync_us += g_get_monotonic_time() - t0;
+ }
+ 
++typedef struct PVGRamBlocks {
++    uint64_t (*blocks)[3];
++    uint32_t n, max;
++} PVGRamBlocks;
++
++static int pvg_exec_ram_block(RAMBlock *rb, void *opaque)
++{
++    PVGRamBlocks *c = opaque;
++
++    /* guest system RAM only (ROMs, VGA RAM and option ROMs are small) */
++    if (c->n < c->max && qemu_ram_get_host_addr(rb) && qemu_ram_get_used_length(rb) >= 256 * MiB) {
++        c->blocks[c->n][0] = qemu_ram_get_offset(rb);
++        c->blocks[c->n][1] = (uintptr_t)qemu_ram_get_host_addr(rb);
++        c->blocks[c->n][2] = qemu_ram_get_used_length(rb);
++        c->n++;
++    }
++    return 0;
++}
++
++static uint32_t pvg_exec_ram_blocks(void *opaque, uint64_t (*blocks)[3], uint32_t max)
++{
++    PVGRamBlocks c = { .blocks = blocks, .max = max };
++
++    RCU_READ_LOCK_GUARD();
++    qemu_ram_foreach_block(pvg_exec_ram_block, &c);
++    return c.n;
++}
++
++/* the GPU wrote guest RAM directly: keep dirty tracking (migration, VGA log) in step */
++static void pvg_exec_mark_dirty(void *opaque, uint64_t ram, uint64_t len)
++{
++    physical_memory_set_dirty_range(ram, len, DIRTY_CLIENTS_NOCODE);
++}
++
+ static void pvg_exec_dirty_test_clear_many(void *opaque, const uint64_t (*runs)[2], uint32_t n,
+                                            bool *dirty)
+ {
+@@ -1511,6 +1548,7 @@ static void pvg_exec_run_buf(PVGLinuxPCIState *s, uint32_t task, const uint8_t *
+                                   s->exec_read_bytes >> 20, s->exec_write_us / 1000,
+                                   s->exec_write_bytes >> 20, st->gpu_wait_us / 1000);
+         trace_pvg_linux_exec_private(st->priv_skipped >> 20, st->priv_flushes, st->gpu_mipmaps);
++        trace_pvg_linux_exec_zc(st->zc_gathered >> 20, st->zc_scattered >> 20, st->zc_fallbacks);
+         trace_pvg_linux_exec_cache(st->cache_hits, st->cache_saved >> 20, st->cache_invalidated,
+                                    st->cache_sync_us / 1000, s->dirty_sync_us / 1000);
+         s->dirty_sync_us = 0;
+@@ -1824,6 +1862,7 @@ static void pvg_dispatch(PVGLinuxPCIState *s, const PVGCmdHeader *h,
+     case 0x3c:          /* ReplacePhysical {u32 task, u32 resource}: its pages were swapped */
+         if (s->exec && len >= 4 && ldl_le_p(payload) < PVG_MAX_TASKS) {
+             pvg_exec_cache_invalidate(s->exec, ldl_le_p(payload), 0, 0);
++            pvg_exec_mapping_changed(s->exec, ldl_le_p(payload), 0, 0);
+         }
+         break;
+     case PVG_CMD_DELETE_RESOURCE:
+@@ -2169,6 +2208,7 @@ static void pvg_linux_realize(PCIDevice *dev, Error **errp)
+                     .dirty_test_clear = pvg_exec_dirty_test_clear,
+                     .dirty_test_clear_many = pvg_exec_dirty_test_clear_many,
+                     .translate = pvg_exec_translate,
++                    .ram_blocks = pvg_exec_ram_blocks, .mark_dirty = pvg_exec_mark_dirty,
+                 };
+ 
+                 s->exec = pvg_exec_new(&s->gpu, &host);
+@@ -2179,6 +2219,10 @@ static void pvg_linux_realize(PCIDevice *dev, Error **errp)
+                     pvg_exec_set_dry_run(s->exec, s->exec_dry_run);
+                     pvg_exec_set_damage_limit(s->exec, s->damage_limit);
+                     pvg_exec_set_msaa(s->exec, s->msaa);
++                    if (s->zero_copy && !s->dump_dir &&
++                        !pvg_exec_set_zero_copy(s->exec, true)) {
++                        warn_report("pvg-linux-pci: zero-copy unavailable, using CPU copies");
++                    }
+                     pvg_exec_set_private_resident(s->exec, s->private_resident &&
+                                                   !s->async_exec);
+                     /*
+@@ -2292,6 +2336,7 @@ static const Property pvg_linux_properties[] = {
+     DEFINE_PROP_BOOL("damage-limit", PVGLinuxPCIState, damage_limit, true),
+     DEFINE_PROP_BOOL("msaa", PVGLinuxPCIState, msaa, true),
+     DEFINE_PROP_BOOL("upload-cache", PVGLinuxPCIState, upload_cache, false),
++    DEFINE_PROP_BOOL("zero-copy", PVGLinuxPCIState, zero_copy, true),
+     DEFINE_PROP_BOOL("private-resident", PVGLinuxPCIState, private_resident, true),
+     DEFINE_PROP_BOOL("gpu", PVGLinuxPCIState, gpu_enable, true),
+     DEFINE_PROP_BOOL("gpu-validation", PVGLinuxPCIState, gpu_validation, false),
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index 4b556d3..c7c461c 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -21,6 +21,8 @@
+ #include "pvg-exec.h"
+ 
+ #define ARENA_SIZE          (256u << 20)
++#define ZC_MAX_CHUNKS       64
++#define ZC_CHUNK            (1ull << 30)    /* guest RAM is imported in pieces of 1 GiB */
+ #define MAX_SLOTS           16
+ #define MAX_OBJ             0x1000
+ #define MAX_MIPS            15
+@@ -159,6 +161,28 @@ struct PVGExec {
+     VkDeviceMemory arena_mem;
+     uint8_t *arena_ptr;
+     VkDeviceAddress arena_addr;
++    /*
++     * The buffer the GPU uses for arena offsets: the arena itself, or with zero-copy a
++     * device-local twin filled from / emptied into imported guest RAM by GPU transfers
++     */
++    VkBuffer gbuf;
++    VkDeviceAddress gaddr;
++    bool zc;
++    VkBuffer stage;
++    VkDeviceMemory stage_mem;
++    struct {
++        uint64_t ram, len;      /* RAM offset range of this imported piece of guest RAM */
++        VkBuffer buf;
++        VkDeviceMemory mem;
++    } zc_ram[ZC_MAX_CHUNKS];
++    uint32_t zc_nram;
++    VkCommandBuffer zc_pre, zc_post;    /* gathers before / scatters after e->cmd */
++    bool zc_pre_open, zc_post_open;
++    uint64_t (*zc_runs)[2];
++    uint32_t zc_runs_max;
++    VkBufferCopy *zc_regs;
++    uint32_t zc_regs_max;
++    GHashTable *zc_cache;       /* ZCKey -> ZCRuns: RAM runs of task ranges, until remapped */
+     uint64_t arena_used;
+ 
+     VkSampler sampler;
+@@ -168,7 +192,7 @@ struct PVGExec {
+     /* last render pass, resumed by continuation segments */
+     bool have_last;
+     uint32_t last_task;
+-    uint8_t last_att[8 * 512];  /* Attachment[8] */
++    uint8_t last_att[8 * 640];  /* Attachment[8] */
+     uint8_t last_st[4096];      /* RenderState */
+     char *dump_dir;
+     bool dry_run;
+@@ -433,6 +457,8 @@ static int arena_init(PVGExec *e)
+     }
+     bdai.buffer = e->arena;
+     e->arena_addr = vkGetBufferDeviceAddress(g->device, &bdai);
++    e->gbuf = e->arena;
++    e->gaddr = e->arena_addr;
+     return 0;
+ }
+ 
+@@ -499,6 +525,470 @@ static char written_by(PVGExec *e, uint32_t task, uint64_t va, uint64_t len)
+     return any ? '-' : '?';
+ }
+ 
++/* ---- zero-copy: guest RAM imported into Vulkan, copied by GPU transfers ---- */
++
++typedef struct ZCKey {
++    uint64_t va, len;
++    uint32_t task;
++} ZCKey;
++
++typedef struct ZCRuns {
++    uint32_t n;
++    uint64_t base;              /* va of the first page */
++    uint64_t runs[][3];         /* {RAM offset, length, offset from base} */
++} ZCRuns;
++
++#define ZC_CACHE_MAX    8192
++
++static guint zc_key_hash(gconstpointer p)
++{
++    const ZCKey *k = p;
++
++    return g_int64_hash(&k->va) ^ (guint)(k->len * 0x9e3779b1u) ^ k->task;
++}
++
++static gboolean zc_key_equal(gconstpointer a, gconstpointer b)
++{
++    const ZCKey *x = a, *y = b;
++
++    return x->va == y->va && x->len == y->len && x->task == y->task;
++}
++
++/* RAM runs of task va..va+len (page granular), cached until the range is remapped */
++static const ZCRuns *zc_runs(PVGExec *e, uint32_t task, uint64_t va, uint64_t len)
++{
++    ZCKey key = { .va = va, .len = len, .task = task };
++    ZCRuns *r = g_hash_table_lookup(e->zc_cache, &key);
++    uint32_t pages = (uint32_t)((((va + len + 0xfff) & ~0xfffull) - (va & ~0xfffull)) >> 12);
++    uint32_t n;
++
++    if (r) {
++        return r;
++    }
++    if (pages + 1 > e->zc_runs_max) {
++        e->zc_runs_max = pages + 1;
++        e->zc_runs = g_realloc(e->zc_runs, e->zc_runs_max * sizeof(*e->zc_runs));
++    }
++    n = e->host.ram_runs(e->host.opaque, task, va, len, e->zc_runs, e->zc_runs_max);
++    if (!n) {
++        return NULL;
++    }
++    if (g_hash_table_size(e->zc_cache) >= ZC_CACHE_MAX) {
++        g_hash_table_remove_all(e->zc_cache);
++    }
++    r = g_malloc(sizeof(*r) + n * sizeof(r->runs[0]));
++    r->n = n;
++    r->base = va & ~0xfffull;
++    uint64_t at = 0;
++
++    for (uint32_t i = 0; i < n; at += e->zc_runs[i][1], i++) {
++        r->runs[i][0] = e->zc_runs[i][0];
++        r->runs[i][1] = e->zc_runs[i][1];
++        r->runs[i][2] = at;
++    }
++    g_hash_table_insert(e->zc_cache, g_memdup2(&key, sizeof(key)), r);
++    return r;
++}
++
++void pvg_exec_mapping_changed(PVGExec *e, uint32_t task, uint64_t va, uint64_t len)
++{
++    GHashTableIter it;
++    gpointer k;
++
++    if (!e->zc_cache) {
++        return;
++    }
++    g_hash_table_iter_init(&it, e->zc_cache);
++    while (g_hash_table_iter_next(&it, &k, NULL)) {
++        const ZCKey *z = k;
++
++        if (z->task == task && (!len || (z->va < va + len && va < z->va + z->len))) {
++            g_hash_table_iter_remove(&it);
++        }
++    }
++}
++
++static bool zc_import(PVGExec *e, uint64_t ram, uint8_t *host, uint64_t len)
++{
++    PVGGpu *g = e->gpu;
++    PFN_vkGetMemoryHostPointerPropertiesEXT get_props = (PFN_vkGetMemoryHostPointerPropertiesEXT)
++        vkGetDeviceProcAddr(g->device, "vkGetMemoryHostPointerPropertiesEXT");
++    VkMemoryHostPointerPropertiesEXT hp = {
++        .sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT,
++    };
++    VkExternalMemoryBufferCreateInfo ext = {
++        .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
++        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
++    };
++    VkBufferCreateInfo bci = {
++        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &ext, .size = len,
++        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++    };
++    VkImportMemoryHostPointerInfoEXT imp = {
++        .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
++        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
++        .pHostPointer = host,
++    };
++    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &imp,
++                                 .allocationSize = len };
++    VkMemoryRequirements req;
++    uint32_t bits;
++
++    if (!get_props || e->zc_nram == ZC_MAX_CHUNKS ||
++        get_props(g->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host,
++                  &hp) != VK_SUCCESS ||
++        vkCreateBuffer(g->device, &bci, NULL, &e->zc_ram[e->zc_nram].buf) != VK_SUCCESS) {
++        return false;
++    }
++    vkGetBufferMemoryRequirements(g->device, e->zc_ram[e->zc_nram].buf, &req);
++    bits = req.memoryTypeBits & hp.memoryTypeBits;
++    mai.memoryTypeIndex = bits ? (uint32_t)__builtin_ctz(bits) : 0;
++    if (!bits ||
++        vkAllocateMemory(g->device, &mai, NULL, &e->zc_ram[e->zc_nram].mem) != VK_SUCCESS) {
++        vkDestroyBuffer(g->device, e->zc_ram[e->zc_nram].buf, NULL);
++        return false;
++    }
++    if (vkBindBufferMemory(g->device, e->zc_ram[e->zc_nram].buf, e->zc_ram[e->zc_nram].mem,
++                           0) != VK_SUCCESS) {
++        vkFreeMemory(g->device, e->zc_ram[e->zc_nram].mem, NULL);
++        vkDestroyBuffer(g->device, e->zc_ram[e->zc_nram].buf, NULL);
++        return false;
++    }
++    e->zc_ram[e->zc_nram].ram = ram;
++    e->zc_ram[e->zc_nram].len = len;
++    e->zc_nram++;
++    return true;
++}
++
++static void zc_fini(PVGExec *e)
++{
++    VkDevice d = e->gpu->device;
++
++    for (uint32_t i = 0; i < e->zc_nram; i++) {
++        vkDestroyBuffer(d, e->zc_ram[i].buf, NULL);
++        vkFreeMemory(d, e->zc_ram[i].mem, NULL);
++    }
++    e->zc_nram = 0;
++    if (e->stage) {
++        vkDestroyBuffer(d, e->stage, NULL);
++        e->stage = VK_NULL_HANDLE;
++    }
++    if (e->stage_mem) {
++        vkFreeMemory(d, e->stage_mem, NULL);
++        e->stage_mem = VK_NULL_HANDLE;
++    }
++    e->zc = false;
++    if (e->zc_cache) {
++        g_hash_table_destroy(e->zc_cache);
++        e->zc_cache = NULL;
++    }
++    e->gbuf = e->arena;
++    e->gaddr = e->arena_addr;
++}
++
++/* a device-local twin of the arena (same offsets, same uses) */
++static bool zc_stage_init(PVGExec *e)
++{
++    PVGGpu *g = e->gpu;
++    VkBufferCreateInfo bci = {
++        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = ARENA_SIZE,
++        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
++                 VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
++                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
++                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
++    };
++    VkMemoryAllocateFlagsInfo flags = {
++        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
++        .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT,
++    };
++    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &flags };
++    VkBufferDeviceAddressInfo bdai = { .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
++    VkMemoryRequirements req;
++    int mt;
++
++    if (vkCreateBuffer(g->device, &bci, NULL, &e->stage) != VK_SUCCESS) {
++        return false;
++    }
++    vkGetBufferMemoryRequirements(g->device, e->stage, &req);
++    mt = pvg_gpu_memory_type(g, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++    if (mt < 0) {
++        return false;
++    }
++    mai.allocationSize = req.size;
++    mai.memoryTypeIndex = mt;
++    if (vkAllocateMemory(g->device, &mai, NULL, &e->stage_mem) != VK_SUCCESS ||
++        vkBindBufferMemory(g->device, e->stage, e->stage_mem, 0) != VK_SUCCESS) {
++        return false;
++    }
++    bdai.buffer = e->stage;
++    e->gbuf = e->stage;
++    e->gaddr = vkGetBufferDeviceAddress(g->device, &bdai);
++    return true;
++}
++
++bool pvg_exec_set_zero_copy(PVGExec *e, bool on)
++{
++    uint64_t blocks[8][3];
++    uint32_t n;
++
++    vkQueueWaitIdle(e->gpu->queue);
++    zc_fini(e);
++    if (!on || e->dump_dir || !e->gpu->host_import || !e->host.ram_blocks ||
++        !e->host.ram_runs) {
++        return false;   /* dumps and captures read GPU results through the arena */
++    }
++    n = e->host.ram_blocks(e->host.opaque, blocks, G_N_ELEMENTS(blocks));
++    for (uint32_t i = 0; i < n; i++) {
++        for (uint64_t o = 0; o < blocks[i][2]; o += ZC_CHUNK) {
++            if (!zc_import(e, blocks[i][0] + o, (uint8_t *)(uintptr_t)blocks[i][1] + o,
++                           MIN(ZC_CHUNK, blocks[i][2] - o))) {
++                elog(e, "zero-copy: importing guest RAM at 0x%" G_GINT64_MODIFIER "x failed",
++                     blocks[i][0] + o);
++                zc_fini(e);
++                return false;
++            }
++        }
++    }
++    if (!e->zc_nram || !zc_stage_init(e)) {
++        zc_fini(e);
++        return false;
++    }
++    e->zc = true;
++    e->zc_cache = g_hash_table_new_full(zc_key_hash, zc_key_equal, g_free, g_free);
++    elog(e, "zero-copy: guest RAM imported in %u pieces", e->zc_nram);
++    return true;
++}
++
++static void zc_full_barrier(VkCommandBuffer c);
++
++/* begin the gather (pre) or scatter (post) command buffer of the next submission */
++static VkCommandBuffer zc_cmd(PVGExec *e, bool post)
++{
++    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
++    VkCommandBuffer c = post ? e->zc_post : e->zc_pre;
++    bool *open = post ? &e->zc_post_open : &e->zc_pre_open;
++
++    if (!*open) {
++        vkBeginCommandBuffer(c, &bi);
++        *open = true;
++        if (post) {
++            zc_full_barrier(c);     /* after the main command buffer's writes */
++        }
++    }
++    return c;
++}
++
++/* everything before in submission order -> everything after */
++static void zc_full_barrier(VkCommandBuffer c)
++{
++    VkMemoryBarrier mb = {
++        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
++    };
++
++    vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
++}
++
++static int zc_piece(PVGExec *e, uint64_t ram)
++{
++    for (uint32_t k = 0; k < e->zc_nram; k++) {
++        if (ram >= e->zc_ram[k].ram && ram < e->zc_ram[k].ram + e->zc_ram[k].len) {
++            return (int)k;
++        }
++    }
++    return -1;
++}
++
++static void zc_flush_regions(PVGExec *e, VkCommandBuffer c, int piece, uint32_t nr,
++                             bool to_guest)
++{
++    if (!nr) {
++        return;
++    }
++    if (to_guest) {
++        vkCmdCopyBuffer(c, e->stage, e->zc_ram[piece].buf, nr, e->zc_regs);
++    } else {
++        vkCmdCopyBuffer(c, e->zc_ram[piece].buf, e->stage, nr, e->zc_regs);
++    }
++}
++
++/*
++ * Record copies between task va..va+len and arena offset off: guest RAM -> twin (pre) or
++ * twin -> guest RAM (post), one region per contiguous run of guest pages. The pages are
++ * looked up for the enclosing range cva..cva+clen (an image, a buffer), so its rows share
++ * one cached lookup. false: some page is not in imported RAM (then nothing is recorded).
++ */
++static bool zc_copy(PVGExec *e, uint32_t task, uint64_t cva, uint64_t clen, uint64_t va,
++                    uint64_t len, uint64_t off, bool to_guest)
++{
++    uint32_t lo, hi, nr = 0;
++    int last = -1;
++    VkCommandBuffer c;
++    const ZCRuns *rr;
++    uint64_t rel;
++
++    if (!len) {
++        return true;
++    }
++    if (va < cva || va + len > cva + clen) {
++        cva = va;
++        clen = len;
++    }
++    rr = zc_runs(e, task, cva, clen);
++    if (!rr) {
++        return false;
++    }
++    /* first run containing va: binary search on the runs' offsets */
++    rel = va - rr->base;
++    for (lo = 0, hi = rr->n; hi - lo > 1;) {
++        uint32_t mid = (lo + hi) / 2;
++
++        if (rr->runs[mid][2] <= rel) {
++            lo = mid;
++        } else {
++            hi = mid;
++        }
++    }
++    for (uint32_t i = lo; i < rr->n && rr->runs[i][2] < rel + len; i++) {
++        for (uint64_t ram = rr->runs[i][0]; ram < rr->runs[i][0] + rr->runs[i][1];) {
++            int k = zc_piece(e, ram);
++
++            if (k < 0) {
++                return false;
++            }
++            ram = e->zc_ram[k].ram + e->zc_ram[k].len;
++        }
++    }
++    if (rr->n + e->zc_nram > e->zc_regs_max) {
++        e->zc_regs_max = rr->n + e->zc_nram;
++        e->zc_regs = g_realloc(e->zc_regs, e->zc_regs_max * sizeof(*e->zc_regs));
++    }
++    c = zc_cmd(e, to_guest);
++    for (uint32_t i = lo; i < rr->n && rr->runs[i][2] < rel + len; i++) {
++        uint64_t rs = rr->runs[i][2], re = rs + rr->runs[i][1];
++        uint64_t s0 = MAX(rs, rel), s1 = MIN(re, rel + len);
++        uint64_t ram = rr->runs[i][0] + (s0 - rs);
++        uint64_t left = s1 > s0 ? s1 - s0 : 0, dst = off + (s0 - rel);
++
++        while (left) {
++            int k = zc_piece(e, ram);
++            uint64_t take = MIN(left, e->zc_ram[k].ram + e->zc_ram[k].len - ram);
++
++            if (k != last) {
++                zc_flush_regions(e, c, last, nr, to_guest);
++                nr = 0;
++                last = k;
++            }
++            e->zc_regs[nr++] = to_guest ?
++                (VkBufferCopy){ .srcOffset = dst, .dstOffset = ram - e->zc_ram[k].ram,
++                                .size = take } :
++                (VkBufferCopy){ .srcOffset = ram - e->zc_ram[k].ram, .dstOffset = dst,
++                                .size = take };
++            if (to_guest && e->host.mark_dirty) {
++                e->host.mark_dirty(e->host.opaque, ram, take);
++            }
++            ram += take;
++            dst += take;
++            left -= take;
++        }
++    }
++    zc_flush_regions(e, c, last, nr, to_guest);
++    if (to_guest) {
++        e->stats.zc_scattered += len;
++    } else {
++        e->stats.zc_gathered += len;
++    }
++    return true;
++}
++
++/*
++ * Guest memory -> arena offset off, for the GPU: a GPU gather into the twin with zero-copy;
++ * otherwise (and as fallback) a CPU copy into the arena, then copied on into the twin.
++ */
++static bool guest_to_arena_in(PVGExec *e, uint32_t task, uint64_t cva, uint64_t clen,
++                              uint64_t va, uint64_t off, uint64_t len)
++{
++    VkBufferCopy r = { .srcOffset = off, .dstOffset = off, .size = len };
++
++    if (e->zc && zc_copy(e, task, cva, clen, va, len, off, false)) {
++        return true;
++    }
++    if (!e->host.read(e->host.opaque, task, va, e->arena_ptr + off, len)) {
++        return false;
++    }
++    if (e->zc && len) {
++        vkCmdCopyBuffer(zc_cmd(e, false), e->arena, e->stage, 1, &r);
++        e->stats.zc_fallbacks++;
++    }
++    return true;
++}
++
++/*
++ * Arena offset off (written by the GPU in this submission) -> task va..va+len, as a GPU
++ * scatter recorded for after the submission (true: done when it completes). false: the
++ * caller writes it from the arena with the CPU after the submission (with zero-copy the
++ * twin's bytes are copied into the arena for that).
++ */
++static bool arena_to_guest_in(PVGExec *e, uint32_t task, uint64_t cva, uint64_t clen,
++                              uint64_t va, uint64_t off, uint64_t len)
++{
++    VkBufferCopy r = { .srcOffset = off, .dstOffset = off, .size = len };
++
++    if (!e->zc) {
++        return false;
++    }
++    if (zc_copy(e, task, cva, clen, va, len, off, true)) {
++        return true;
++    }
++    if (len) {
++        vkCmdCopyBuffer(zc_cmd(e, true), e->stage, e->arena, 1, &r);
++        e->stats.zc_fallbacks++;
++    }
++    return false;
++}
++
++/* the same for a whole range (its own enclosing range) */
++static bool guest_to_arena(PVGExec *e, uint32_t task, uint64_t va, uint64_t off, uint64_t len)
++{
++    return guest_to_arena_in(e, task, va, len, va, off, len);
++}
++
++static bool arena_to_guest(PVGExec *e, uint32_t task, uint64_t va, uint64_t off, uint64_t len)
++{
++    return arena_to_guest_in(e, task, va, len, va, off, len);
++}
++
++/* end of one image's or buffer's write-back: later (possibly overlapping) ones come after it */
++static void zc_writeback_done(PVGExec *e)
++{
++    if (e->zc_post_open) {
++        zc_full_barrier(e->zc_post);
++    }
++}
++
++/* gathers/scatters recorded for a command buffer that was never submitted */
++static void zc_discard(PVGExec *e)
++{
++    if (e->zc_pre_open) {
++        vkEndCommandBuffer(e->zc_pre);
++        e->zc_pre_open = false;
++    }
++    if (e->zc_post_open) {
++        vkEndCommandBuffer(e->zc_post);
++        e->zc_post_open = false;
++    }
++}
++
++/* the arena is reused from the start: uploads were only valid for the last submission */
++static void arena_reset(PVGExec *e)
++{
++    e->arena_used = 0;
++    zc_discard(e);
++}
++
+ /* ---- objects ---- */
+ 
+ static uint8_t object(PVGExec *e, uint32_t task, uint32_t id, uint8_t *buf, uint32_t *len)
+@@ -533,8 +1023,7 @@ static uint64_t buffer_upload(PVGExec *e, uint32_t task, uint32_t ref, uint64_t
+     }
+     off = arena_alloc(e, blen);
+     if (off == UINT64_MAX ||
+-        !e->host.read(e->host.opaque, task, (uint64_t)ldl(obj + 8) << 12, e->arena_ptr + off,
+-                      blen)) {
++        !guest_to_arena(e, task, (uint64_t)ldl(obj + 8) << 12, off, blen)) {
+         return UINT64_MAX;
+     }
+     g_hash_table_insert(e->uploaded, key_new(task, ref), (gpointer)(uintptr_t)(off + 1));
+@@ -966,7 +1455,7 @@ static bool image_upload(PVGExec *e, const GuestImage *gi, HostImage *hi, VkImag
+     VkBufferImageCopy r[MAX_MIPS];
+ 
+     if (off == UINT64_MAX ||
+-        !e->host.read(e->host.opaque, gi->task, gi->va, e->arena_ptr + off, size)) {
++        !guest_to_arena(e, gi->task, gi->va, off, size)) {
+         if (e->upload_failures++ < 20) {
+             elog(e, "upload failed: task %u va 0x%" G_GINT64_MODIFIER "x %ux%ux%u x%u layers "
+                  "%u mips, %" G_GUINT64_FORMAT " bytes (%s)", gi->task, gi->va, gi->width,
+@@ -1005,7 +1494,7 @@ static bool image_upload(PVGExec *e, const GuestImage *gi, HostImage *hi, VkImag
+         };
+     }
+     barrier(e, hi->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+-    vkCmdCopyBufferToImage(e->cmd, e->arena, hi->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++    vkCmdCopyBufferToImage(e->cmd, e->gbuf, hi->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            gi->mips, r);
+     barrier(e, hi->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, final);
+     hi->layout = final;
+@@ -1287,21 +1776,47 @@ static uint64_t record_readback(PVGExec *e, const GuestImage *gi, HostImage *hi,
+                              MAX(gi->depth >> l, 1) },
+         };
+     }
+-    vkCmdCopyImageToBuffer(e->cmd, hi->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, e->arena,
++    vkCmdCopyImageToBuffer(e->cmd, hi->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, e->gbuf,
+                            gi->mips - first, r);
+     return off;
+ }
+ 
+-/* after the readback's submission completed: levels first.. from the arena to guest memory */
+-static void write_levels(PVGExec *e, const GuestImage *gi, uint64_t off, uint32_t first)
++/* bytes of level l to write back: never beyond the memory the object owns */
++static uint64_t level_wb_bytes(const GuestImage *gi, uint32_t l)
+ {
+-    for (uint32_t l = first; l < gi->mips; l++) {
+-        uint64_t n = level_bytes(gi, l);
++    uint64_t n = level_bytes(gi, l);
+ 
+-        if (gi->span && gi->mip_off[l] + n > gi->span) {
+-            n = gi->span > gi->mip_off[l] ? gi->span - gi->mip_off[l] : 0;  /* owned memory only */
++    if (gi->span && gi->mip_off[l] + n > gi->span) {
++        n = gi->span > gi->mip_off[l] ? gi->span - gi->mip_off[l] : 0;
++    }
++    return n;
++}
++
++/*
++ * While recording the readback's submission: levels first.. as GPU scatters (zero-copy).
++ * Returns the levels the CPU must still write (write_levels) once it completed.
++ */
++static uint32_t levels_to_guest(PVGExec *e, const GuestImage *gi, uint64_t off, uint32_t first)
++{
++    uint32_t cpu = 0;
++
++    for (uint32_t l = first; l < gi->mips; l++) {
++        if (!arena_to_guest(e, gi->task, gi->va + gi->mip_off[l], off + gi->mip_off[l],
++                            level_wb_bytes(gi, l))) {
++            cpu |= 1u << l;
+         }
+-        if (n) {
++    }
++    zc_writeback_done(e);
++    return cpu;
++}
++
++/* after the readback's submission completed: the levels in mask, arena -> guest memory */
++static void write_levels(PVGExec *e, const GuestImage *gi, uint64_t off, uint32_t mask)
++{
++    for (uint32_t l = 0; l < gi->mips; l++) {
++        uint64_t n = level_wb_bytes(gi, l);
++
++        if ((mask >> l & 1) && n) {
+             e->host.write(e->host.opaque, gi->task, gi->va + gi->mip_off[l],
+                           e->arena_ptr + off + gi->mip_off[l], n);
+         }
+@@ -1320,6 +1835,7 @@ static void priv_flush(PVGExec *e, HostImage *hi)
+     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
+                         .pCommandBuffers = &e->cmd };
+     uint64_t off;
++    uint32_t cpu;
+ 
+     if (!hi->guest_stale) {
+         return;
+@@ -1333,11 +1849,12 @@ static void priv_flush(PVGExec *e, HostImage *hi)
+     barrier(e, hi->image, hi->layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+     hi->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+     off = record_readback(e, gi, hi, 0);
++    cpu = off == UINT64_MAX ? 0 : levels_to_guest(e, gi, off, 0);
+     vkEndCommandBuffer(e->cmd);
+     if (off == UINT64_MAX || !submit_wait(e, &si)) {
+         return;
+     }
+-    write_levels(e, gi, off, 0);
++    write_levels(e, gi, off, cpu);
+     e->stats.priv_flushes++;
+ }
+ 
+@@ -1456,7 +1973,11 @@ static bool image_upload_rect(PVGExec *e, const GuestImage *gi, HostImage *hi, V
+                               VkImageLayout final)
+ {
+     uint64_t row = (uint64_t)rc.extent.width * gi->bpp, size = row * rc.extent.height;
+-    uint64_t off = arena_alloc(e, size);
++    uint64_t first = (uint64_t)rc.offset.y * gi->row_bytes + (uint64_t)rc.offset.x * gi->bpp;
++    uint64_t span = (uint64_t)(rc.extent.height - 1) * gi->row_bytes + row;
++    /* zero-copy and wide rectangles: one GPU gather of the rows in the guest's layout */
++    bool whole = e->zc && row * 2 >= gi->row_bytes;
++    uint64_t off = arena_alloc(e, whole ? span : size);
+     VkBufferImageCopy r = {
+         .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+         .imageOffset = { rc.offset.x, rc.offset.y, 0 },
+@@ -1466,16 +1987,23 @@ static bool image_upload_rect(PVGExec *e, const GuestImage *gi, HostImage *hi, V
+     if (off == UINT64_MAX) {
+         return false;
+     }
+-    for (uint32_t y = 0; y < rc.extent.height; y++) {
+-        if (!e->host.read(e->host.opaque, gi->task,
+-                          gi->va + (uint64_t)(rc.offset.y + y) * gi->row_bytes +
+-                          (uint64_t)rc.offset.x * gi->bpp, e->arena_ptr + off + y * row, row)) {
++    if (whole) {
++        if (!guest_to_arena_in(e, gi->task, gi->va, (uint64_t)gi->row_bytes * gi->height,
++                               gi->va + first, off, span)) {
++            return false;
++        }
++        r.bufferRowLength = gi->row_bytes / gi->bpp;
++    }
++    for (uint32_t y = 0; !whole && y < rc.extent.height; y++) {
++        if (!guest_to_arena_in(e, gi->task, gi->va, (uint64_t)gi->row_bytes * gi->height,
++                               gi->va + (uint64_t)(rc.offset.y + y) * gi->row_bytes +
++                               (uint64_t)rc.offset.x * gi->bpp, off + y * row, row)) {
+             return false;
+         }
+     }
+     r.bufferOffset = off;
+     barrier(e, hi->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+-    vkCmdCopyBufferToImage(e->cmd, e->arena, hi->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++    vkCmdCopyBufferToImage(e->cmd, e->gbuf, hi->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            1, &r);
+     barrier(e, hi->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, final);
+     hi->layout = final;
+@@ -2298,14 +2826,14 @@ static bool bind_and_push(PVGExec *e, uint32_t task, RenderState *st, Pipeline *
+             if (off == UINT64_MAX || st->vbuf[i].offset >= size) {
+                 return false;   /* never hand the GPU an address outside the arena copy */
+             }
+-            stq(pc + 8 * i, e->arena_addr + off + st->vbuf[i].offset);
++            stq(pc + 8 * i, e->gaddr + off + st->vbuf[i].offset);
+         }
+         if (p->fs_buffers & (1u << i)) {
+             off = buffer_upload(e, task, st->fbuf[i].ref, &size);
+             if (off == UINT64_MAX || st->fbuf[i].offset >= size) {
+                 return false;
+             }
+-            stq(pc + PUSH_FRAGMENT_BASE + 8 * i, e->arena_addr + off + st->fbuf[i].offset);
++            stq(pc + PUSH_FRAGMENT_BASE + 8 * i, e->gaddr + off + st->fbuf[i].offset);
+         }
+         if (p->vertex_bindings & (1u << i)) {
+             VkDeviceSize vo;
+@@ -2315,7 +2843,7 @@ static bool bind_and_push(PVGExec *e, uint32_t task, RenderState *st, Pipeline *
+                 return false;
+             }
+             vo = off + st->vbuf[i].offset;
+-            vkCmdBindVertexBuffers(e->cmd, i, 1, &e->arena, &vo);
++            vkCmdBindVertexBuffers(e->cmd, i, 1, &e->gbuf, &vo);
+         }
+     }
+     vkCmdPushConstants(e->cmd, p->layout, VK_SHADER_STAGE_ALL_GRAPHICS, 0,
+@@ -2379,6 +2907,27 @@ static bool submit_wait(PVGExec *e, const VkSubmitInfo *si)
+         return false;
+     }
+     int64_t t0 = g_get_monotonic_time();
++    VkCommandBuffer cbs[3];
++    VkSubmitInfo zsi = *si;
++    uint32_t ncb = 0;
++
++    /* zero-copy: guest RAM gathers before the command buffer, write-back scatters after */
++    if (e->zc_pre_open) {
++        zc_full_barrier(e->zc_pre);
++        vkEndCommandBuffer(e->zc_pre);
++        cbs[ncb++] = e->zc_pre;
++    }
++    cbs[ncb++] = si->pCommandBuffers[0];
++    if (e->zc_post_open) {
++        vkEndCommandBuffer(e->zc_post);
++        cbs[ncb++] = e->zc_post;
++    }
++    e->zc_pre_open = e->zc_post_open = false;
++    if (ncb > 1) {
++        zsi.commandBufferCount = ncb;
++        zsi.pCommandBuffers = cbs;
++        si = &zsi;
++    }
+ 
+     r = vkQueueSubmit(e->gpu->queue, 1, si, e->fence);
+     if (r == VK_SUCCESS) {
+@@ -2402,6 +2951,7 @@ typedef struct Attachment {
+     GuestImage gi;
+     HostImage *img;
+     uint64_t wb_off;
++    bool wb_gpu;                /* written back by a GPU scatter (zero-copy), not by the CPU */
+     VkRect2D damage;            /* region drawn (and uploaded / written back) */
+     /* MSAA: gi/img describe the resolve texture; rendering goes to a host-only image */
+     uint32_t ms_ref, samples;
+@@ -3439,7 +3989,7 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                     e->stats.skipped_draws++;
+                     break;
+                 }
+-                vkCmdBindIndexBuffer(e->cmd, e->arena, io + ib_off,
++                vkCmdBindIndexBuffer(e->cmd, e->gbuf, io + ib_off,
+                                      idx_size == 4 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
+                 vkCmdDrawIndexed(e->cmd, count, instances, 0, base_vertex, base_instance);
+             } else {
+@@ -3502,7 +4052,38 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+         att[i].img->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+         vkCmdCopyImageToBuffer(e->cmd, att[i].img->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+-                               e->arena, 1, &r);
++                               e->gbuf, 1, &r);
++        if (e->zc) {
++            /* the same rows as the CPU write-back below, as GPU copies after this submission */
++            uint64_t n = wb_size(&att[i].gi, size);
++            VkRect2D d = att[i].damage;
++
++            att[i].wb_gpu = true;
++            if (d.extent.width == att[i].gi.width && d.extent.height == att[i].gi.height) {
++                att[i].wb_gpu = arena_to_guest(e, att[i].gi.task, att[i].gi.va, att[i].wb_off, n);
++            } else {
++                uint64_t first = (uint64_t)d.offset.y * att[i].gi.row_bytes +
++                                 (uint64_t)d.offset.x * att[i].gi.bpp;
++                uint64_t w = (uint64_t)d.extent.width * att[i].gi.bpp;
++
++                for (uint32_t y = 0; y < d.extent.height; y++) {
++                    uint64_t o = first + (uint64_t)y * att[i].gi.row_bytes;
++
++                    if (o + w <= n) {
++                        att[i].wb_gpu &= arena_to_guest_in(e, att[i].gi.task, att[i].gi.va, n,
++                                                           att[i].gi.va + o,
++                                                           att[i].wb_off + o, w);
++                    }
++                }
++                if (!att[i].wb_gpu) {
++                    /* the CPU writes every row: all of them must be in the arena */
++                    VkBufferCopy c = { att[i].wb_off, att[i].wb_off, n };
++
++                    vkCmdCopyBuffer(zc_cmd(e, true), e->stage, e->arena, 1, &c);
++                }
++            }
++            zc_writeback_done(e);
++        }
+     }
+     vkEndCommandBuffer(e->cmd);
+     if (!submit_wait(e, &si)) {
+@@ -3607,8 +4188,10 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+ 
+             if (d.extent.width == att[i].gi.width && d.extent.height == att[i].gi.height) {
+                 note_write(e, att[i].gi.task, att[i].gi.va, n, 'R');
+-                e->host.write(e->host.opaque, att[i].gi.task, att[i].gi.va,
+-                              e->arena_ptr + att[i].wb_off, n);
++                if (!att[i].wb_gpu) {
++                    e->host.write(e->host.opaque, att[i].gi.task, att[i].gi.va,
++                                  e->arena_ptr + att[i].wb_off, n);
++                }
+             } else {
+                 uint64_t first = (uint64_t)d.offset.y * att[i].gi.row_bytes +
+                                  (uint64_t)d.offset.x * att[i].gi.bpp;
+@@ -3619,7 +4202,7 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                 for (uint32_t y = 0; y < d.extent.height; y++) {
+                     uint64_t o = first + (uint64_t)y * att[i].gi.row_bytes;
+ 
+-                    if (o + w <= n) {
++                    if (o + w <= n && !att[i].wb_gpu) {
+                         e->host.write(e->host.opaque, att[i].gi.task, att[i].gi.va + o,
+                                       e->arena_ptr + att[i].wb_off + o, w);
+                     }
+@@ -3846,6 +4429,7 @@ typedef struct ComputeOutput {
+     GuestImage gi;
+     HostImage *hi;
+     uint64_t arena_off, size, va;
++    bool wb_gpu;                /* written back by a GPU scatter (zero-copy) */
+ } ComputeOutput;
+ 
+ /*
+@@ -4018,10 +4602,10 @@ static void exec_compute_segment(PVGExec *e, uint32_t task, const uint8_t *p, ui
+                          ldl(obj + 12), ldl(obj + 16), ldl(obj + 20));
+                 }
+                 if (boff == UINT64_MAX || cs.buf[i].offset >= size) {
+-                    stq(pc + 8 * i, e->arena_addr);     /* guard zone at the arena start */
++                    stq(pc + 8 * i, e->gaddr);     /* guard zone at the arena start */
+                     continue;
+                 }
+-                stq(pc + 8 * i, e->arena_addr + boff + cs.buf[i].offset);
++                stq(pc + 8 * i, e->gaddr + boff + cs.buf[i].offset);
+                 if (e->dump_dir && e->cio_dumps < 12 && cio_match(e, pp->fs_name)) {
+                     const uint8_t *b = e->arena_ptr + boff + cs.buf[i].offset;
+                     uint64_t left = size - cs.buf[i].offset;
+@@ -4205,10 +4789,20 @@ static void exec_compute_segment(PVGExec *e, uint32_t task, const uint8_t *p, ui
+                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+             out[i].hi->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+             vkCmdCopyImageToBuffer(e->cmd, out[i].hi->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+-                                   e->arena, 1, &r);
++                                   e->gbuf, 1, &r);
+             out[i].size = size;
+         }
+     }
++    for (uint32_t i = 0; e->zc && i < nout; i++) {
++        /* the same ranges as the CPU write-back below, as GPU copies after this submission */
++        if (out[i].arena_off != UINT64_MAX && out[i].size) {
++            out[i].wb_gpu = out[i].image ?
++                arena_to_guest(e, out[i].gi.task, out[i].gi.va, out[i].arena_off,
++                               wb_size(&out[i].gi, out[i].size)) :
++                arena_to_guest(e, task, out[i].va, out[i].arena_off, out[i].size);
++            zc_writeback_done(e);
++        }
++    }
+     vkEndCommandBuffer(e->cmd);
+     if (!submit_wait(e, &si)) {
+         return;
+@@ -4242,12 +4836,16 @@ static void exec_compute_segment(PVGExec *e, uint32_t task, const uint8_t *p, ui
+                                     (gssize)n, NULL);
+             }
+             note_write(e, out[i].gi.task, out[i].gi.va, n, 'C');
+-            e->host.write(e->host.opaque, out[i].gi.task, out[i].gi.va,
+-                          e->arena_ptr + out[i].arena_off, n);
++            if (!out[i].wb_gpu) {
++                e->host.write(e->host.opaque, out[i].gi.task, out[i].gi.va,
++                              e->arena_ptr + out[i].arena_off, n);
++            }
+         } else {
+             note_write(e, task, out[i].va, out[i].size, 'C');
+-            e->host.write(e->host.opaque, task, out[i].va, e->arena_ptr + out[i].arena_off,
+-                          out[i].size);
++            if (!out[i].wb_gpu) {
++                e->host.write(e->host.opaque, task, out[i].va, e->arena_ptr + out[i].arena_off,
++                              out[i].size);
++            }
+         }
+         e->stats.writebacks++;
+     }
+@@ -4255,7 +4853,7 @@ static void exec_compute_segment(PVGExec *e, uint32_t task, const uint8_t *p, ui
+         e->cio_dumps++;
+     }
+     /* uploads were only valid for this submission */
+-    e->arena_used = 0;
++    arena_reset(e);
+     g_hash_table_remove_all(e->uploaded);
+ }
+ 
+@@ -4356,6 +4954,7 @@ static bool generate_mipmaps_gpu(PVGExec *e, uint32_t task, uint32_t ref, const
+                         .pCommandBuffers = &e->cmd };
+     bool priv = e->private_resident && all->storage == 2;
+     uint64_t mark = e->arena_used, off = UINT64_MAX;
++    uint32_t cpu = 0;
+     VkFormatProperties fp;
+     HostImage *hi;
+ 
+@@ -4398,6 +4997,7 @@ static bool generate_mipmaps_gpu(PVGExec *e, uint32_t task, uint32_t ref, const
+     hi->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+     if (!priv) {
+         off = record_readback(e, all, hi, 1);
++        cpu = off == UINT64_MAX ? 0 : levels_to_guest(e, all, off, 1);
+     }
+     vkEndCommandBuffer(e->cmd);
+     if ((!priv && off == UINT64_MAX) || !submit_wait(e, &si)) {
+@@ -4410,7 +5010,7 @@ static bool generate_mipmaps_gpu(PVGExec *e, uint32_t task, uint32_t ref, const
+         hi->resident = true;
+         hi->guest_stale = true;
+     } else {
+-        write_levels(e, all, off, 1);
++        write_levels(e, all, off, cpu);
+         cache_drop(e, hi);
+         e->cache_writer = hi;
+         note_write(e, all->task, all->va + all->mip_off[1],
+@@ -4660,7 +5260,7 @@ void pvg_exec_cmdbuf(PVGExec *e, uint32_t task, const uint8_t *buf, uint64_t len
+                  e->capture_seq);
+         }
+     }
+-    e->arena_used = 0;
++    arena_reset(e);
+     g_hash_table_remove_all(e->uploaded);
+     if (e->capture_left) {
+         g_autofree char *path = g_strdup_printf("%s/cap-cb-%05u-t%u.bin", e->dump_dir,
+@@ -4685,7 +5285,7 @@ void pvg_exec_cmdbuf(PVGExec *e, uint32_t task, const uint8_t *buf, uint64_t len
+             }
+             exec_render_segment(e, task, buf + off + 8, seglen - 8, buf[off + 5]);
+             /* a segment's uploads are only valid until its submit completed */
+-            e->arena_used = 0;
++            arena_reset(e);
+             g_hash_table_remove_all(e->uploaded);
+         }
+         off += seglen;
+@@ -4744,6 +5344,7 @@ void pvg_exec_object_deleted(PVGExec *e, uint32_t task, uint32_t id)
+ 
+ void pvg_exec_task_reset(PVGExec *e, uint32_t task)
+ {
++    pvg_exec_mapping_changed(e, task, 0, 0);
+     GHashTableIter it;
+     gpointer k, v;
+ 
+@@ -4877,6 +5478,8 @@ PVGExec *pvg_exec_new(PVGGpu *gpu, const PVGExecHost *host)
+     if (!e->push_descriptor || arena_init(e) ||
+         vkCreateSampler(gpu->device, &sci, NULL, &e->sampler) != VK_SUCCESS ||
+         vkAllocateCommandBuffers(gpu->device, &cai, &e->cmd) != VK_SUCCESS ||
++        vkAllocateCommandBuffers(gpu->device, &cai, &e->zc_pre) != VK_SUCCESS ||
++        vkAllocateCommandBuffers(gpu->device, &cai, &e->zc_post) != VK_SUCCESS ||
+         vkCreateFence(gpu->device, &(VkFenceCreateInfo){
+             .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO }, NULL, &e->fence) != VK_SUCCESS) {
+         pvg_exec_free(e);
+@@ -4905,6 +5508,9 @@ void pvg_exec_free(PVGExec *e)
+     VkDevice d = e->gpu->device;
+ 
+     vkDeviceWaitIdle(d);
++    zc_fini(e);
++    g_free(e->zc_runs);
++    g_free(e->zc_regs);
+     free_ctx = e;
+     g_hash_table_destroy(e->images);
+     g_ptr_array_free(e->cached, true);
+diff --git a/hw/display/pvg/pvg-exec.h b/hw/display/pvg/pvg-exec.h
+index 2c92aad..ad99128 100644
+--- a/hw/display/pvg/pvg-exec.h
++++ b/hw/display/pvg/pvg-exec.h
+@@ -37,6 +37,13 @@ typedef struct PVGExecHost {
+     /* batch form: dirty[i] = whether runs[i] is dirty (tested and cleared) */
+     void (*dirty_test_clear_many)(void *opaque, const uint64_t (*runs)[2], uint32_t n,
+                                   bool *dirty);
++    /*
++     * Optional zero-copy access to guest RAM: ram_blocks lists the guest RAM blocks
++     * {ram offset, host address, length} (at most max; returns how many), ram_runs above maps
++     * task ranges into them, and mark_dirty records that the GPU wrote a RAM range.
++     */
++    uint32_t (*ram_blocks)(void *opaque, uint64_t (*blocks)[3], uint32_t max);
++    void (*mark_dirty)(void *opaque, uint64_t ram, uint64_t len);
+ } PVGExecHost;
+ 
+ typedef struct PVGExecStats {
+@@ -49,7 +56,8 @@ typedef struct PVGExecStats {
+     /* upload cache: textures reused, bytes not uploaded, entries dropped, time syncing */
+     uint64_t cache_hits, cache_saved, cache_invalidated, cache_sync_us;
+     uint64_t priv_skipped, priv_flushes;    /* private residency: bytes not copied, flushes */
+-    uint64_t gpu_mipmaps;       /* GenerateMipmaps done on the GPU (the rest: CPU fallback) */
++    uint64_t gpu_mipmaps;
++    uint64_t zc_gathered, zc_scattered, zc_fallbacks;  /* zero-copy bytes in / out, CPU fallbacks */       /* GenerateMipmaps done on the GPU (the rest: CPU fallback) */
+ } PVGExecStats;
+ 
+ typedef struct PVGExec PVGExec;
+@@ -79,6 +87,14 @@ void pvg_exec_cache_mark_stale(PVGExec *e);
+  * the memory is unmapped (pvg_exec_flush_range; len 0 = the whole task).
+  */
+ void pvg_exec_set_private_resident(PVGExec *e, bool on);
++/*
++ * Copy textures and buffers between guest RAM and the GPU with GPU transfers from guest RAM
++ * imported into Vulkan (VK_EXT_external_memory_host) instead of CPU copies. Returns whether
++ * it is active (needs the extension and the ram_blocks/ram_runs callbacks; off with dump-dir).
++ */
++bool pvg_exec_set_zero_copy(PVGExec *e, bool on);
++/* the guest pages behind task va..va+len (len 0: the whole task) changed: Map, Unmap, ... */
++void pvg_exec_mapping_changed(PVGExec *e, uint32_t task, uint64_t va, uint64_t len);
+ void pvg_exec_synchronize(PVGExec *e, uint32_t task, uint32_t id);
+ void pvg_exec_flush_range(PVGExec *e, uint32_t task, uint64_t va, uint64_t len);
+ void pvg_exec_free(PVGExec *e);
+diff --git a/hw/display/trace-events b/hw/display/trace-events
+index 3095d3d..313e256 100644
+--- a/hw/display/trace-events
++++ b/hw/display/trace-events
+@@ -258,6 +258,7 @@ pvg_linux_exec_time(uint64_t cmdbufs, int64_t exec_ms, int64_t wall_ms, int64_t
+ pvg_linux_exec_pipelines(uint64_t pipe_ms, uint64_t spv_hits, uint64_t damage_mb) "building pipelines %"PRIu64" ms, translations reused %"PRIu64", damage rectangles saved %"PRIu64" MiB"
+ pvg_linux_exec_cache(uint64_t hits, uint64_t saved_mb, uint64_t dropped, uint64_t sync_ms, int64_t kvm_ms) "upload cache: %"PRIu64" hits, %"PRIu64" MiB not uploaded, %"PRIu64" dropped, sync %"PRIu64" ms (KVM log %"PRId64" ms)"
+ pvg_linux_exec_private(uint64_t skipped_mb, uint64_t flushes, uint64_t gpu_mipmaps) "private textures: %"PRIu64" MiB not copied, %"PRIu64" flushes; %"PRIu64" GPU mipmaps"
++pvg_linux_exec_zc(uint64_t gathered_mb, uint64_t scattered_mb, uint64_t fallbacks) "zero-copy: %"PRIu64" MiB gathered, %"PRIu64" MiB scattered by the GPU, %"PRIu64" CPU fallbacks"
+ pvg_linux_child_poke(uint32_t index, uint32_t written, uint32_t read, uint32_t length) "child FIFO %u written=0x%x read=0x%x length=0x%x"
+ pvg_linux_cmd_stub(uint32_t op) "op=0x%02x not implemented, completed"
+ pvg_linux_signal_stamp(uint32_t index, uint32_t value) "stamps[%u]=%u"
+-- 
+2.43.0
+

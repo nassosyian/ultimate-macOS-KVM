@@ -1,0 +1,80 @@
+From 5c7675d0339b62595421656a03e3e4735361c571 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Fri, 30 Oct 2026 23:31:47 +0200
+Subject: [PATCH 59/60] hw/display/pvg: enable VK_EXT_external_memory_host when
+ available
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/pvg-gpu.c | 21 +++++++++++++++++++--
+ hw/display/pvg/pvg-gpu.h |  1 +
+ 2 files changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/hw/display/pvg/pvg-gpu.c b/hw/display/pvg/pvg-gpu.c
+index 9c9847c..c7848de 100644
+--- a/hw/display/pvg/pvg-gpu.c
++++ b/hw/display/pvg/pvg-gpu.c
+@@ -7,6 +7,7 @@
+  * SPDX-License-Identifier: GPL-2.0-or-later
+  */
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ 
+ #include "pvg-gpu.h"
+@@ -29,7 +30,9 @@ int pvg_gpu_init(PVGGpu *g, bool validation, char *err, size_t errlen)
+ {
+     const char *layers[] = { "VK_LAYER_KHRONOS_validation" };
+     const char *inst_exts[] = { VK_EXT_DEBUG_UTILS_EXTENSION_NAME };
+-    const char *dev_exts[] = { VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME };
++    /* host-pointer import last: optional (zero-copy access to guest RAM) */
++    const char *dev_exts[] = { VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
++                               VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME };
+     VkApplicationInfo app = {
+         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "qemu-pvg-linux",
+         .apiVersion = VK_API_VERSION_1_3,
+@@ -83,7 +86,7 @@ int pvg_gpu_init(PVGGpu *g, bool validation, char *err, size_t errlen)
+     VkDeviceCreateInfo dci = {
+         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f2,
+         .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
+-        .enabledExtensionCount = 1, .ppEnabledExtensionNames = dev_exts,
++        .enabledExtensionCount = 1, .ppEnabledExtensionNames = dev_exts,     /* see below */
+     };
+     VkCommandPoolCreateInfo pci = {
+         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+@@ -135,6 +138,20 @@ int pvg_gpu_init(PVGGpu *g, bool validation, char *err, size_t errlen)
+         goto fail;
+     }
+     qci.queueFamilyIndex = g->queue_family;
++    {
++        VkExtensionProperties *ext;
++        uint32_t next = 0;
++
++        vkEnumerateDeviceExtensionProperties(g->phys, NULL, &next, NULL);
++        ext = calloc(next ? next : 1, sizeof(*ext));
++        vkEnumerateDeviceExtensionProperties(g->phys, NULL, &next, ext);
++        for (uint32_t i = 0; i < next; i++) {
++            g->host_import |= !strcmp(ext[i].extensionName,
++                                      VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
++        }
++        free(ext);
++        dci.enabledExtensionCount = g->host_import ? 2 : 1;
++    }
+     r = vkCreateDevice(g->phys, &dci, NULL, &g->device);
+     if (r != VK_SUCCESS) {
+         snprintf(err, errlen, "vkCreateDevice on %s: %d", g->name, r);
+diff --git a/hw/display/pvg/pvg-gpu.h b/hw/display/pvg/pvg-gpu.h
+index 31ab11c..0c37e50 100644
+--- a/hw/display/pvg/pvg-gpu.h
++++ b/hw/display/pvg/pvg-gpu.h
+@@ -21,6 +21,7 @@ typedef struct PVGGpu {
+     VkPhysicalDeviceMemoryProperties mem_props;
+     char name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
+     bool validation;
++    bool host_import;           /* VK_EXT_external_memory_host enabled */
+     uint32_t validation_errors;
+ } PVGGpu;
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,318 @@
+From 3e466b4a9556a478ceddb25a254bf02c7a9d8479 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Fri, 30 Oct 2026 00:51:21 +0200
+Subject: [PATCH 47/54] hw/display/pvg/pvg-exec: GenerateMipmaps (CPU box
+ filter), whole-level texture copies (0x13e), full MTLVertexFormat table with
+ support check, SetVertexTextures
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/pvg-exec.c | 237 ++++++++++++++++++++++++++++++++++----
+ 1 file changed, 215 insertions(+), 22 deletions(-)
+
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index e1de380..e880989 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -11,6 +11,7 @@
+  */
+ #include <glib.h>
+ #include <glib/gstdio.h>
++#include <math.h>
+ #include <stdarg.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -253,24 +254,44 @@ static VkFormat mtl_pixel_format(uint32_t f, uint32_t *bpp, VkComponentMapping *
+     }
+ }
+ 
++/*
++ * MTLVertexFormat -> VkFormat. 3-component 8/16-bit formats have no vertex-buffer support on
++ * common hosts: they read as 4 components (the shader input ignores the extra one).
++ */
+ static VkFormat mtl_vertex_format(uint32_t f)
+ {
+-    switch (f) {
+-    case 3: return VK_FORMAT_R8G8B8A8_UINT;
+-    case 9: return VK_FORMAT_R8G8B8A8_UNORM;
+-    case 15: return VK_FORMAT_R16G16B16A16_UINT;
+-    case 21: return VK_FORMAT_R16G16B16A16_UNORM;
+-    case 25: return VK_FORMAT_R16G16_SFLOAT;
+-    case 27: return VK_FORMAT_R16G16B16A16_SFLOAT;
+-    case 28: return VK_FORMAT_R32_SFLOAT;
+-    case 29: return VK_FORMAT_R32G32_SFLOAT;
+-    case 30: return VK_FORMAT_R32G32B32_SFLOAT;
+-    case 31: return VK_FORMAT_R32G32B32A32_SFLOAT;
+-    case 32: return VK_FORMAT_R32_SINT;
+-    case 36: return VK_FORMAT_R32_UINT;
+-    case 39: return VK_FORMAT_R32G32B32A32_UINT;
+-    default: return VK_FORMAT_UNDEFINED;
+-    }
++    static const VkFormat map[] = {
++        [1] = VK_FORMAT_R8G8_UINT, [2] = VK_FORMAT_R8G8B8A8_UINT, [3] = VK_FORMAT_R8G8B8A8_UINT,
++        [4] = VK_FORMAT_R8G8_SINT, [5] = VK_FORMAT_R8G8B8A8_SINT, [6] = VK_FORMAT_R8G8B8A8_SINT,
++        [7] = VK_FORMAT_R8G8_UNORM, [8] = VK_FORMAT_R8G8B8A8_UNORM,
++        [9] = VK_FORMAT_R8G8B8A8_UNORM,
++        [10] = VK_FORMAT_R8G8_SNORM, [11] = VK_FORMAT_R8G8B8A8_SNORM,
++        [12] = VK_FORMAT_R8G8B8A8_SNORM,
++        [13] = VK_FORMAT_R16G16_UINT, [14] = VK_FORMAT_R16G16B16A16_UINT,
++        [15] = VK_FORMAT_R16G16B16A16_UINT,
++        [16] = VK_FORMAT_R16G16_SINT, [17] = VK_FORMAT_R16G16B16A16_SINT,
++        [18] = VK_FORMAT_R16G16B16A16_SINT,
++        [19] = VK_FORMAT_R16G16_UNORM, [20] = VK_FORMAT_R16G16B16A16_UNORM,
++        [21] = VK_FORMAT_R16G16B16A16_UNORM,
++        [22] = VK_FORMAT_R16G16_SNORM, [23] = VK_FORMAT_R16G16B16A16_SNORM,
++        [24] = VK_FORMAT_R16G16B16A16_SNORM,
++        [25] = VK_FORMAT_R16G16_SFLOAT, [26] = VK_FORMAT_R16G16B16A16_SFLOAT,
++        [27] = VK_FORMAT_R16G16B16A16_SFLOAT,
++        [28] = VK_FORMAT_R32_SFLOAT, [29] = VK_FORMAT_R32G32_SFLOAT,
++        [30] = VK_FORMAT_R32G32B32_SFLOAT, [31] = VK_FORMAT_R32G32B32A32_SFLOAT,
++        [32] = VK_FORMAT_R32_SINT, [33] = VK_FORMAT_R32G32_SINT, [34] = VK_FORMAT_R32G32B32_SINT,
++        [35] = VK_FORMAT_R32G32B32A32_SINT,
++        [36] = VK_FORMAT_R32_UINT, [37] = VK_FORMAT_R32G32_UINT, [38] = VK_FORMAT_R32G32B32_UINT,
++        [39] = VK_FORMAT_R32G32B32A32_UINT,
++        [40] = VK_FORMAT_A2B10G10R10_SNORM_PACK32, [41] = VK_FORMAT_A2B10G10R10_UNORM_PACK32,
++        [42] = VK_FORMAT_B8G8R8A8_UNORM,        /* UChar4Normalized_BGRA */
++        [45] = VK_FORMAT_R8_UINT, [46] = VK_FORMAT_R8_SINT, [47] = VK_FORMAT_R8_UNORM,
++        [48] = VK_FORMAT_R8_SNORM, [49] = VK_FORMAT_R16_UINT, [50] = VK_FORMAT_R16_SINT,
++        [51] = VK_FORMAT_R16_UNORM, [52] = VK_FORMAT_R16_SNORM, [53] = VK_FORMAT_R16_SFLOAT,
++        [54] = VK_FORMAT_B10G11R11_UFLOAT_PACK32, [55] = VK_FORMAT_E5B9G9R9_UFLOAT_PACK32,
++    };
++
++    return f < G_N_ELEMENTS(map) ? map[f] : VK_FORMAT_UNDEFINED;
+ }
+ 
+ static VkBlendFactor mtl_blend_factor(uint32_t f)
+@@ -1247,12 +1268,21 @@ static Pipeline *pipeline_get(PVGExec *e, uint32_t task, uint32_t ref, const VkF
+                     case 3: buf = v; break;
+                     }
+                 }
++                VkFormat vf = mtl_vertex_format(fmt);
++                VkFormatProperties fp;
++
+                 if (!fmt || buf >= MAX_SLOTS) {
+                     continue;
+                 }
++                vkGetPhysicalDeviceFormatProperties(g->phys, vf, &fp);
++                if (vf == VK_FORMAT_UNDEFINED ||
++                    !(fp.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT)) {
++                    elog(e, "task %u pipeline %u: vertex attribute %u MTLVertexFormat %u "
++                         "unsupported (VkFormat %d): dropped", task, ref, idx, fmt, vf);
++                    continue;
++                }
+                 vattr[nattr++] = (VkVertexInputAttributeDescription){
+-                    .location = idx, .binding = buf, .format = mtl_vertex_format(fmt),
+-                    .offset = aoff };
++                    .location = idx, .binding = buf, .format = vf, .offset = aoff };
+                 if (!(p->vertex_bindings & (1u << buf))) {
+                     p->vertex_bindings |= 1u << buf;
+                     vbind[nbind++] = (VkVertexInputBindingDescription){
+@@ -2113,7 +2143,7 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+             if (clen < 8 || o + clen > len) {
+                 break;
+             }
+-            if (id == 0x72) {
++            if (id == 0x72 || id == 0x81) {     /* Set{Fragment,Vertex}Textures */
+                 set_refs(refs, p + o + 8, clen - 8);
+                 for (int i = 0; i < MAX_SLOTS; i++) {
+                     GuestImage gi;
+@@ -2256,6 +2286,7 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+             }
+             break;
+         case 0x72: set_refs(st.ftex, a, alen); break;
++        case 0x81: set_refs(st.vtex, a, alen); break;      /* SetVertexTextures */
+         case 0x70: case 0x71: set_refs(st.fsmp, a, alen); break;    /* SetFragmentSamplerStates[LODClamp] */
+         case 0x7f: case 0x80: set_refs(st.vsmp, a, alen); break;    /* SetVertexSamplerStates[LODClamp] */
+         case 0x65:      /* SetBlendColor {f32 r, g, b, a} */
+@@ -2366,8 +2397,15 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                      instances, ib, ib_off, rw, rh, natt);
+             }
+             for (int i = 0; i < MAX_SLOTS; i++) {
+-                if (st.ftex[i] && !is_attachment(att, natt, st.ftex[i])) {
+-                    gint64 key = key_of(task, st.ftex[i]);
++                /*
++                 * One binding (16 + index) per Metal texture index for both stages: a slot
++                 * only the vertex shader samples takes the vertex binding
++                 */
++                uint32_t tref = pp && !(pp->fs_textures >> i & 1) && (pp->vs_textures >> i & 1) ?
++                                st.vtex[i] : st.ftex[i];
++
++                if (tref && !is_attachment(att, natt, tref)) {
++                    gint64 key = key_of(task, tref);
+ 
+                     draw_tex[i] = g_hash_table_lookup(e->images, &key);
+                 }
+@@ -3175,6 +3213,132 @@ static void exec_compute_segment(PVGExec *e, uint32_t task, const uint8_t *p, ui
+     g_hash_table_remove_all(e->uploaded);
+ }
+ 
++/* ---- blit: mipmap generation (CPU 2x2 box filter on the guest copy) ---- */
++
++static float half_to_float(uint16_t h)
++{
++    uint32_t sign = (uint32_t)(h & 0x8000) << 16, exp = (h >> 10) & 0x1f, man = h & 0x3ff, f;
++    float r;
++
++    if (!exp) {
++        r = ldexpf((float)man, -24);
++        return sign ? -r : r;
++    }
++    f = sign | (exp == 31 ? 0x7f800000u | (man << 13) : ((exp + 112) << 23) | (man << 13));
++    memcpy(&r, &f, 4);
++    return r;
++}
++
++static uint16_t float_to_half(float v)
++{
++    uint32_t f, sign, man;
++    int exp;
++
++    memcpy(&f, &v, 4);
++    sign = (f >> 16) & 0x8000;
++    exp = (int)((f >> 23) & 0xff) - 127 + 15;
++    man = f & 0x7fffff;
++    if (((f >> 23) & 0xff) == 0xff) {
++        return sign | 0x7c00 | (man ? 0x200 : 0);
++    }
++    if (exp >= 31) {
++        return sign | 0x7c00;
++    }
++    if (exp <= 0) {
++        return exp < -10 ? sign : sign | ((man | 0x800000) >> (14 - exp));
++    }
++    return sign | (exp << 10) | (man >> 13);
++}
++
++/* channel layout of formats whose levels can be averaged per channel; 0 = unsupported */
++static int mip_channels(VkFormat f, int *kind)
++{
++    switch (f) {
++    case VK_FORMAT_R8_UNORM: case VK_FORMAT_R8_SRGB: *kind = 0; return 1;
++    case VK_FORMAT_R8G8_UNORM: *kind = 0; return 2;
++    case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB:
++    case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB: *kind = 0; return 4;
++    case VK_FORMAT_R16_SFLOAT: *kind = 1; return 1;
++    case VK_FORMAT_R16G16_SFLOAT: *kind = 1; return 2;
++    case VK_FORMAT_R16G16B16A16_SFLOAT: *kind = 1; return 4;
++    case VK_FORMAT_R32_SFLOAT: *kind = 2; return 1;
++    case VK_FORMAT_R32G32_SFLOAT: *kind = 2; return 2;
++    case VK_FORMAT_R32G32B32A32_SFLOAT: *kind = 2; return 4;
++    default: return 0;
++    }
++}
++
++static float mip_load(const uint8_t *p, int kind, int c)
++{
++    return kind == 0 ? p[c] : kind == 1 ? half_to_float(lduw(p + 2 * c)) : ldf(p + 4 * c);
++}
++
++static void mip_store(uint8_t *p, int kind, int c, float v)
++{
++    if (kind == 0) {
++        p[c] = (uint8_t)MIN(MAX(v + 0.5f, 0.0f), 255.0f);
++    } else if (kind == 1) {
++        uint16_t h = float_to_half(v);
++
++        memcpy(p + 2 * c, &h, 2);
++    } else {
++        memcpy(p + 4 * c, &v, 4);
++    }
++}
++
++static void generate_mipmaps(PVGExec *e, uint32_t task, uint32_t ref)
++{
++    GuestImage all, src, dst;
++    int kind, nc;
++
++    if (!guest_image_ex(e, task, ref, -1, 0, &all) || all.mips < 2) {
++        return;
++    }
++    nc = mip_channels(all.format, &kind);
++    if (!nc || all.depth > 1) {
++        elog(e, "task %u texture %u: generateMipmaps for format %d / 3D not supported", task, ref,
++             all.format);
++        return;
++    }
++    for (uint32_t slice = 0; slice < all.layers; slice++) {
++        for (uint32_t l = 1; l < all.mips; l++) {
++            g_autofree uint8_t *in = NULL, *out = NULL;
++
++            if (!guest_image_ex(e, task, ref, l - 1, slice, &src) ||
++                !guest_image_ex(e, task, ref, l, slice, &dst) ||
++                src.bpp != dst.bpp || !dst.width || !dst.height) {
++                return;
++            }
++            in = g_malloc((size_t)src.row_bytes * src.height);
++            out = g_malloc((size_t)dst.width * dst.bpp);
++            if (!e->host.read(e->host.opaque, src.task, src.va, in,
++                              (uint64_t)src.row_bytes * src.height)) {
++                return;
++            }
++            for (uint32_t y = 0; y < dst.height; y++) {
++                uint32_t y0 = MIN(2 * y, src.height - 1), y1 = MIN(2 * y + 1, src.height - 1);
++
++                for (uint32_t x = 0; x < dst.width; x++) {
++                    uint32_t x0 = MIN(2 * x, src.width - 1), x1 = MIN(2 * x + 1, src.width - 1);
++
++                    for (int c = 0; c < nc; c++) {
++                        float v = mip_load(in + y0 * src.row_bytes + x0 * src.bpp, kind, c) +
++                                  mip_load(in + y0 * src.row_bytes + x1 * src.bpp, kind, c) +
++                                  mip_load(in + y1 * src.row_bytes + x0 * src.bpp, kind, c) +
++                                  mip_load(in + y1 * src.row_bytes + x1 * src.bpp, kind, c);
++
++                        mip_store(out + x * dst.bpp, kind, c, v * 0.25f);
++                    }
++                }
++                e->host.write(e->host.opaque, dst.task, dst.va + (uint64_t)y * dst.row_bytes, out,
++                              (uint64_t)dst.width * dst.bpp);
++            }
++            note_write(e, dst.task, dst.va, (uint64_t)dst.row_bytes * dst.height, 'M');
++        }
++    }
++    e->stats.blits++;
++}
++
+ static void exec_blit_segment(PVGExec *e, uint32_t task, const uint8_t *p, uint32_t len)
+ {
+     for (uint32_t off = 0; off + 8 <= len;) {
+@@ -3258,7 +3422,36 @@ static void exec_blit_segment(PVGExec *e, uint32_t task, const uint8_t *p, uint3
+                 e->stats.blits++;
+             }
+             break;
+-        default:        /* mipmaps, optimise, synchronise, fences: nothing to do in v0 */
++        case 0x133:     /* GenerateMipmaps {u32 texture} */
++            if (alen >= 4) {
++                generate_mipmaps(e, task, ldl(a));
++            }
++            break;
++        case 0x13e: {   /* CopyFromTextureToTexture {u32 src, u32 dst, u16 srcSlice, srcLevel,
++                         * dstSlice, dstLevel, sliceCount, levelCount}: whole levels */
++            uint32_t sslice, slevel, dslice, dlevel, nslice, nlevel;
++
++            if (alen < 20) {
++                break;
++            }
++            sslice = lduw(a + 8); slevel = lduw(a + 10); dslice = lduw(a + 12);
++            dlevel = lduw(a + 14); nslice = lduw(a + 16); nlevel = lduw(a + 18);
++            for (uint32_t sl = 0; sl < nslice; sl++) {
++                for (uint32_t lv = 0; lv < nlevel; lv++) {
++                    if (guest_image_ex(e, task, ldl(a), slevel + lv, sslice + sl, &gi) &&
++                        guest_image_ex(e, task, ldl(a + 4), dlevel + lv, dslice + sl, &gi2) &&
++                        gi.bpp == gi2.bpp && gi.width == gi2.width && gi.height == gi2.height) {
++                        copy_rows(e, gi.task, gi.va, gi.row_bytes, gi2.task, gi2.va,
++                                  gi2.row_bytes, (uint64_t)gi.width * gi.bpp, gi.height);
++                    }
++                }
++            }
++            e->stats.blits++;
++            break;
++        }
++        case 0x134: case 0x135:     /* OptimizeForCPU/GPUAccess: layout hints */
++            break;
++        default:        /* synchronise, fences: nothing to do (in order) */
+             if (e->blit_unhandled++ < 200) {
+                 elog(e, "blit 0x%x len %u unhandled: %08x %08x %08x %08x", id, clen,
+                      alen >= 4 ? ldl(a) : 0, alen >= 8 ? ldl(a + 4) : 0,
+-- 
+2.43.0
+

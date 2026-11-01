@@ -1,0 +1,159 @@
+From ce8b2d5d74f628c18a5f5cbed51332c0e0e32301 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Sat, 31 Oct 2026 20:48:54 +0200
+Subject: [PATCH] hw/display/pvg, ui/dbus: tear down Vulkan and EGL before exit
+
+QEMU does not unrealize devices on quit, so the pvg Vulkan device, its
+executor threads and the NVIDIA driver's worker threads were still running
+while exit() ran the driver's destructors; the D-Bus display also never
+terminated its EGL display. Seen once as a SIGSEGV in libnvidia-glcore at
+exit (dbus display + qemu-rdw viewer).
+
+pvg: an exit notifier (runs from atexit, before shared-library destructors)
+stops the executor threads and destroys the executor and Vulkan device;
+pvg_linux_exit uses the same helpers. ui/dbus: dbus_cleanup() calls
+egl_cleanup() like egl-headless does.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-pci.c | 71 ++++++++++++++++++++++++++++----------
+ ui/dbus.c                  |  4 +++
+ 2 files changed, 56 insertions(+), 19 deletions(-)
+
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index 5a83cfd..3120151 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -359,6 +359,7 @@ struct PVGLinuxPCIState {
+     bool guest_fixups_enable;
+     PVGGuestFixups *guest_fixups;   /* patches for guest-side x86 PVG bugs */
+     QEMUTimer *efi_timer;           /* EFI display scanout while the GOP driver owns the screen */
++    Notifier exit_notifier;         /* GPU teardown before the process exits */
+     int64_t fps_start;              /* frame-rate window (realtime ms) */
+     uint32_t fps_frames;
+ 
+@@ -2765,6 +2766,8 @@ static const MemoryRegionOps pvg_linux_mmio_ops = {
+     },
+ };
+ 
++static void pvg_linux_exit_notify(Notifier *n, void *data);
++
+ static void pvg_linux_realize(PCIDevice *dev, Error **errp)
+ {
+     PVGLinuxPCIState *s = PVG_LINUX_PCI(dev);
+@@ -2791,6 +2794,8 @@ static void pvg_linux_realize(PCIDevice *dev, Error **errp)
+     if (msi_init(dev, 0, s->msi_vectors, true, false, errp)) {
+         return;
+     }
++    s->exit_notifier.notify = pvg_linux_exit_notify;
++    qemu_add_exit_notifier(&s->exit_notifier);
+     s->cur_stamp_index = -1;
+     qemu_mutex_init(&s->stamp_lock);
+     if (s->guest_fixups_enable) {
+@@ -2880,10 +2885,55 @@ static void pvg_linux_realize(PCIDevice *dev, Error **errp)
+     }
+ }
+ 
++static void pvg_exec_threads_stop(PVGLinuxPCIState *s)
++{
++    if (!s->exec_thread_started) {
++        return;
++    }
++    qemu_mutex_lock(&s->exec_lock);
++    s->exec_stop = true;
++    qemu_cond_broadcast(&s->exec_cond);
++    qemu_cond_broadcast(&s->done_cond);
++    qemu_mutex_unlock(&s->exec_lock);
++    qemu_thread_join(&s->exec_thread);
++    if (s->done_thread_started) {
++        qemu_thread_join(&s->done_thread);
++    }
++    qemu_bh_delete(s->exec_bh);
++    s->exec_thread_started = false;
++}
++
++static void pvg_gpu_release(PVGLinuxPCIState *s)
++{
++    if (s->exec) {
++        pvg_exec_free(s->exec);
++        s->exec = NULL;
++    }
++    if (s->gpu_ok) {
++        pvg_gpu_fini(&s->gpu);
++        s->gpu_ok = false;
++    }
++}
++
++/*
++ * QEMU does not unrealize devices on quit. Without this the Vulkan device and the NVIDIA
++ * driver's worker threads are still running while exit() runs the driver's destructors
++ * (SIGSEGV in libnvidia-glcore at exit). Exit notifiers run from atexit, before the
++ * shared-library destructors. The vCPUs are stopped: no drain.
++ */
++static void pvg_linux_exit_notify(Notifier *n, void *data)
++{
++    PVGLinuxPCIState *s = container_of(n, PVGLinuxPCIState, exit_notifier);
++
++    pvg_exec_threads_stop(s);
++    pvg_gpu_release(s);
++}
++
+ static void pvg_linux_exit(PCIDevice *dev)
+ {
+     PVGLinuxPCIState *s = PVG_LINUX_PCI(dev);
+ 
++    qemu_remove_exit_notifier(&s->exit_notifier);
+     if (s->exec_thread_started) {
+         pvg_exec_drain(s);
+     }
+@@ -2891,30 +2941,13 @@ static void pvg_linux_exit(PCIDevice *dev)
+     msi_uninit(dev);
+     if (s->exec_thread_started) {
+         pvg_exec_drain(s);
+-        qemu_mutex_lock(&s->exec_lock);
+-        s->exec_stop = true;
+-        qemu_cond_broadcast(&s->exec_cond);
+-        qemu_cond_broadcast(&s->done_cond);
+-        qemu_mutex_unlock(&s->exec_lock);
+-        qemu_thread_join(&s->exec_thread);
+-        if (s->done_thread_started) {
+-            qemu_thread_join(&s->done_thread);
+-        }
+-        qemu_bh_delete(s->exec_bh);
+-        s->exec_thread_started = false;
+     }
++    pvg_exec_threads_stop(s);
+     if (s->dirty_ram) {
+         memory_region_set_log(s->dirty_ram, false, DIRTY_MEMORY_VGA);
+         s->dirty_ram = NULL;
+     }
+-    if (s->exec) {
+-        pvg_exec_free(s->exec);
+-        s->exec = NULL;
+-    }
+-    if (s->gpu_ok) {
+-        pvg_gpu_fini(&s->gpu);
+-        s->gpu_ok = false;
+-    }
++    pvg_gpu_release(s);
+     pvg_guest_fixups_stop(s->guest_fixups);
+     s->guest_fixups = NULL;
+     if (s->con) {
+diff --git a/ui/dbus.c b/ui/dbus.c
+index 7be0f8e..24c9f3d 100644
+--- a/ui/dbus.c
++++ b/ui/dbus.c
+@@ -684,6 +684,10 @@ dbus_cleanup(void)
+     if (o) {
+         object_unparent(o);
+     }
++#ifdef CONFIG_OPENGL
++    /* like egl-headless: no live EGL display / driver threads left for exit() */
++    egl_cleanup();
++#endif
+ }
+ 
+ static QemuDisplay qemu_display_dbus = {
+-- 
+2.56.0
+

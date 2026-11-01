@@ -52,6 +52,18 @@ ULTMOS now has built-in support for CorpNewt's [GenSMBIOS](https://github.com/co
 
 ***
 
+## 6. Metal GPU acceleration
+
+Builds and runs `pvg-metal-vulkan`, a paravirtual GPU for QEMU that executes macOS's Metal on the host GPU through Vulkan, without GPU passthrough. It needs a Vulkan 1.3 host GPU (tested on NVIDIA), LLVM 19 or newer and Vulkan development files, and a macOS Tahoe x86 guest. The menu shows whether QEMU is built and the option ROM is collected, and offers:
+
+1. **Build QEMU with the paravirtual GPU**: clones QEMU 11.1.3 into `pvg-metal-vulkan/src/qemu`, applies the patches and builds it.
+2. **Collect the option ROM from macOS (once)**: boots your VM with a small transfer disk. In macOS, open Terminal and run `sh /Volumes/PVGXFER/collect.sh rom`, then shut down. The ROM (`AppleParavirtEFI.rom`, part of macOS) is copied back afterwards.
+3. **Boot macOS with Metal acceleration**: boots your VM's disks with the paravirtual GPU.
+
+See [pvg-metal-vulkan/README.md](../pvg-metal-vulkan/README.md) for details.
+
+***
+
 ## C. Cleanup Tools...
 
 This utility is a powerful self-destructing uninstaller for Ultimate macOS KVM that provides the following functions:

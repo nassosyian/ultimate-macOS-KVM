@@ -1,0 +1,460 @@
+From 83062cf408d11a6581c5bfde72fd0a3f063cdde0 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Sat, 31 Oct 2026 10:57:13 +0200
+Subject: [PATCH 67/72] hw/display/pvg: render mip-chain levels in place; flush
+ only what blits touch
+
+The Wallpaper pane's blur pyramid renders into each level of a private
+mip-chain texture and then samples the chain. Each level had its own host
+image, so every frame flushed each level to guest memory and re-uploaded
+the chain (~290 flushes / 620 MiB per 500 cmdbufs). Private 2D targets
+inside a mip chain now render through a level view of the chain's own
+image (GENERAL layout), which sampling uses directly: 0 flushes.
+
+Blit segments flushed every private texture of the task; they now flush
+only the ranges each copy reads or writes. Per-level/slice host images
+carry level and slice in the key. Flush reasons are logged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/pvg-exec.c | 216 ++++++++++++++++++++++++++++++++------
+ 1 file changed, 182 insertions(+), 34 deletions(-)
+
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index 59e0daa..bfebe74 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -121,6 +121,7 @@ typedef struct HostImage {
+      */
+     bool priv, resident, guest_stale;
+     GuestImage pgi;
++    VkImageView level_view[MAX_MIPS];   /* render-target views of single levels (mip chains) */
+     uint32_t c_task, nruns;
+     uint64_t c_va, c_len;
+     uint64_t (*runs)[2];
+@@ -187,7 +188,8 @@ struct PVGExec {
+     uint32_t zc_runs_max;
+     VkBufferCopy *zc_regs;
+     uint32_t zc_regs_max;
+-    GHashTable *zc_cache;       /* ZCKey -> ZCRuns: RAM runs of task ranges, until remapped */
++    GHashTable *zc_cache;
++    const char *flush_why;      /* diagnostics: why private images are being flushed */       /* ZCKey -> ZCRuns: RAM runs of task ranges, until remapped */
+     uint64_t arena_used;
+ 
+     VkSampler sampler;
+@@ -197,7 +199,7 @@ struct PVGExec {
+     /* last render pass, resumed by continuation segments */
+     bool have_last;
+     uint32_t last_task;
+-    uint8_t last_att[8 * 640];  /* Attachment[8] */
++    uint8_t last_att[8 * 1280]; /* Attachment[8] */
+     uint8_t last_st[4096];      /* RenderState */
+     char *dump_dir;
+     bool dry_run;
+@@ -267,6 +269,23 @@ static gint64 key_of(uint32_t task, uint32_t id)
+     return (gint64)task << 32 | id;
+ }
+ 
++/*
++ * Render targets other than level 0 / slice 0 get their own host image per level and slice
++ * (a blur pyramid renders into every level of one texture in turn): the "task" word of the
++ * key carries them above the task id (tasks are < 256).
++ */
++#define KEY_TASK(k)     ((uint32_t)((k) >> 32) & 0xff)
++
++static uint32_t level_task(uint32_t task, uint32_t level, uint32_t slice)
++{
++    return task | (level & 0xff) << 8 | (slice & 0xffff) << 16;
++}
++
++static uint32_t level_ref(uint32_t ref, uint32_t level, uint32_t slice)
++{
++    return level || slice ? ref | 0x10000000u : ref;
++}
++
+ /* ---- formats ---- */
+ 
+ static VkFormat mtl_pixel_format(uint32_t f, uint32_t *bpp, VkComponentMapping *swz)
+@@ -1889,6 +1908,11 @@ static void priv_flush(PVGExec *e, HostImage *hi)
+     if (hi->layout == VK_IMAGE_LAYOUT_UNDEFINED) {
+         return;
+     }
++    {
++        elog(e, "priv flush %s task %u va 0x%" G_GINT64_MODIFIER "x %ux%u fmt %d mips %u "
++             "bytes %" G_GUINT64_FORMAT, e->flush_why ? e->flush_why : "?", gi->task, gi->va,
++             gi->width, gi->height, gi->format, gi->mips, guest_image_size(gi));
++    }
+     vkResetCommandBuffer(e->cmd, 0);
+     vkBeginCommandBuffer(e->cmd, &bi);
+     barrier(e, hi->image, hi->layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+@@ -1931,13 +1955,19 @@ static void priv_invalidate_range(PVGExec *e, uint32_t task, uint64_t va, uint64
+ 
+ void pvg_exec_synchronize(PVGExec *e, uint32_t task, uint32_t id)
+ {
+-    static const uint32_t variants[] = { 0, 0x10000000u };
++    GHashTableIter it;
++    gpointer k, v;
+ 
+-    for (size_t i = 0; i < G_N_ELEMENTS(variants); i++) {
+-        gint64 key = key_of(task, id | variants[i]);
+-        HostImage *hi = g_hash_table_lookup(e->images, &key);
++    if (!e->priv_imgs->len) {
++        return;
++    }
++    g_hash_table_iter_init(&it, e->images);
++    while (g_hash_table_iter_next(&it, &k, &v)) {
++        gint64 key = *(gint64 *)k;
++        HostImage *hi = v;
+ 
+-        if (hi && hi->guest_stale) {
++        if (KEY_TASK(key) == task && ((uint32_t)key & 0xefffffffu) == id && hi->guest_stale) {
++            e->flush_why = "synchronize";
+             priv_flush(e, hi);
+         }
+     }
+@@ -1950,6 +1980,7 @@ void pvg_exec_flush_range(PVGExec *e, uint32_t task, uint64_t va, uint64_t len)
+ 
+         if (hi->guest_stale && (!len || gi_overlap(&hi->pgi, task, va, len)) &&
+             hi->pgi.task == task) {
++            e->flush_why = len ? "unmap" : "blit";
+             priv_flush(e, hi);
+         }
+     }
+@@ -1969,8 +2000,10 @@ static void priv_prepare_refs(PVGExec *e, uint32_t task, const uint32_t *refs, u
+             HostImage *own = g_hash_table_lookup(e->images, &key);
+ 
+             if (own && own->guest_stale && !priv_same(own, &gi)) {
++                e->flush_why = "texture-reshape";
+                 priv_flush(e, own);     /* about to be re-created for another shape */
+             }
++            e->flush_why = "texture-overlap";
+             priv_flush_range(e, gi.task, gi.va, guest_image_size(&gi),
+                              priv_same(own, &gi) ? own : NULL);
+         }
+@@ -2914,7 +2947,9 @@ static bool bind_and_push(PVGExec *e, uint32_t task, RenderState *st, Pipeline *
+                     }
+                 }
+                 ii[nw] = (VkDescriptorImageInfo){ .imageView = img->view,
+-                    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
++                    .imageLayout = img->layout == VK_IMAGE_LAYOUT_GENERAL ?
++                                   VK_IMAGE_LAYOUT_GENERAL :
++                                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+                 w[nw] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                     .dstBinding = A2S_TEXTURE_BINDING + off + i, .descriptorCount = 1,
+                     .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .pImageInfo = &ii[nw] };
+@@ -3003,6 +3038,12 @@ typedef struct Attachment {
+     HostImage *msimg;
+     bool kept;                  /* image fully equal to the guest's copy before the pass */
+     bool priv;                  /* MTLStorageModePrivate target kept on the GPU, not written back */
++    /*
++     * Private target in a 2D mip chain: rendered through a level view of the whole chain's
++     * image, which is also what sampling the texture uses (no copies between the two)
++     */
++    bool chain;
++    GuestImage cgi;             /* the whole chain */
+ } Attachment;
+ 
+ /* DescribeRenderPass depth (bytes 0..39) and stencil (40..75) attachments */
+@@ -3191,6 +3232,25 @@ static void ds_apply(PVGExec *e, const RenderState *st, bool has_depth, bool has
+ }
+ 
+ /* a level-0, slice-0 attachment: sampling its texture in the pass reads the render target */
++/* colour-attachment view of one mip level of a 2D chain image (identity swizzle) */
++static VkImageView level_view(PVGExec *e, HostImage *hi, uint32_t level)
++{
++    VkImageViewCreateInfo vci = {
++        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = hi->image,
++        .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = hi->format,
++        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, level, 1, 0, 1 },
++    };
++
++    if (level >= MAX_MIPS || level >= hi->mips) {
++        return VK_NULL_HANDLE;
++    }
++    if (!hi->level_view[level] &&
++        vkCreateImageView(e->gpu->device, &vci, NULL, &hi->level_view[level]) != VK_SUCCESS) {
++        hi->level_view[level] = VK_NULL_HANDLE;
++    }
++    return hi->level_view[level];
++}
++
+ static bool is_attachment(const Attachment *att, uint32_t natt, uint32_t ref)
+ {
+     for (uint32_t i = 0; i < natt; i++) {
+@@ -3450,6 +3510,15 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+             att[i].samples = 0;
+         }
+     }
++    for (uint32_t i = 0; i < natt; i++) {
++        /* private targets inside a 2D mip chain render into the chain's own image */
++        att[i].chain = att[i].ref && e->private_resident && att[i].gi.storage == 2 &&
++                       att[i].samples <= 1 && !att[i].slice &&
++                       guest_image(e, task, att[i].ref, &att[i].cgi) &&
++                       att[i].cgi.view_type == VK_IMAGE_VIEW_TYPE_2D && att[i].cgi.mips > 1 &&
++                       att[i].level < MIN(att[i].cgi.mips, MAX_MIPS) &&
++                       att[i].cgi.format == att[i].gi.format && att[i].cgi.desc_samples <= 1;
++    }
+     if (!natt) {
+         uint8_t obj[MAX_OBJ];
+         uint32_t olen;
+@@ -3494,14 +3563,28 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+         uint32_t n = segment_texture_refs(p, off, len, refs, MAX_SEG_REFS);
+ 
+         for (uint32_t i = 0; i < natt; i++) {
+-            if (att[i].ref) {
+-                gint64 key = key_of(task, att[i].level || att[i].slice ?
+-                                    att[i].ref | 0x10000000u : att[i].ref);
++            if (att[i].chain) {
++                gint64 key = key_of(task, att[i].ref);
++                HostImage *own = g_hash_table_lookup(e->images, &key);
++
++                if (own && own->guest_stale && !priv_same(own, &att[i].cgi)) {
++                    e->flush_why = "chain-reshape";
++                    priv_flush(e, own);
++                }
++                e->flush_why = "chain-overlap";
++                priv_flush_range(e, att[i].cgi.task, att[i].cgi.va,
++                                 guest_image_size(&att[i].cgi),
++                                 priv_same(own, &att[i].cgi) ? own : NULL);
++            } else if (att[i].ref) {
++                gint64 key = key_of(level_task(task, att[i].level, att[i].slice),
++                                    level_ref(att[i].ref, att[i].level, att[i].slice));
+                 HostImage *own = g_hash_table_lookup(e->images, &key);
+ 
+                 if (own && own->guest_stale && !priv_same(own, &att[i].gi)) {
++                    e->flush_why = "attachment-reshape";
+                     priv_flush(e, own);     /* about to be re-created for another level */
+                 }
++                e->flush_why = "attachment-overlap";
+                 priv_flush_range(e, att[i].gi.task, att[i].gi.va,
+                                  guest_image_size(&att[i].gi),
+                                  priv_same(own, &att[i].gi) ? own : NULL);
+@@ -3517,8 +3600,10 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+             continue;
+         }
+         /* other levels/slices get their own host image (mip 0 / slice 0 keeps the plain key) */
+-        att[i].img = host_image(e, task, att[i].level || att[i].slice ?
+-                                att[i].ref | 0x10000000u : att[i].ref, &att[i].gi, true);
++        att[i].img = att[i].chain ? host_image(e, task, att[i].ref, &att[i].cgi, true) :
++                     host_image(e, level_task(task, att[i].level, att[i].slice),
++                                level_ref(att[i].ref, att[i].level, att[i].slice), &att[i].gi,
++                                true);
+         if (!att[i].img) {
+             vkEndCommandBuffer(e->cmd);
+             return;
+@@ -3632,6 +3717,32 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+             att[i].damage = damage;
+         }
+         att[i].priv = e->private_resident && att[i].gi.storage == 2 && att[i].samples <= 1;
++        if (att[i].chain) {
++            HostImage *hi = att[i].img;
++            VkImageView v = level_view(e, hi, att[i].level);
++
++            if (!(hi->resident && priv_same(hi, &att[i].cgi))) {
++                /* the other levels must stay what they are: bring the whole chain in */
++                image_upload(e, &att[i].cgi, hi, VK_IMAGE_LAYOUT_GENERAL);
++            } else if (att[i].load == 1) {
++                e->stats.priv_skipped += (uint64_t)att[i].gi.row_bytes * att[i].gi.height;
++            }
++            /* GENERAL: the pass may sample other levels of the same image */
++            if (hi->layout != VK_IMAGE_LAYOUT_GENERAL) {
++                barrier(e, hi->image, hi->layout, VK_IMAGE_LAYOUT_GENERAL);
++                hi->layout = VK_IMAGE_LAYOUT_GENERAL;
++            }
++            ca[i].imageView = v;
++            ca[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
++            ca[i].loadOp = att[i].load == 2 ? VK_ATTACHMENT_LOAD_OP_CLEAR :
++                           att[i].load == 1 ? VK_ATTACHMENT_LOAD_OP_LOAD :
++                           VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++            ca[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++            for (int k = 0; k < 4; k++) {
++                ca[i].clearValue.color.float32[k] = att[i].clear[k];
++            }
++            continue;
++        }
+         if (att[i].priv) {
+             HostImage *hi = att[i].img;
+ 
+@@ -4207,7 +4318,21 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                                     (gssize)att[i].gi.row_bytes * att[i].gi.height, NULL);
+             }
+         }
+-        if (att[i].priv && att[i].img && att[i].store == 1) {
++        if (att[i].chain && att[i].img) {
++            /* the chain image holds the newest contents of every level (stored or not) */
++            HostImage *hi = att[i].img;
++
++            priv_track(e, hi, &att[i].cgi);
++            hi->resident = true;
++            if (att[i].store == 1) {
++                hi->guest_stale = true;
++                priv_invalidate_range(e, att[i].cgi.task, att[i].cgi.va,
++                                      guest_image_size(&att[i].cgi), hi);
++                pvg_exec_cache_invalidate(e, att[i].cgi.task, att[i].cgi.va,
++                                          guest_image_size(&att[i].cgi));
++                e->stats.priv_skipped += (uint64_t)att[i].gi.row_bytes * att[i].gi.height;
++            }
++        } else if (att[i].priv && att[i].img && att[i].store == 1) {
+             HostImage *hi = att[i].img;
+ 
+             priv_track(e, hi, &att[i].gi);
+@@ -5007,6 +5132,7 @@ static bool generate_mipmaps_gpu(PVGExec *e, uint32_t task, uint32_t ref, const
+         return false;
+     }
+     if (old && old->guest_stale && !priv_same(old, all)) {
++        e->flush_why = "mip-reshape";
+         priv_flush(e, old);     /* e.g. level 0 rendered as a single-level target: keep it */
+     }
+     if (!(hi = host_image(e, task, ref, all, false))) {
+@@ -5076,6 +5202,7 @@ static void generate_mipmaps(PVGExec *e, uint32_t task, uint32_t ref)
+     }
+     if (e->private_resident) {
+         /* the CPU path works on the guest copy: GPU-only contents first */
++        e->flush_why = "mip-cpu";
+         priv_flush_range(e, all.task, all.va, guest_image_size(&all), NULL);
+     }
+     nc = mip_channels(all.format, &kind);
+@@ -5140,23 +5267,20 @@ static void generate_mipmaps(PVGExec *e, uint32_t task, uint32_t ref)
+     e->stats.blits++;
+ }
+ 
+-static void exec_blit_segment(PVGExec *e, uint32_t task, const uint8_t *p, uint32_t len)
++/*
++ * A CPU blit is about to read or write guest memory task:va..va+len: GPU-only contents there
++ * must be in guest memory first (also for writes: a partial overwrite keeps the rest)
++ */
++static void blit_flush(PVGExec *e, uint32_t task, uint64_t va, uint64_t len)
+ {
+-    bool through_guest = false;
+-
+-    /* blits copy through guest memory; mipmaps (GPU, or flushed themselves) and hints do not */
+-    for (uint32_t off = 0; off + 8 <= len;) {
+-        uint32_t id = ldl(p + off), clen = ldl(p + off + 4);
+-
+-        if (clen < 8 || off + clen > len) {
+-            break;
+-        }
+-        through_guest |= id != 0x133 && id != 0x134 && id != 0x135;
+-        off += clen;
+-    }
+-    if (e->private_resident && through_guest) {
+-        pvg_exec_flush_range(e, task, 0, 0);
++    if (e->private_resident && e->priv_imgs->len) {
++        e->flush_why = "blit";
++        priv_flush_range(e, task, va, len, NULL);
+     }
++}
++
++static void exec_blit_segment(PVGExec *e, uint32_t task, const uint8_t *p, uint32_t len)
++{
+     for (uint32_t off = 0; off + 8 <= len;) {
+         uint32_t id = ldl(p + off), clen = ldl(p + off + 4);
+         const uint8_t *a = p + off + 8;
+@@ -5179,6 +5303,8 @@ static void exec_blit_segment(PVGExec *e, uint32_t task, const uint8_t *p, uint3
+                     !buffer_range(e, task, ldl(a), ldq(a + 8), bpr * (h - 1) + w * gi.bpp, &va)) {
+                     break;
+                 }
++                blit_flush(e, task, va, bpr * (h - 1) + w * gi.bpp);
++                blit_flush(e, gi.task, gi.va, (uint64_t)gi.row_bytes * gi.height);
+                 copy_rows(e, task, va, bpr, gi.task, gi.va + y * gi.row_bytes + x * gi.bpp,
+                           gi.row_bytes, w * gi.bpp, h);
+                 e->stats.blits++;
+@@ -5195,6 +5321,8 @@ static void exec_blit_segment(PVGExec *e, uint32_t task, const uint8_t *p, uint3
+                                   &va)) {
+                     break;
+                 }
++                blit_flush(e, gi.task, gi.va, (uint64_t)gi.row_bytes * gi.height);
++                blit_flush(e, task, va, bpr * (h - 1) + w * gi.bpp);
+                 copy_rows(e, gi.task, gi.va + y * gi.row_bytes + x * gi.bpp, gi.row_bytes, task,
+                           va, bpr, w * gi.bpp, h);
+                 e->stats.blits++;
+@@ -5213,6 +5341,8 @@ static void exec_blit_segment(PVGExec *e, uint32_t task, const uint8_t *p, uint3
+                     dy + h > gi2.height || !w || !h) {
+                     break;
+                 }
++                blit_flush(e, gi.task, gi.va, (uint64_t)gi.row_bytes * gi.height);
++                blit_flush(e, gi2.task, gi2.va, (uint64_t)gi2.row_bytes * gi2.height);
+                 copy_rows(e, gi.task, gi.va + sy * gi.row_bytes + sx * gi.bpp, gi.row_bytes,
+                           gi2.task, gi2.va + dy * gi2.row_bytes + dx * gi2.bpp, gi2.row_bytes,
+                           w * gi.bpp, h);
+@@ -5223,6 +5353,8 @@ static void exec_blit_segment(PVGExec *e, uint32_t task, const uint8_t *p, uint3
+             if (alen >= 0x20 && ldq(a + 0x18) &&
+                 buffer_range(e, task, ldl(a), ldq(a + 8), ldq(a + 0x18), &va) &&
+                 buffer_range(e, task, ldl(a + 4), ldq(a + 0x10), ldq(a + 0x18), &va2)) {
++                blit_flush(e, task, va, ldq(a + 0x18));
++                blit_flush(e, task, va2, ldq(a + 0x18));
+                 copy_rows(e, task, va, 0, task, va2, 0, ldq(a + 0x18), 1);
+                 e->stats.blits++;
+             }
+@@ -5233,6 +5365,7 @@ static void exec_blit_segment(PVGExec *e, uint32_t task, const uint8_t *p, uint3
+                 g_autofree uint8_t *fill = g_malloc(ldq(a + 0xc));
+ 
+                 memset(fill, a[0x14], ldq(a + 0xc));
++                blit_flush(e, task, va, ldq(a + 0xc));
+                 e->host.write(e->host.opaque, task, va, fill, ldq(a + 0xc));
+                 note_write(e, task, va, ldq(a + 0xc), 'F');
+                 e->stats.blits++;
+@@ -5257,6 +5390,8 @@ static void exec_blit_segment(PVGExec *e, uint32_t task, const uint8_t *p, uint3
+                     if (guest_image_ex(e, task, ldl(a), slevel + lv, sslice + sl, &gi) &&
+                         guest_image_ex(e, task, ldl(a + 4), dlevel + lv, dslice + sl, &gi2) &&
+                         gi.bpp == gi2.bpp && gi.width == gi2.width && gi.height == gi2.height) {
++                        blit_flush(e, gi.task, gi.va, (uint64_t)gi.row_bytes * gi.height);
++                        blit_flush(e, gi2.task, gi2.va, (uint64_t)gi2.row_bytes * gi2.height);
+                         copy_rows(e, gi.task, gi.va, gi.row_bytes, gi2.task, gi2.va,
+                                   gi2.row_bytes, (uint64_t)gi.width * gi.bpp, gi.height);
+                     }
+@@ -5335,7 +5470,16 @@ void pvg_exec_cmdbuf(PVGExec *e, uint32_t task, const uint8_t *buf, uint64_t len
+ 
+ static gboolean match_task(gpointer key, gpointer value, gpointer task)
+ {
+-    return (uint32_t)(*(gint64 *)key >> 32) == GPOINTER_TO_UINT(task);
++    return KEY_TASK(*(gint64 *)key) == GPOINTER_TO_UINT(task);
++}
++
++/* every host image of object id (all variants, all levels and slices) */
++static gboolean match_object(gpointer key, gpointer value, gpointer data)
++{
++    const uint32_t *ti = data;
++    gint64 k = *(gint64 *)key;
++
++    return KEY_TASK(k) == ti[0] && ((uint32_t)k & 0x0fffffffu) == ti[1];
+ }
+ 
+ static gboolean match_task_str(gpointer key, gpointer value, gpointer task)
+@@ -5354,7 +5498,6 @@ void pvg_exec_reset_wait(PVGExec *e)
+ void pvg_exec_object_deleted(PVGExec *e, uint32_t task, uint32_t id)
+ {
+     g_autofree char *prefix = g_strdup_printf("%u:%u:", task, id);
+-    static const uint32_t variants[] = { 0, 0x10000000u, 0x40000000u, 0x80000000u };
+     GHashTableIter it;
+     gpointer k, v;
+     gint64 key = key_of(task, id);
+@@ -5376,10 +5519,10 @@ void pvg_exec_object_deleted(PVGExec *e, uint32_t task, uint32_t id)
+         g_hash_table_remove(e->samplers, &key);
+     }
+     g_hash_table_remove(e->unnorm, &key);
+-    for (size_t i = 0; i < G_N_ELEMENTS(variants); i++) {
+-        gint64 ik = key_of(task, id | variants[i]);
++    {
++        uint32_t ti[2] = { task, id };
+ 
+-        g_hash_table_remove(e->images, &ik);
++        g_hash_table_foreach_remove(e->images, match_object, ti);
+     }
+ }
+ 
+@@ -5457,6 +5600,11 @@ static void image_free(gpointer v)
+         g_ptr_array_remove_fast(free_ctx->priv_imgs, hi);
+     }
+     vkDestroyImageView(d, hi->view, NULL);
++    for (uint32_t l = 0; l < MAX_MIPS; l++) {
++        if (hi->level_view[l]) {
++            vkDestroyImageView(d, hi->level_view[l], NULL);
++        }
++    }
+     vkDestroyImage(d, hi->image, NULL);
+     vkFreeMemory(d, hi->mem, NULL);
+     g_free(hi);
+-- 
+2.43.0
+

@@ -1,0 +1,61 @@
+From a933f06f7fa5beced2ffd4aec3e7c9a2a412c290 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Sat, 31 Oct 2026 12:20:46 +0200
+Subject: [PATCH 72/72] hw/display/pvg: execute on the worker thread by
+ default, with residency and early completion
+
+Command buffers run on the executor thread (outside the BQL and the vCPU
+threads) instead of in the doorbell's MMIO handler. SynchronizeResources
+now drains the worker like the other commands that reach into the
+executor, so private residency and early completion stay on with it.
+
+Mission Control, per 500 cmdbufs: wall 309 -> 242 ms (+28% command
+buffer throughput), executor 199 -> 175 ms; presents/s unchanged within
+noise.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-pci.c | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index a499c82..2ad8a38 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -1774,6 +1774,7 @@ static void pvg_dispatch(PVGLinuxPCIState *s, const PVGCmdHeader *h,
+     case PVG_CMD_DISPLAY_TRANSACTION3: case PVG_CMD_UNMAP_MEMORY: case PVG_CMD_MAP_MEMORY2:
+     case PVG_CMD_DELETE_TASK: case PVG_CMD_DELETE_RESOURCE: case PVG_CMD_DELETE_OBJECT:
+     case PVG_CMD_DEFINE_TASK2: case PVG_CMD_SET_OBJECT_LIST: case 0x3c: /* ReplacePhysical */
++    case 0x35:          /* SynchronizeResources: the executor writes resources back */
+         pvg_exec_drain(s);
+         break;
+     }
+@@ -2224,13 +2225,13 @@ static void pvg_linux_realize(PCIDevice *dev, Error **errp)
+                     pvg_exec_set_dry_run(s->exec, s->exec_dry_run);
+                     pvg_exec_set_damage_limit(s->exec, s->damage_limit);
+                     pvg_exec_set_msaa(s->exec, s->msaa);
+-                    pvg_exec_set_early_complete(s->exec, s->early_complete && !s->async_exec);
++                    pvg_exec_set_early_complete(s->exec, s->early_complete);
+                     if (s->zero_copy && !s->dump_dir &&
+                         !pvg_exec_set_zero_copy(s->exec, true, s->rebar)) {
+                         warn_report("pvg-linux-pci: zero-copy unavailable, using CPU copies");
+                     }
+-                    pvg_exec_set_private_resident(s->exec, s->private_resident &&
+-                                                  !s->async_exec);
++                    /* executor calls from the FIFO (flush, synchronize) drain the worker */
++                    pvg_exec_set_private_resident(s->exec, s->private_resident);
+                     /*
+                      * Upload cache: KVM dirty logging on guest RAM tells which texture pages
+                      * the guest wrote. Not with the async worker (syncing needs the BQL).
+@@ -2338,7 +2339,7 @@ static const Property pvg_linux_properties[] = {
+     /* guestDisplayPortCount (0x122c); only port 0 is implemented */
+     DEFINE_PROP_UINT32("display-ports", PVGLinuxPCIState, display_ports, 1),
+     DEFINE_PROP_BOOL("guest-fixups", PVGLinuxPCIState, guest_fixups_enable, true),
+-    DEFINE_PROP_BOOL("async", PVGLinuxPCIState, async_exec, false),
++    DEFINE_PROP_BOOL("async", PVGLinuxPCIState, async_exec, true),
+     DEFINE_PROP_BOOL("damage-limit", PVGLinuxPCIState, damage_limit, true),
+     DEFINE_PROP_BOOL("msaa", PVGLinuxPCIState, msaa, true),
+     DEFINE_PROP_BOOL("upload-cache", PVGLinuxPCIState, upload_cache, false),
+-- 
+2.43.0
+

@@ -1,0 +1,415 @@
+From 84ed0e192ce75d5ae4a8f6a2ebf86cb1369562dc Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Fri, 30 Oct 2026 01:26:50 +0200
+Subject: [PATCH 49/54] hw/display/pvg: optional asynchronous command buffer
+ execution (async=on)
+
+A worker thread runs ExecIndirect2 command buffers in order; the FIFO stamp is
+published from a bottom half when its jobs finish (stamps never move back).
+Commands that change what the executor reads, or read its output (present,
+map/unmap, deletes, task/object list), drain the worker first. Off by
+default: the guest waits for each command buffer's stamp, so it does not
+change the frame rate yet.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-pci.c | 277 +++++++++++++++++++++++++++++++++----
+ 1 file changed, 247 insertions(+), 30 deletions(-)
+
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index 8f79a78..bee37e0 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -90,6 +90,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(PVGLinuxPCIState, PVG_LINUX_PCI)
+ #define PVG_CMD_GET_DEVICE_INFO     0x3a
+ 
+ #define PVG_ROOT_STAMP_INDEX    0
++#define PVG_MAX_STAMPS          64
+ #define PVG_MAX_TASKS           0x100
+ #define PVG_ROOT_DISPLAY_PAGES  0x900   /* root page: u32 shared state PFN per port */
+ 
+@@ -260,6 +261,27 @@ struct PVGLinuxPCIState {
+     int64_t exec_us, exec_max_us, exec_window_start;   /* executor time per 500 cmdbufs */
+     int64_t exec_read_us, exec_write_us;            /* ... of it copying guest memory */
+     uint64_t exec_read_bytes, exec_write_bytes;
++    /*
++     * Asynchronous execution: ExecIndirect2 queues its command buffers for a worker thread and
++     * the FIFO's stamp is published when the worker is done with them. Commands that change
++     * what the executor reads (mappings, objects, tasks) or read its results (present) drain
++     * the worker first, so it never runs concurrently with them.
++     */
++    bool async_exec;
++    QemuThread exec_thread;
++    QemuMutex exec_lock;
++    QemuCond exec_cond;
++    GQueue exec_jobs;
++    bool exec_busy, exec_stop, exec_thread_started;
++    QEMUBH *exec_bh;
++    uint32_t exec_pending[PVG_MAX_STAMPS];      /* queued/running jobs per stamp index */
++    uint32_t exec_done[PVG_MAX_STAMPS];         /* last completed job stamp */
++    bool exec_done_new[PVG_MAX_STAMPS];
++    uint32_t deferred_stamp[PVG_MAX_STAMPS];    /* FIFO stamp waiting for its jobs */
++    bool deferred_valid[PVG_MAX_STAMPS];
++    uint32_t published[PVG_MAX_STAMPS];
++    int cur_stamp_index;                        /* FIFO being processed, -1 none */
++    uint32_t cur_stamp_value;
+     bool guest_fixups_enable;
+     PVGGuestFixups *guest_fixups;   /* patches for guest-side x86 PVG bugs */
+     QEMUTimer *efi_timer;           /* EFI display scanout while the GOP driver owns the screen */
+@@ -353,6 +375,14 @@ static void pvg_signal_stamp(PVGLinuxPCIState *s, uint32_t index,
+ {
+     uint32_t le = cpu_to_le32(value);
+ 
++    if (index < PVG_MAX_STAMPS) {
++        /* stamps only move forward (a job completion can be older than a FIFO's last stamp) */
++        if (s->published[index] && (int32_t)(value - s->published[index]) < 0) {
++            return;
++        }
++        s->published[index] = value;
++    }
++
+     pci_dma_write(PCI_DEVICE(s), pvg_fifo_base(s) + index * 4, &le, 4);
+     s->stamp_status |= 1u << index;
+     trace_pvg_linux_signal_stamp(index, value);
+@@ -1364,11 +1394,175 @@ static void pvg_parse_cmdbuf(PVGLinuxPCIState *s, uint32_t task,
+  * resources[] (24 B), cmd buffers[] {u64 va, u64 len}}
+  * (-[PGLocalTask doExecIndirect:cmdBuffers:resourceList:...]).
+  */
++typedef struct PVGExecJob {
++    uint32_t task;
++    GPtrArray *bufs;            /* GBytes: command buffers, copied at submission */
++    int stamp_index;            /* FIFO stamp to publish when done, -1 none */
++    uint32_t stamp;
++} PVGExecJob;
++
++static void pvg_exec_job_free(PVGExecJob *job)
++{
++    g_ptr_array_unref(job->bufs);
++    g_free(job);
++}
++
++/* Execute one command buffer; per-500 timing and statistics traces */
++static void pvg_exec_run_buf(PVGLinuxPCIState *s, uint32_t task, const uint8_t *buf,
++                             uint64_t cblen)
++{
++    int64_t t0 = g_get_monotonic_time(), dt;
++
++    pvg_exec_cmdbuf(s->exec, task, buf, cblen);
++    dt = g_get_monotonic_time() - t0;
++    s->exec_us += dt;
++    s->exec_max_us = MAX(s->exec_max_us, dt);
++    if (++s->exec_cmdbufs % 500 == 0) {
++        const PVGExecStats *st = pvg_exec_stats(s->exec);
++
++        trace_pvg_linux_exec_time(s->exec_cmdbufs, s->exec_us / 1000,
++                                  (t0 + dt - s->exec_window_start) / 1000,
++                                  s->exec_max_us, s->exec_read_us / 1000,
++                                  s->exec_read_bytes >> 20, s->exec_write_us / 1000,
++                                  s->exec_write_bytes >> 20, st->gpu_wait_us / 1000);
++        trace_pvg_linux_exec_pipelines(st->pipeline_us / 1000, st->spv_cache_hits);
++        trace_pvg_linux_exec_stats(s->exec_cmdbufs, st->render_passes, st->draws,
++                                   st->skipped_draws, st->pipelines,
++                                   st->pipeline_failures, st->writebacks, st->blits,
++                                   st->feedback_copies, st->dispatches);
++        s->exec_us = s->exec_max_us = s->exec_read_us = s->exec_write_us = 0;
++        s->exec_read_bytes = s->exec_write_bytes = 0;
++        s->exec_window_start = t0 + dt;
++        pvg_exec_reset_wait(s->exec);
++    }
++}
++
++static void *pvg_exec_thread(void *opaque)
++{
++    PVGLinuxPCIState *s = opaque;
++
++    rcu_register_thread();
++    qemu_mutex_lock(&s->exec_lock);
++    for (;;) {
++        PVGExecJob *job;
++
++        while (!s->exec_stop && g_queue_is_empty(&s->exec_jobs)) {
++            qemu_cond_wait(&s->exec_cond, &s->exec_lock);
++        }
++        if (s->exec_stop) {
++            break;
++        }
++        job = g_queue_pop_head(&s->exec_jobs);
++        s->exec_busy = true;
++        qemu_mutex_unlock(&s->exec_lock);
++        for (guint i = 0; i < job->bufs->len; i++) {
++            gsize n;
++            const uint8_t *b = g_bytes_get_data(g_ptr_array_index(job->bufs, i), &n);
++
++            pvg_exec_run_buf(s, job->task, b, n);
++        }
++        qemu_mutex_lock(&s->exec_lock);
++        if (job->stamp_index >= 0) {
++            s->exec_pending[job->stamp_index]--;
++            s->exec_done[job->stamp_index] = job->stamp;
++            s->exec_done_new[job->stamp_index] = true;
++        }
++        s->exec_busy = false;
++        qemu_cond_broadcast(&s->exec_cond);
++        qemu_mutex_unlock(&s->exec_lock);
++        pvg_exec_job_free(job);
++        qemu_bh_schedule(s->exec_bh);       /* stamps and interrupts from the main loop */
++        qemu_mutex_lock(&s->exec_lock);
++    }
++    qemu_mutex_unlock(&s->exec_lock);
++    rcu_unregister_thread();
++    return NULL;
++}
++
++/* main loop: publish the stamps of finished jobs (or the FIFO stamp they held back) */
++static void pvg_exec_bh(void *opaque)
++{
++    PVGLinuxPCIState *s = opaque;
++
++    for (int i = 0; i < PVG_MAX_STAMPS; i++) {
++        uint32_t value;
++        bool fire = false;
++
++        qemu_mutex_lock(&s->exec_lock);
++        if (s->exec_done_new[i]) {
++            s->exec_done_new[i] = false;
++            fire = true;
++            value = s->exec_done[i];
++            if (!s->exec_pending[i] && s->deferred_valid[i]) {
++                value = s->deferred_stamp[i];
++                s->deferred_valid[i] = false;
++            }
++        }
++        qemu_mutex_unlock(&s->exec_lock);
++        if (fire) {
++            pvg_signal_stamp(s, i, value);
++        }
++    }
++}
++
++static void pvg_exec_submit(PVGLinuxPCIState *s, PVGExecJob *job)
++{
++    job->stamp_index = s->cur_stamp_index;
++    job->stamp = s->cur_stamp_value;
++    if (!s->async_exec || !s->exec_thread_started) {
++        for (guint i = 0; i < job->bufs->len; i++) {
++            gsize n;
++            const uint8_t *b = g_bytes_get_data(g_ptr_array_index(job->bufs, i), &n);
++
++            pvg_exec_run_buf(s, job->task, b, n);
++        }
++        pvg_exec_job_free(job);
++        return;
++    }
++    qemu_mutex_lock(&s->exec_lock);
++    if (job->stamp_index >= 0) {
++        s->exec_pending[job->stamp_index]++;
++    }
++    g_queue_push_tail(&s->exec_jobs, job);
++    qemu_cond_broadcast(&s->exec_cond);
++    qemu_mutex_unlock(&s->exec_lock);
++}
++
++/* wait until the worker has executed everything queued */
++static void pvg_exec_drain(PVGLinuxPCIState *s)
++{
++    if (!s->exec_thread_started) {
++        return;
++    }
++    qemu_mutex_lock(&s->exec_lock);
++    while (!g_queue_is_empty(&s->exec_jobs) || s->exec_busy) {
++        qemu_cond_wait(&s->exec_cond, &s->exec_lock);
++    }
++    qemu_mutex_unlock(&s->exec_lock);
++}
++
++/* publish a FIFO's stamp now, or when the jobs it queued are done */
++static void pvg_publish_fifo_stamp(PVGLinuxPCIState *s, uint32_t index, uint32_t stamp)
++{
++    if (index < PVG_MAX_STAMPS && s->exec_thread_started) {
++        qemu_mutex_lock(&s->exec_lock);
++        if (s->exec_pending[index]) {
++            s->deferred_stamp[index] = stamp;
++            s->deferred_valid[index] = true;
++            qemu_mutex_unlock(&s->exec_lock);
++            return;
++        }
++        qemu_mutex_unlock(&s->exec_lock);
++    }
++    pvg_signal_stamp(s, index, stamp);
++}
++
+ static void pvg_cmd_exec_indirect2(PVGLinuxPCIState *s, const uint8_t *p,
+                                    uint32_t len)
+ {
+     uint32_t task, nres, ncb;
+     const uint8_t *cbs;
++    PVGExecJob *job = NULL;
+ 
+     if (len < 12) {
+         return;
+@@ -1408,36 +1602,17 @@ static void pvg_cmd_exec_indirect2(PVGLinuxPCIState *s, const uint8_t *p,
+         }
+         pvg_parse_cmdbuf(s, task, buf, cblen);
+         if (s->exec) {
+-            int64_t t0 = g_get_monotonic_time(), dt;
+-
+-            pvg_exec_cmdbuf(s->exec, task, buf, cblen);
+-            dt = g_get_monotonic_time() - t0;
+-            s->exec_us += dt;
+-            s->exec_max_us = MAX(s->exec_max_us, dt);
+-            if (++s->exec_cmdbufs % 500 == 0) {
+-                trace_pvg_linux_exec_time(s->exec_cmdbufs, s->exec_us / 1000,
+-                                          (t0 + dt - s->exec_window_start) / 1000,
+-                                          s->exec_max_us, s->exec_read_us / 1000,
+-                                          s->exec_read_bytes >> 20, s->exec_write_us / 1000,
+-                                          s->exec_write_bytes >> 20,
+-                                          pvg_exec_stats(s->exec)->gpu_wait_us / 1000);
+-                trace_pvg_linux_exec_pipelines(pvg_exec_stats(s->exec)->pipeline_us / 1000,
+-                                               pvg_exec_stats(s->exec)->spv_cache_hits);
+-                s->exec_us = s->exec_max_us = s->exec_read_us = s->exec_write_us = 0;
+-                s->exec_read_bytes = s->exec_write_bytes = 0;
+-                s->exec_window_start = t0 + dt;
+-                pvg_exec_reset_wait(s->exec);
+-            }
+-            if (s->exec_cmdbufs % 500 == 0) {
+-                const PVGExecStats *st = pvg_exec_stats(s->exec);
+-
+-                trace_pvg_linux_exec_stats(s->exec_cmdbufs, st->render_passes, st->draws,
+-                                           st->skipped_draws, st->pipelines,
+-                                           st->pipeline_failures, st->writebacks, st->blits,
+-                                           st->feedback_copies, st->dispatches);
++            if (!job) {
++                job = g_new0(PVGExecJob, 1);
++                job->task = task;
++                job->bufs = g_ptr_array_new_with_free_func((GDestroyNotify)g_bytes_unref);
+             }
++            g_ptr_array_add(job->bufs, g_bytes_new_take(g_steal_pointer(&buf), cblen));
+         }
+     }
++    if (job) {
++        pvg_exec_submit(s, job);
++    }
+ }
+ 
+ /* CmdDefineChildFIFO, non-restoring path of -[PGChildFIFO initWithDevice:...] */
+@@ -1462,6 +1637,13 @@ static void pvg_cmd_define_child_fifo(PVGLinuxPCIState *s, const uint8_t *p,
+ static void pvg_dispatch(PVGLinuxPCIState *s, const PVGCmdHeader *h,
+                          const uint8_t *payload, uint32_t len)
+ {
++    switch (h->opcode) {
++    case PVG_CMD_DISPLAY_TRANSACTION3: case PVG_CMD_UNMAP_MEMORY: case PVG_CMD_MAP_MEMORY2:
++    case PVG_CMD_DELETE_TASK: case PVG_CMD_DELETE_RESOURCE: case PVG_CMD_DELETE_OBJECT:
++    case PVG_CMD_DEFINE_TASK2: case PVG_CMD_SET_OBJECT_LIST: case 0x3c: /* ReplacePhysical */
++        pvg_exec_drain(s);
++        break;
++    }
+     switch (h->opcode) {
+     case PVG_CMD_DISPLAY_SET_SHARED_STATE_PAGE:
+         pvg_cmd_display_set_state_page(s, payload, len);
+@@ -1603,7 +1785,8 @@ static bool pvg_fifo_run(PVGLinuxPCIState *s, uint32_t fifo,
+             trace_pvg_linux_cmd(fifo, *head, h.opcode, h.barrier_count,
+                                 h.length, h.stamp_value, words->str);
+         }
+-        /* barriers wait for other FIFOs' stamps; nothing else runs yet */
++        /* barriers wait for other FIFOs' stamps: the guest never uses them so far */
++        s->cur_stamp_value = h.stamp_value;
+         pvg_dispatch(s, &h, s->payload, len);
+         *head += h.length;
+         *last_stamp = h.stamp_value;
+@@ -1632,10 +1815,12 @@ static void pvg_root_fifo_process(PVGLinuxPCIState *s, uint32_t written)
+     }
+     /* root offsets are ring positions, not monotonic counters */
+     written = head + (written + v->length - head % v->length) % v->length;
++    s->cur_stamp_index = PVG_ROOT_STAMP_INDEX;
+     ran = pvg_fifo_run(s, 0, v, &head, written, &stamp);
++    s->cur_stamp_index = -1;
+     s->regs[PVG_REG_FIFO_READ / 4] = head % v->length;
+     if (ran) {
+-        pvg_signal_stamp(s, PVG_ROOT_STAMP_INDEX, stamp);
++        pvg_publish_fifo_stamp(s, PVG_ROOT_STAMP_INDEX, stamp);
+     }
+ }
+ 
+@@ -1660,11 +1845,13 @@ static void pvg_child_fifo_process(PVGLinuxPCIState *s, uint32_t index)
+     lduw_le_pci_dma(PCI_DEVICE(s), node + PVG_NODE_STAMP_INDEX, &stamp_index,
+                     MEMTXATTRS_UNSPECIFIED);
+     trace_pvg_linux_child_poke(index, written, head, v->length);
++    s->cur_stamp_index = stamp_index < PVG_MAX_STAMPS ? stamp_index : -1;
+     if (pvg_fifo_run(s, index, v, &head, written, &stamp)) {
+         stl_le_pci_dma(PCI_DEVICE(s), node + PVG_NODE_READ, head,
+                        MEMTXATTRS_UNSPECIFIED);
+-        pvg_signal_stamp(s, stamp_index, stamp);
++        pvg_publish_fifo_stamp(s, stamp_index, stamp);
+     }
++    s->cur_stamp_index = -1;
+ }
+ 
+ static uint64_t pvg_linux_mmio_read(void *opaque, hwaddr addr, unsigned size)
+@@ -1846,6 +2033,7 @@ static void pvg_linux_realize(PCIDevice *dev, Error **errp)
+     if (msi_init(dev, 0, s->msi_vectors, true, false, errp)) {
+         return;
+     }
++    s->cur_stamp_index = -1;
+     if (s->guest_fixups_enable) {
+         s->guest_fixups = pvg_guest_fixups_start(pvg_exec_log, s);
+     }
+@@ -1879,6 +2067,14 @@ static void pvg_linux_realize(PCIDevice *dev, Error **errp)
+                 }
+                 if (!s->exec) {
+                     warn_report("pvg-linux-pci: Metal executor initialisation failed");
++                } else if (s->async_exec) {
++                    qemu_mutex_init(&s->exec_lock);
++                    qemu_cond_init(&s->exec_cond);
++                    g_queue_init(&s->exec_jobs);
++                    s->exec_bh = qemu_bh_new(pvg_exec_bh, s);
++                    qemu_thread_create(&s->exec_thread, "pvg-exec", pvg_exec_thread, s,
++                                       QEMU_THREAD_JOINABLE);
++                    s->exec_thread_started = true;
+                 }
+             }
+         }
+@@ -1890,6 +2086,16 @@ static void pvg_linux_exit(PCIDevice *dev)
+     PVGLinuxPCIState *s = PVG_LINUX_PCI(dev);
+ 
+     msi_uninit(dev);
++    if (s->exec_thread_started) {
++        pvg_exec_drain(s);
++        qemu_mutex_lock(&s->exec_lock);
++        s->exec_stop = true;
++        qemu_cond_broadcast(&s->exec_cond);
++        qemu_mutex_unlock(&s->exec_lock);
++        qemu_thread_join(&s->exec_thread);
++        qemu_bh_delete(s->exec_bh);
++        s->exec_thread_started = false;
++    }
+     if (s->exec) {
+         pvg_exec_free(s->exec);
+         s->exec = NULL;
+@@ -1915,6 +2121,16 @@ static void pvg_linux_reset(DeviceState *dev)
+ {
+     PVGLinuxPCIState *s = PVG_LINUX_PCI(dev);
+ 
++    pvg_exec_drain(s);
++    if (s->exec_thread_started) {
++        qemu_mutex_lock(&s->exec_lock);
++        memset(s->exec_pending, 0, sizeof(s->exec_pending));
++        memset(s->exec_done_new, 0, sizeof(s->exec_done_new));
++        memset(s->deferred_valid, 0, sizeof(s->deferred_valid));
++        qemu_mutex_unlock(&s->exec_lock);
++    }
++    memset(s->published, 0, sizeof(s->published));
++    s->cur_stamp_index = -1;
+     memset(s->regs, 0, s->mmio_size);
+     s->irq_status = 0;
+     s->stamp_status = 0;
+@@ -1937,6 +2153,7 @@ static const Property pvg_linux_properties[] = {
+     /* guestDisplayPortCount (0x122c); only port 0 is implemented */
+     DEFINE_PROP_UINT32("display-ports", PVGLinuxPCIState, display_ports, 1),
+     DEFINE_PROP_BOOL("guest-fixups", PVGLinuxPCIState, guest_fixups_enable, true),
++    DEFINE_PROP_BOOL("async", PVGLinuxPCIState, async_exec, false),
+     DEFINE_PROP_BOOL("gpu", PVGLinuxPCIState, gpu_enable, true),
+     DEFINE_PROP_BOOL("gpu-validation", PVGLinuxPCIState, gpu_validation, false),
+     DEFINE_PROP_BOOL("exec", PVGLinuxPCIState, exec_enable, true),
+-- 
+2.43.0
+

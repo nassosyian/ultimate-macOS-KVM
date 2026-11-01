@@ -1,0 +1,1039 @@
+From 2cf55e10166d6a198456121ae8ff283e072ec28b Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 17:57:55 +0200
+Subject: [PATCH 30/54] hw/display/pvg: compute kernels and dispatch
+
+air2spv: air.kernel entries (GLCompute, LocalSizeId from spec constants
+1..3), thread/threadgroup/simd builtins, writable textures as storage
+images (write_texture, read on read_write), constant texel offsets on
+samples, writable-buffer mask, and an entry guard against a push-constant
+grid size (dispatchThreads launches partial threadgroups in Metal).
+Executor: compute pipelines (type 7 kind 0xb, key 0 = kernel), compute
+segments (SetPipelineState/SetBuffers/SetBufferOffset/SetTextures/
+SetSamplers/DispatchThreadgroups/DispatchThreads), storage images and
+writable buffers written back to guest memory; storage-capable host images.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-pci.c |   2 +-
+ hw/display/pvg/air2spv.c   | 248 ++++++++++++++++++++--
+ hw/display/pvg/air2spv.h   |  10 +-
+ hw/display/pvg/pvg-exec.c  | 419 ++++++++++++++++++++++++++++++++++++-
+ hw/display/pvg/pvg-exec.h  |   1 +
+ hw/display/pvg/pvg-gpu.c   |   2 +
+ hw/display/pvg/spv.h       |  10 +-
+ hw/display/trace-events    |   2 +-
+ 8 files changed, 666 insertions(+), 28 deletions(-)
+
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index 78412ad..30a183a 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -1366,7 +1366,7 @@ static void pvg_cmd_exec_indirect2(PVGLinuxPCIState *s, const uint8_t *p,
+                 trace_pvg_linux_exec_stats(s->exec_cmdbufs, st->render_passes, st->draws,
+                                            st->skipped_draws, st->pipelines,
+                                            st->pipeline_failures, st->writebacks, st->blits,
+-                                           st->feedback_copies);
++                                           st->feedback_copies, st->dispatches);
+             }
+         }
+     }
+diff --git a/hw/display/pvg/air2spv.c b/hw/display/pvg/air2spv.c
+index c69a8b5..0e622b1 100644
+--- a/hw/display/pvg/air2spv.c
++++ b/hw/display/pvg/air2spv.c
+@@ -27,6 +27,9 @@ enum ArgKind {
+     ARG_NONE, ARG_BUFFER, ARG_TEXTURE, ARG_SAMPLER, ARG_POSITION, ARG_VARYING,
+     ARG_VERTEX_ID, ARG_INSTANCE_ID, ARG_FRONT_FACING, ARG_SAMPLE_ID, ARG_VERTEX_INPUT,
+     ARG_POINT_COORD,
++    /* kernel builtins */
++    ARG_GLOBAL_ID, ARG_LOCAL_ID, ARG_GROUP_ID, ARG_GROUPS, ARG_LOCAL_INDEX, ARG_THREADS_PER_GROUP,
++    ARG_GRID_SIZE, ARG_SIMD_LANE, ARG_SIMD_GROUP, ARG_SIMD_SIZE,
+ };
+ 
+ enum Interp { INTERP_PERSPECTIVE, INTERP_NOPERSPECTIVE, INTERP_FLAT };
+@@ -39,6 +42,7 @@ typedef struct Arg {
+     char tex_type[64];          /* e.g. "texture2d<float, sample>" */
+     uint32_t var;               /* SPIR-V variable */
+     uint32_t io_type;           /* variable's type when widened from 8/16 bits, else 0 */
++    bool writable;              /* texture / buffer with air.write or air.read_write access */
+ } Arg;
+ 
+ typedef struct Resource {       /* texture/sampler handle reached through an LLVM value */
+@@ -48,6 +52,7 @@ typedef struct Resource {       /* texture/sampler handle reached through an LLV
+     uint32_t dim;
+     bool arrayed;
+     int slot;                   /* sampler argument index, -1 for constant samplers */
++    bool storage;               /* texture bound as a storage image */
+     uint64_t state;             /* constant sampler: AIR sampler state word */
+ } Resource;
+ 
+@@ -75,6 +80,8 @@ typedef struct Ctx {
+     uint32_t t_void, t_bool, t_u32, t_u64, t_f32;
+     uint32_t pc_var, pc_elem_ptr;
+     uint32_t unnorm_spec;       /* OpSpecConstant A2S_SPEC_UNNORMALIZED, 0 = not yet */
++    uint32_t local_size[3];     /* kernels: spec constants A2S_SPEC_LOCAL_X..Z */
++    uint32_t pc_grid_ptr;       /* kernels: pointer type to the push-constant grid size */
+     uint32_t out_vars[16];      /* fragment render targets / vertex outputs */
+     uint32_t out_io_type[16];   /* widened type of an output, 0 = as declared */
+     int nout;
+@@ -395,6 +402,7 @@ static int parse_entry(Ctx *c)
+ {
+     static const struct { const char *name; int stage; } kinds[] = {
+         { "air.vertex", A2S_STAGE_VERTEX }, { "air.fragment", A2S_STAGE_FRAGMENT },
++        { "air.kernel", A2S_STAGE_COMPUTE },
+     };
+     LLVMValueRef node = NULL, ops[8], argnodes[MAX_ARGS];
+     int nargs;
+@@ -410,7 +418,7 @@ static int parse_entry(Ctx *c)
+         }
+     }
+     if (!node) {
+-        return fail(c, "no air.vertex/air.fragment entry (kernels unsupported)");
++        return fail(c, "no air.vertex/air.fragment/air.kernel entry");
+     }
+     md_ops(node, ops, 8);
+     c->fn = ops[0];
+@@ -437,7 +445,28 @@ static int parse_entry(Ctx *c)
+         arg = &c->args[idx];
+         p = md_find(a, n, "air.location_index");
+         arg->index = p >= 0 && p + 1 < n ? md_int(a[p + 1]) : 0;
+-        if (!strcmp(kind, "air.buffer")) {
++        static const struct { const char *name; int kind; } kernel_builtins[] = {
++            { "air.thread_position_in_grid", ARG_GLOBAL_ID },
++            { "air.thread_position_in_threadgroup", ARG_LOCAL_ID },
++            { "air.threadgroup_position_in_grid", ARG_GROUP_ID },
++            { "air.threadgroups_per_grid", ARG_GROUPS },
++            { "air.thread_index_in_threadgroup", ARG_LOCAL_INDEX },
++            { "air.threads_per_threadgroup", ARG_THREADS_PER_GROUP },
++            { "air.threads_per_grid", ARG_GRID_SIZE },
++            { "air.thread_index_in_simdgroup", ARG_SIMD_LANE },
++            { "air.simdgroup_index_in_threadgroup", ARG_SIMD_GROUP },
++            { "air.threads_per_simdgroup", ARG_SIMD_SIZE },
++        };
++
++        arg->writable = md_find(a, n, "air.write") >= 0 || md_find(a, n, "air.read_write") >= 0;
++        for (size_t k = 0; k < sizeof(kernel_builtins) / sizeof(kernel_builtins[0]); k++) {
++            if (!strcmp(kind, kernel_builtins[k].name)) {
++                arg->kind = kernel_builtins[k].kind;
++            }
++        }
++        if (arg->kind != ARG_NONE) {
++            continue;
++        } else if (!strcmp(kind, "air.buffer")) {
+             arg->kind = ARG_BUFFER;
+         } else if (!strcmp(kind, "air.texture")) {
+             arg->kind = ARG_TEXTURE;
+@@ -523,7 +552,7 @@ static uint32_t builtin_var(Ctx *c, uint32_t sc, uint32_t type, uint32_t builtin
+     return v;
+ }
+ 
+-static uint32_t image_type(Ctx *c, const char *tname, uint32_t *dim, bool *arrayed)
++static uint32_t image_type(Ctx *c, const char *tname, uint32_t *dim, bool *arrayed, bool storage)
+ {
+     uint32_t ops[8];
+     bool depth = !strncmp(tname, "depth", 5);
+@@ -545,8 +574,15 @@ static uint32_t image_type(Ctx *c, const char *tname, uint32_t *dim, bool *array
+     ops[2] = depth ? 1 : 0;
+     ops[3] = *arrayed;
+     ops[4] = strstr(tname, "_ms") ? 1 : 0;
+-    ops[5] = 1;                 /* sampled */
++    ops[5] = storage ? 2 : 1;   /* sampled / storage image */
+     ops[6] = 0;                 /* format unknown */
++    if (storage) {
++        spv_capability(&c->m, SpvCapabilityStorageImageReadWithoutFormat);
++        spv_capability(&c->m, SpvCapabilityStorageImageWriteWithoutFormat);
++        if (*dim == SpvDim1D) {
++            spv_capability(&c->m, SpvCapabilityImage1D);
++        }
++    }
+     return spv_type(&c->m, SpvOpTypeImage, ops, 7);
+ }
+ 
+@@ -595,6 +631,43 @@ static uint32_t io_convert(Ctx *c, uint32_t v, LLVMTypeRef t, uint32_t to)
+                 to, 0, &v, 1);
+ }
+ 
++/* kernels: threads per threadgroup as spec constants A2S_SPEC_LOCAL_X..Z (default 1) */
++static void declare_local_size(Ctx *c)
++{
++    for (int i = 0; i < 3; i++) {
++        uint32_t sc[3] = { c->t_u32, spv_id(&c->m), 1 };
++
++        spv_emit(&c->m, SPV_SEC_TYPES, SpvOpSpecConstant, sc, 3);
++        decorate1(c, sc[1], SpvDecorationSpecId, A2S_SPEC_LOCAL_X + i);
++        c->local_size[i] = sc[1];
++    }
++}
++
++/* a uvec3 (or u32 when src_n == 1) kernel builtin as the AIR parameter's type */
++static uint32_t kernel_builtin_value(Ctx *c, uint32_t v, int src_n, LLVMTypeRef t)
++{
++    LLVMTypeRef et = LLVMGetTypeKind(t) == LLVMVectorTypeKind ? LLVMGetElementType(t) : t;
++    int n = LLVMGetTypeKind(t) == LLVMVectorTypeKind ? (int)LLVMGetVectorSize(t) : 1;
++    unsigned w = LLVMGetIntTypeWidth(et);
++    uint32_t ops[5];
++
++    if (n == 1 && src_n == 3) {
++        ops[0] = v;
++        ops[1] = 0;
++        v = emit(c, SpvOpCompositeExtract, c->t_u32, 0, ops, 2);
++    } else if (n == 2 && src_n == 3) {
++        ops[0] = v;
++        ops[1] = v;
++        ops[2] = 0;
++        ops[3] = 1;
++        v = emit(c, SpvOpVectorShuffle, spv_type_vec(&c->m, c->t_u32, 2), 0, ops, 4);
++    }
++    if (w != 32) {
++        v = emit(c, SpvOpUConvert, ty(c, t), 0, &v, 1);
++    }
++    return v;
++}
++
+ static int setup_interface(Ctx *c)
+ {
+     int max_buf = -1, nconst = 0;
+@@ -607,17 +680,32 @@ static int setup_interface(Ctx *c)
+     if (max_buf >= A2S_MAX_BUFFERS) {
+         return fail(c, "buffer index %d beyond the push table", max_buf);
+     }
+-    if (max_buf >= 0) {
+-        uint32_t arr_ops[2] = { c->t_u64, spv_const_u32(&c->m, max_buf + 1) };
++    if (c->stage == A2S_STAGE_COMPUTE) {
++        declare_local_size(c);
++    }
++    if (max_buf >= 0 || c->stage == A2S_STAGE_COMPUTE) {
++        /* {u64 buffer table[] at push_base}, kernels also {uvec3 grid at A2S_PUSH_GRID} */
++        uint32_t members[2], nm = 0, blk;
++        uint32_t arr_ops[2] = { c->t_u64, spv_const_u32(&c->m, (max_buf > 0 ? max_buf : 0) + 1) };
+         uint32_t arr = spv_type(&c->m, SpvOpTypeArray, arr_ops, 2);
+-        uint32_t blk = spv_type(&c->m, SpvOpTypeStruct, &arr, 1);
++        uint32_t uv3 = spv_type_vec(&c->m, c->t_u32, 3);
+ 
+         decorate1(c, arr, SpvDecorationArrayStride, 8);
++        members[nm++] = arr;
++        if (c->stage == A2S_STAGE_COMPUTE) {
++            members[nm++] = uv3;
++        }
++        blk = spv_type(&c->m, SpvOpTypeStruct, members, nm);
+         spv_decorate(&c->m, blk, SpvDecorationBlock, NULL, 0);
+         spv_member_decorate(&c->m, blk, 0, SpvDecorationOffset, c->res->push_base);
+         c->pc_var = global_var(c, SpvStoragePushConstant, blk);
+         c->pc_elem_ptr = spv_type_ptr(&c->m, SpvStoragePushConstant, c->t_u64);
+-        c->res->push_size = c->res->push_base + 8 * (max_buf + 1);
++        c->res->push_size = c->res->push_base + 8 * ((max_buf > 0 ? max_buf : 0) + 1);
++        if (c->stage == A2S_STAGE_COMPUTE) {
++            spv_member_decorate(&c->m, blk, 1, SpvDecorationOffset, A2S_PUSH_GRID);
++            c->pc_grid_ptr = spv_type_ptr(&c->m, SpvStoragePushConstant, uv3);
++            c->res->push_size = A2S_PUSH_GRID + 12;
++        }
+     }
+     for (int i = 0; i < c->nargs; i++) {
+         Arg *a = &c->args[i];
+@@ -626,12 +714,46 @@ static int setup_interface(Ctx *c)
+         switch (a->kind) {
+         case ARG_BUFFER:
+             c->res->buffer_mask |= 1u << a->index;
++            if (a->writable) {
++                c->res->buffer_write_mask |= 1u << a->index;
++            }
++            break;
++        case ARG_GLOBAL_ID: case ARG_LOCAL_ID: case ARG_GROUP_ID: case ARG_GROUPS:
++        case ARG_LOCAL_INDEX: case ARG_SIMD_LANE: case ARG_SIMD_GROUP: case ARG_SIMD_SIZE: {
++            static const uint32_t bi[] = {
++                [ARG_GLOBAL_ID] = SpvBuiltInGlobalInvocationId,
++                [ARG_LOCAL_ID] = SpvBuiltInLocalInvocationId,
++                [ARG_GROUP_ID] = SpvBuiltInWorkgroupId, [ARG_GROUPS] = SpvBuiltInNumWorkgroups,
++                [ARG_LOCAL_INDEX] = SpvBuiltInLocalInvocationIndex,
++                [ARG_SIMD_LANE] = SpvBuiltInSubgroupLocalInvocationId,
++                [ARG_SIMD_GROUP] = SpvBuiltInSubgroupId, [ARG_SIMD_SIZE] = SpvBuiltInSubgroupSize,
++            };
++            bool scalar = a->kind == ARG_LOCAL_INDEX || a->kind >= ARG_SIMD_LANE;
++
++            if (c->stage != A2S_STAGE_COMPUTE) {
++                return fail(c, "kernel builtin outside a kernel");
++            }
++            if (a->kind >= ARG_SIMD_LANE) {
++                spv_capability(&c->m, SpvCapabilityGroupNonUniform);
++            }
++            a->var = builtin_var(c, SpvStorageInput, scalar ? c->t_u32 :
++                                 spv_type_vec(&c->m, c->t_u32, 3), bi[a->kind]);
+             break;
++        }
++        case ARG_THREADS_PER_GROUP: case ARG_GRID_SIZE:
++            if (c->stage != A2S_STAGE_COMPUTE) {
++                return fail(c, "kernel builtin outside a kernel");
++            }
++            break;      /* computed from the local-size spec constants / grid push constant */
+         case ARG_TEXTURE: {
+             Resource *r = &c->rsrc[c->nrsrc++];
+ 
+             r->key = LLVMGetParam(c->fn, i);
+-            r->type = image_type(c, a->tex_type, &r->dim, &r->arrayed);
++            r->storage = a->writable;
++            r->type = image_type(c, a->tex_type, &r->dim, &r->arrayed, r->storage);
++            if (r->storage) {
++                c->res->storage_mask |= 1u << a->index;
++            }
+             r->var = global_var(c, SpvStorageUniformConstant, r->type);
+             decorate1(c, r->var, SpvDecorationDescriptorSet, 0);
+             decorate1(c, r->var, SpvDecorationBinding, A2S_TEXTURE_BINDING + a->index);
+@@ -1286,14 +1408,17 @@ static int texture_call(Ctx *c, LLVMValueRef call, const char *name, uint32_t re
+         if (arrayed || tex->dim != SpvDim2D) {
+             return fail(c, "unsupported read_texture variant %s", name);
+         }
+-        texel = emit(c, SpvOpImageFetch, v4, 0, ops, 4);
++        /* storage images (read_write textures) read without a sampler or level */
++        texel = tex->storage ? emit(c, SpvOpImageRead, v4, 0, ops, 2) :
++                emit(c, SpvOpImageFetch, v4, 0, ops, 4);
+     } else {
+         /* sample(tex, smp, coord, [array], i1, offset, i1 is_level, f32 lod_bias, f32 min_lod, i32) */
+         Resource *smp = resource_for(c, LLVMGetOperand(call, 1));
+         unsigned a = 2;
+         uint32_t coord = val(c, LLVMGetOperand(call, a++)), sampler, sampled, si_ty, ops[8];
+-        LLVMValueRef lod_arg, level_flag;
+-        bool explicit_lod;
++        LLVMValueRef lod_arg, level_flag, offset_arg;
++        bool explicit_lod, offset;
++        uint32_t mask = 0, nops = 2;
+ 
+         if (!smp || !smp->is_sampler) {
+             return fail(c, "sample with unknown sampler");
+@@ -1348,7 +1473,8 @@ static int texture_call(Ctx *c, LLVMValueRef call, const char *name, uint32_t re
+             coord = emit(c, SpvOpCompositeConstruct, spv_type_vec(&c->m, c->t_f32, cn + 1), 0,
+                          cops, 2);
+         }
+-        a += 2;     /* i1, offset */
++        offset_arg = LLVMGetOperand(call, a + 1);   /* after an i1 */
++        a += 2;
+         level_flag = LLVMGetOperand(call, a++);
+         lod_arg = LLVMGetOperand(call, a++);
+         explicit_lod = LLVMIsAConstantInt(level_flag) && LLVMConstIntGetZExtValue(level_flag);
+@@ -1360,19 +1486,27 @@ static int texture_call(Ctx *c, LLVMValueRef call, const char *name, uint32_t re
+         ops[0] = image;
+         ops[1] = sampler;
+         sampled = emit(c, SpvOpSampledImage, si_ty, 0, ops, 2);
++        /* image operands go in bit order: Bias / Lod, then ConstOffset */
++        offset = LLVMIsConstant(offset_arg) && !LLVMIsNull(offset_arg);
+         ops[0] = sampled;
+         ops[1] = coord;
+         if (explicit_lod || c->stage != A2S_STAGE_FRAGMENT) {
+-            ops[2] = SpvImageOperandsLod;
++            mask = SpvImageOperandsLod;
+             ops[3] = explicit_lod ? val(c, lod_arg) : spv_const_f32(&c->m, 0);
+-            texel = emit(c, SpvOpImageSampleExplicitLod, v4, 0, ops, 4);
+-        } else if (LLVMIsAConstantFP(lod_arg) && LLVMIsNull(lod_arg)) {
+-            texel = emit(c, SpvOpImageSampleImplicitLod, v4, 0, ops, 2);
+-        } else {
+-            ops[2] = SpvImageOperandsBias;
++            nops = 4;
++        } else if (!(LLVMIsAConstantFP(lod_arg) && LLVMIsNull(lod_arg))) {
++            mask = SpvImageOperandsBias;
+             ops[3] = val(c, lod_arg);
+-            texel = emit(c, SpvOpImageSampleImplicitLod, v4, 0, ops, 4);
++            nops = 4;
++        }
++        if (offset) {
++            mask |= SpvImageOperandsConstOffset;
++            ops[nops == 2 ? 3 : 4] = const_val(c, offset_arg);
++            nops = nops == 2 ? 4 : 5;
+         }
++        ops[2] = mask;
++        texel = emit(c, mask & SpvImageOperandsLod ? SpvOpImageSampleExplicitLod :
++                     SpvOpImageSampleImplicitLod, v4, 0, ops, mask ? nops : 2);
+     }
+     if (narrow) {
+         texel = emit(c, SpvOpFConvert, ty(c, vty), 0, &texel, 1);
+@@ -1432,6 +1566,25 @@ static int call_inst(Ctx *c, LLVMValueRef call, uint32_t result)
+     dot = strchr(full, '.');
+     snprintf(base, sizeof(base), "%.*s", dot ? (int)(dot - full) : (int)strlen(full), full);
+ 
++    if (!strncmp(base, "write_texture", 13)) {
++        /* write_texture_2d(tex, int2 coord, value, i32 lod, i32 access) */
++        Resource *tex = resource_for(c, LLVMGetOperand(call, 0));
++        LLVMTypeRef vt = LLVMTypeOf(LLVMGetOperand(call, 2));
++        uint32_t ops[3];
++
++        if (!tex || !tex->storage || tex->arrayed || tex->dim != SpvDim2D) {
++            return fail(c, "unsupported %s", base);
++        }
++        ops[0] = load_resource(c, tex);
++        ops[1] = val(c, LLVMGetOperand(call, 1));
++        ops[2] = val(c, LLVMGetOperand(call, 2));
++        if (LLVMGetTypeKind(LLVMGetElementType(vt)) == LLVMHalfTypeKind) {
++            ops[2] = emit(c, SpvOpFConvert, spv_type_vec(&c->m, c->t_f32, LLVMGetVectorSize(vt)),
++                          0, &ops[2], 1);
++        }
++        spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpImageWrite, ops, 3);
++        return 0;
++    }
+     if (!strncmp(base, "sample_texture", 14) || !strncmp(base, "read_texture", 12)) {
+         return texture_call(c, call, base, result);
+     }
+@@ -2325,11 +2478,40 @@ static int translate_function(Ctx *c)
+     ops[3] = fn_ty;
+     spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpFunction, ops, 4);
+ 
++    if (c->stage == A2S_STAGE_COMPUTE && !c->err[0]) {
++        /*
++         * Metal's dispatchThreads launches partial threadgroups; Vulkan launches whole ones.
++         * Threads beyond the grid (push constant) return before the AIR entry block.
++         */
++        uint32_t pro = spv_id(&c->m), ret = spv_id(&c->m), bb0 = label(c, g.bb[0]);
++        uint32_t uv3 = spv_type_vec(&c->m, c->t_u32, 3), gid_var, gops[3], gid, grid, cond;
++        uint32_t idx[2] = { c->pc_var, spv_const_u32(&c->m, 1) };
++
++        spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpLabel, &pro, 1);
++        declare_allocas(c);     /* a failure sets c->err and stops the block loop below */
++        gid_var = builtin_var(c, SpvStorageInput, uv3, SpvBuiltInGlobalInvocationId);
++        gid = emit(c, SpvOpLoad, uv3, 0, &gid_var, 1);
++        gops[0] = emit(c, SpvOpAccessChain, c->pc_grid_ptr, 0, idx, 2);
++        grid = emit(c, SpvOpLoad, uv3, 0, gops, 1);
++        gops[0] = gid;
++        gops[1] = grid;
++        cond = emit(c, SpvOpUGreaterThanEqual, spv_type_vec(&c->m, c->t_bool, 3), 0, gops, 2);
++        cond = emit(c, SpvOpAny, c->t_bool, 0, &cond, 1);
++        gops[0] = bb0;
++        gops[1] = 0;
++        spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpSelectionMerge, gops, 2);
++        gops[0] = cond;
++        gops[1] = ret;
++        gops[2] = bb0;
++        spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpBranchConditional, gops, 3);
++        spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpLabel, &ret, 1);
++        spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpReturn, NULL, 0);
++    }
+     for (int i = 0; i < g.n && !c->err[0]; i++) {
+         uint32_t l = label(c, g.bb[i]);
+ 
+         spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpLabel, &l, 1);
+-        if (i == 0 && declare_allocas(c)) {
++        if (i == 0 && c->stage != A2S_STAGE_COMPUTE && declare_allocas(c)) {
+             break;
+         }
+         if (i == 0) {
+@@ -2346,6 +2528,23 @@ static int translate_function(Ctx *c)
+ 
+                     (void)aops;
+                     vset(c, p, emit(c, SpvOpLoad, c->t_u64, 0, &ptr, 1));
++                } else if (arg->kind >= ARG_GLOBAL_ID && arg->kind <= ARG_SIMD_SIZE) {
++                    uint32_t v;
++                    int src_n = arg->kind == ARG_LOCAL_INDEX || arg->kind >= ARG_SIMD_LANE ? 1 : 3;
++
++                    if (arg->kind == ARG_THREADS_PER_GROUP) {
++                        v = emit(c, SpvOpCompositeConstruct, spv_type_vec(&c->m, c->t_u32, 3), 0,
++                                 c->local_size, 3);
++                    } else if (arg->kind == ARG_GRID_SIZE) {
++                        uint32_t idx[2] = { c->pc_var, spv_const_u32(&c->m, 1) };
++                        uint32_t ptr = emit(c, SpvOpAccessChain, c->pc_grid_ptr, 0, idx, 2);
++
++                        v = emit(c, SpvOpLoad, spv_type_vec(&c->m, c->t_u32, 3), 0, &ptr, 1);
++                    } else {
++                        v = emit(c, SpvOpLoad, src_n == 1 ? c->t_u32 :
++                                 spv_type_vec(&c->m, c->t_u32, 3), 0, &arg->var, 1);
++                    }
++                    vset(c, p, kernel_builtin_value(c, v, src_n, LLVMTypeOf(p)));
+                 } else if (arg->var) {
+                     uint32_t t = ty(c, LLVMTypeOf(p));
+ 
+@@ -2382,10 +2581,17 @@ static int translate_function(Ctx *c)
+     /* entry point */
+     {
+         uint32_t pre[2] = { c->stage == A2S_STAGE_FRAGMENT ? SpvExecutionModelFragment :
++                            c->stage == A2S_STAGE_COMPUTE ? SpvExecutionModelGLCompute :
+                             SpvExecutionModelVertex, fn_id };
+ 
+         spv_emit_str(&c->m, SPV_SEC_ENTRY, SpvOpEntryPoint, pre, 2, "main",
+                      c->iface, c->niface);
++        if (c->stage == A2S_STAGE_COMPUTE) {
++            uint32_t em[5] = { fn_id, SpvExecutionModeLocalSizeId, c->local_size[0],
++                               c->local_size[1], c->local_size[2] };
++
++            spv_emit(&c->m, SPV_SEC_EXECMODE, SpvOpExecutionModeId, em, 5);
++        }
+         if (c->stage == A2S_STAGE_FRAGMENT) {
+             uint32_t em[2] = { fn_id, SpvExecutionModeOriginUpperLeft };
+ 
+diff --git a/hw/display/pvg/air2spv.h b/hw/display/pvg/air2spv.h
+index 0aa57be..c150178 100644
+--- a/hw/display/pvg/air2spv.h
++++ b/hw/display/pvg/air2spv.h
+@@ -17,13 +17,19 @@
+ #define A2S_CONST_SAMPLER_BINDING 64
+ #define A2S_MAX_BUFFERS      16     /* Metal buffer indices per stage in the push table */
+ 
+-enum { A2S_STAGE_VERTEX = 0, A2S_STAGE_FRAGMENT = 4 };
++enum { A2S_STAGE_VERTEX = 0, A2S_STAGE_FRAGMENT = 4, A2S_STAGE_COMPUTE = 5 };
+ /* image view kinds expected by a texture binding (values = VkImageViewType) */
+ enum { A2S_VIEW_1D = 0, A2S_VIEW_2D = 1, A2S_VIEW_3D = 2, A2S_VIEW_CUBE = 3,
+        A2S_VIEW_1D_ARRAY = 4, A2S_VIEW_2D_ARRAY = 5, A2S_VIEW_CUBE_ARRAY = 6 };
+ /* specialisation constant: u32 mask of sampler slots bound to unnormalised-coordinate samplers
+  * (their coordinates are divided by the texture size; the host samplers are normalised) */
+ #define A2S_SPEC_UNNORMALIZED   0
++/* kernels: threads per threadgroup (LocalSizeId) */
++#define A2S_SPEC_LOCAL_X        1
++#define A2S_SPEC_LOCAL_Y        2
++#define A2S_SPEC_LOCAL_Z        3
++/* kernels: push-constant uvec3 grid size (threads); threads beyond it return at entry */
++#define A2S_PUSH_GRID           128
+ 
+ /*
+  * AIR constant sampler state word (inferred from the shader corpus): bits 0-2/3-5/6-8 s/t/r
+@@ -43,6 +49,8 @@ typedef struct A2SResult {
+     uint32_t texture_mask;
+     uint8_t texture_view[32];   /* per Metal texture index: A2S_VIEW_* */
+     uint32_t sampler_mask;
++    uint32_t storage_mask;      /* texture indices bound as storage images (write / read_write) */
++    uint32_t buffer_write_mask; /* buffer indices the function may write */
+     uint32_t push_base;         /* in: byte offset of this stage's buffer table */
+     uint32_t push_size;         /* out: end offset of the push constants used */
+     int nconst_samplers;
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index 48c846c..4e92799 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -34,6 +34,7 @@
+ #define OBJ_FUNCTION        0x06
+ #define OBJ_SERIALIZED      0x07
+ #define SER_RENDER_PIPELINE 0x0e
++#define SER_COMPUTE_PIPELINE 0x0b
+ 
+ static inline uint32_t ldl(const uint8_t *p)
+ {
+@@ -59,6 +60,12 @@ static inline uint64_t ldq(const uint8_t *p)
+     return GUINT64_FROM_LE(v);
+ }
+ 
++static inline void stl(uint8_t *p, uint32_t v)
++{
++    v = GUINT32_TO_LE(v);
++    memcpy(p, &v, 4);
++}
++
+ static inline void stq(uint8_t *p, uint64_t v)
+ {
+     v = GUINT64_TO_LE(v);
+@@ -103,6 +110,9 @@ typedef struct Pipeline {
+     uint8_t texture_view[32];
+     int fs_const_samplers, vs_const_samplers;
+     VkSampler const_smp[A2S_MAX_CONST_SAMP];  /* in-shader samplers (binding 64 + i) */
++    /* compute pipelines: kernel resources are kept in the fs_* fields */
++    bool compute;
++    uint32_t storage_mask, buffer_write_mask;
+     uint32_t vertex_bindings;           /* Metal buffer indices fetched as vertex buffers */
+     uint32_t push_size;
+     uint32_t draws_logged;
+@@ -540,6 +550,15 @@ static bool guest_image(PVGExec *e, uint32_t task, uint32_t ref, GuestImage *gi)
+     return guest_image_ex(e, task, ref, -1, 0, gi);
+ }
+ 
++/* can images of this format be kernel-writable (storage) images? */
++static bool format_storage_ok(PVGExec *e, VkFormat f)
++{
++    VkFormatProperties fp;
++
++    vkGetPhysicalDeviceFormatProperties(e->gpu->phys, f, &fp);
++    return fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
++}
++
+ static HostImage *host_image(PVGExec *e, uint32_t task, uint32_t ref, const GuestImage *gi,
+                              bool render_target)
+ {
+@@ -561,7 +580,8 @@ static HostImage *host_image(PVGExec *e, uint32_t task, uint32_t ref, const Gues
+         /* only plain 2D images are ever render targets */
+         .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+-                 (is2d ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0),
++                 (is2d ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0) |
++                 (format_storage_ok(e, gi->format) ? VK_IMAGE_USAGE_STORAGE_BIT : 0),
+         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+     };
+     VkImageViewCreateInfo vci = {
+@@ -2376,6 +2396,401 @@ static bool copy_rows(PVGExec *e, uint32_t stask, uint64_t sva, uint64_t sstride
+     return true;
+ }
+ 
++/*
++ * Compute pipeline object (type 7 kind 0xb): property list key 0 = kernel function,
++ * 1 = threadGroupSizeIsMultipleOfThreadExecutionWidth, 2 = label offset. One Vulkan pipeline per
++ * (threads per threadgroup, unnormalised-sampler mask).
++ */
++static Pipeline *compute_pipeline_get(PVGExec *e, uint32_t task, uint32_t ref,
++                                      const uint32_t local[3], uint32_t unnorm)
++{
++    PVGGpu *g = e->gpu;
++    g_autofree char *key = g_strdup_printf("%u:%u:c%u,%u,%u:%x", task, ref, local[0], local[1],
++                                           local[2], unnorm);
++    Pipeline *p = g_hash_table_lookup(e->pipelines, key);
++    uint8_t obj[MAX_OBJ];
++    uint32_t len, plen, fn = 0, spec_data[4] = { unnorm, local[0], local[1], local[2] };
++    PlEntry ents[16];
++    A2SResult cs = { 0 };
++    VkShaderModule csm = VK_NULL_HANDLE;
++    VkDescriptorSetLayoutBinding dsb[80];
++    uint32_t ndsb = 0;
++    int n;
++
++    if (p) {
++        return p;
++    }
++    p = g_new0(Pipeline, 1);
++    p->compute = true;
++    g_hash_table_insert(e->pipelines, g_strdup(key), p);
++    e->stats.pipelines++;
++    if (object(e, task, ref, obj, &len) != OBJ_SERIALIZED || len < 16 ||
++        ldl(obj) != SER_COMPUTE_PIPELINE) {
++        elog(e, "task %u: object %u is not a compute pipeline", task, ref);
++        goto fail;
++    }
++    plen = MIN(ldl(obj + 12), MIN(len, MAX_OBJ) - 16);
++    n = plist(obj + 16, 0, plen, ents, G_N_ELEMENTS(ents));
++    for (int i = 0; i < n; i++) {
++        if (ents[i].key == 0) {
++            fn = plval(&ents[i]);
++        }
++    }
++    cs.push_base = 0;
++    if (!fn || !function_spirv(e, task, fn, &cs)) {
++        goto fail;
++    }
++    if (cs.stage != A2S_STAGE_COMPUTE) {
++        elog(e, "task %u compute pipeline %u: function %u is not a kernel", task, ref, fn);
++        goto fail;
++    }
++    p->fs_buffers = cs.buffer_mask;
++    p->fs_textures = cs.texture_mask;
++    p->fs_samplers = cs.sampler_mask;
++    p->fs_const_samplers = cs.nconst_samplers;
++    p->storage_mask = cs.storage_mask;
++    p->buffer_write_mask = cs.buffer_write_mask;
++    memcpy(p->texture_view, cs.texture_view, sizeof(p->texture_view));
++    p->push_size = MAX(cs.push_size, A2S_PUSH_GRID + 12);
++    for (int i = 0; i < cs.nconst_samplers; i++) {
++        p->const_smp[i] = const_sampler(e, cs.const_sampler_state[i]);
++    }
++    csm = shader_module(e, &cs);
++    free(cs.spirv);
++    if (!csm) {
++        goto fail;
++    }
++    for (int i = 0; i < 32; i++) {
++        if (p->fs_textures & (1u << i)) {
++            dsb[ndsb++] = (VkDescriptorSetLayoutBinding){
++                .binding = A2S_TEXTURE_BINDING + i, .descriptorCount = 1,
++                .descriptorType = p->storage_mask >> i & 1 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE :
++                                  VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
++                .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT };
++        }
++        if (p->fs_samplers & (1u << i)) {
++            dsb[ndsb++] = (VkDescriptorSetLayoutBinding){
++                .binding = A2S_SAMPLER_BINDING + i, .descriptorCount = 1,
++                .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER,
++                .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT };
++        }
++    }
++    for (int i = 0; i < p->fs_const_samplers; i++) {
++        dsb[ndsb++] = (VkDescriptorSetLayoutBinding){
++            .binding = A2S_CONST_SAMPLER_BINDING + i, .descriptorCount = 1,
++            .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER,
++            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT };
++    }
++    {
++        VkDescriptorSetLayoutCreateInfo dci = {
++            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
++            .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
++            .bindingCount = ndsb, .pBindings = dsb };
++        VkPushConstantRange pcr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, (p->push_size + 3) & ~3u };
++        VkPipelineLayoutCreateInfo lci = {
++            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
++            .pSetLayouts = &p->dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr };
++        VkSpecializationMapEntry sme[4] = {
++            { A2S_SPEC_UNNORMALIZED, 0, 4 }, { A2S_SPEC_LOCAL_X, 4, 4 },
++            { A2S_SPEC_LOCAL_Y, 8, 4 }, { A2S_SPEC_LOCAL_Z, 12, 4 },
++        };
++        VkSpecializationInfo spec = { 4, sme, sizeof(spec_data), spec_data };
++        VkComputePipelineCreateInfo cci = {
++            .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
++            .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
++                       .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = csm, .pName = "main",
++                       .pSpecializationInfo = &spec },
++        };
++
++        if (vkCreateDescriptorSetLayout(g->device, &dci, NULL, &p->dsl) != VK_SUCCESS ||
++            vkCreatePipelineLayout(g->device, &lci, NULL, &p->layout) != VK_SUCCESS) {
++            goto fail;
++        }
++        cci.layout = p->layout;
++        if (vkCreateComputePipelines(g->device, VK_NULL_HANDLE, 1, &cci, NULL, &p->pipe) !=
++            VK_SUCCESS) {
++            elog(e, "task %u compute pipeline %u: vkCreateComputePipelines failed", task, ref);
++            goto fail;
++        }
++    }
++    vkDestroyShaderModule(g->device, csm, NULL);
++    g_strlcpy(p->fs_name, cs.entry, sizeof(p->fs_name));
++    p->ok = true;
++    elog(e, "task %u compute pipeline %u: kernel %s (bufs %#x write %#x tex %#x storage %#x) "
++         "local %ux%ux%u", task, ref, cs.entry, p->fs_buffers, p->buffer_write_mask,
++         p->fs_textures, p->storage_mask, local[0], local[1], local[2]);
++    return p;
++fail:
++    if (csm) {
++        vkDestroyShaderModule(g->device, csm, NULL);
++    }
++    e->stats.pipeline_failures++;
++    return p;
++}
++
++typedef struct ComputeState {
++    uint32_t pipeline;
++    Binding buf[MAX_SLOTS];
++    uint32_t tex[MAX_SLOTS], smp[MAX_SLOTS];
++} ComputeState;
++
++/* results the guest will read back: storage images and writable buffers */
++typedef struct ComputeOutput {
++    bool image;
++    GuestImage gi;
++    HostImage *hi;
++    uint64_t arena_off, size, va;
++} ComputeOutput;
++
++/*
++ * Compute segments (PGDeserializerComputeDecoder, ids 0xc8..0xe6): 0xd0 SetPipelineState {ref},
++ * 0xcb SetBuffers {start, count, {ref, u64 offset}}, 0xcf SetBufferOffset {index, u64 offset},
++ * 0xce SetTextures / 0xcc SetSamplers {start, count, refs}, 0xc8 DispatchThreadgroups and
++ * 0xca DispatchThreads {u64 size[3], u64 threadsPerThreadgroup[3]}. Kernel-written storage images
++ * and buffers are copied back to guest memory at the end of the segment.
++ */
++static void exec_compute_segment(PVGExec *e, uint32_t task, const uint8_t *p, uint32_t len)
++{
++    ComputeState cs = { 0 };
++    ComputeOutput out[64];
++    uint32_t nout = 0, off = 0, dispatches = 0;
++    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
++    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
++                        .pCommandBuffers = &e->cmd };
++    bool started = false;
++
++    e->stats.compute_segments++;
++    while (off + 8 <= len) {
++        uint32_t id = ldl(p + off), clen = ldl(p + off + 4);
++        const uint8_t *a = p + off + 8;
++        uint32_t alen = clen - 8;
++
++        if (clen < 8 || off + clen > len) {
++            break;
++        }
++        off += clen;
++        switch (id) {
++        case 0xd0:
++            cs.pipeline = alen >= 4 ? ldl(a) : 0;
++            break;
++        case 0xcb:
++            set_bindings(cs.buf, a, alen);
++            break;
++        case 0xcf:
++            if (alen >= 12 && ldl(a) < MAX_SLOTS) {
++                cs.buf[ldl(a)].offset = ldq(a + 4);
++            }
++            break;
++        case 0xce:
++            set_refs(cs.tex, a, alen);
++            break;
++        case 0xcc:
++            set_refs(cs.smp, a, alen);
++            break;
++        case 0xc8: case 0xca: {
++            uint32_t local[3], groups[3], grid[3], unnorm = 0;
++            uint8_t pc[256] = { 0 };
++            VkWriteDescriptorSet w[80];
++            VkDescriptorImageInfo ii[80];
++            uint32_t nw = 0;
++            Pipeline *pp;
++            bool bad = alen < 48, missing = false;
++
++            for (int k = 0; k < 3 && !bad; k++) {
++                uint64_t size = ldq(a + 8 * k), tpt = ldq(a + 24 + 8 * k);
++
++                bad |= !tpt || tpt > 1024 || !size || size > (1u << 24);
++                local[k] = (uint32_t)tpt;
++                if (id == 0xc8) {
++                    groups[k] = (uint32_t)size;
++                    grid[k] = (uint32_t)(size * tpt);
++                } else {
++                    groups[k] = (uint32_t)((size + tpt - 1) / tpt);
++                    grid[k] = (uint32_t)size;
++                }
++                bad |= groups[k] > 65535;
++            }
++            if (bad || (uint64_t)local[0] * local[1] * local[2] > 1024) {
++                elog(e, "task %u dispatch 0x%x: bad size, skipped", task, id);
++                e->stats.skipped_draws++;
++                break;
++            }
++            for (int i = 0; i < MAX_SLOTS; i++) {
++                gint64 k = key_of(task, cs.smp[i]);
++
++                sampler_get(e, task, cs.smp[i]);
++                unnorm |= cs.smp[i] && g_hash_table_contains(e->unnorm, &k) ? 1u << i : 0;
++            }
++            pp = cs.pipeline ? compute_pipeline_get(e, task, cs.pipeline, local, unnorm) : NULL;
++            if (!pp || !pp->ok) {
++                e->stats.skipped_draws++;
++                break;
++            }
++            if (!started) {
++                vkResetCommandBuffer(e->cmd, 0);
++                vkBeginCommandBuffer(e->cmd, &bi);
++                started = true;
++            }
++            /* buffers: device addresses in the push table; writable ones are read back later */
++            for (int i = 0; i < A2S_MAX_BUFFERS; i++) {
++                uint64_t size, boff;
++
++                if (!(pp->fs_buffers >> i & 1)) {
++                    continue;
++                }
++                boff = cs.buf[i].ref ? buffer_upload(e, task, cs.buf[i].ref, &size) : UINT64_MAX;
++                if (boff == UINT64_MAX || cs.buf[i].offset >= size) {
++                    stq(pc + 8 * i, e->arena_addr);     /* guard zone at the arena start */
++                    continue;
++                }
++                stq(pc + 8 * i, e->arena_addr + boff + cs.buf[i].offset);
++                if ((pp->buffer_write_mask >> i & 1) && nout < G_N_ELEMENTS(out)) {
++                    uint64_t va;
++
++                    if (buffer_range(e, task, cs.buf[i].ref, 0, size, &va)) {
++                        out[nout++] = (ComputeOutput){ .arena_off = boff, .size = size, .va = va };
++                    }
++                }
++            }
++            stl(pc + A2S_PUSH_GRID, grid[0]);
++            stl(pc + A2S_PUSH_GRID + 4, grid[1]);
++            stl(pc + A2S_PUSH_GRID + 8, grid[2]);
++            /* textures: sampled or storage images, uploaded from guest memory */
++            for (int i = 0; i < 32; i++) {
++                GuestImage gi;
++                HostImage *hi = NULL;
++                bool storage = pp->storage_mask >> i & 1;
++
++                if (!(pp->fs_textures >> i & 1)) {
++                    continue;
++                }
++                if (i < MAX_SLOTS && cs.tex[i] && guest_image(e, task, cs.tex[i], &gi) &&
++                    gi.view_type == pp->texture_view[i] &&
++                    (hi = host_image(e, task, cs.tex[i], &gi, false))) {
++                    image_upload(e, &gi, hi, storage ? VK_IMAGE_LAYOUT_GENERAL :
++                                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++                    if (storage && nout < G_N_ELEMENTS(out)) {
++                        out[nout++] = (ComputeOutput){ .image = true, .gi = gi, .hi = hi };
++                    }
++                }
++                if (!hi) {
++                    hi = dummy_image(e, pp->texture_view[i]);
++                    if (!hi || storage) {
++                        /* no placeholder for writes: skip the dispatch */
++                        elog(e, "task %u kernel %s: texture %d (ref %u) unavailable", task,
++                             pp->fs_name, i, i < MAX_SLOTS ? cs.tex[i] : 0);
++                        missing = true;
++                        break;
++                    }
++                }
++                ii[nw] = (VkDescriptorImageInfo){ .imageView = hi->view,
++                    .imageLayout = storage ? VK_IMAGE_LAYOUT_GENERAL :
++                                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
++                w[nw] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
++                    .dstBinding = A2S_TEXTURE_BINDING + i, .descriptorCount = 1,
++                    .descriptorType = storage ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE :
++                                      VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
++                    .pImageInfo = &ii[nw] };
++                nw++;
++            }
++            if (missing) {
++                e->stats.skipped_draws++;
++                break;
++            }
++            for (int i = 0; i < 32; i++) {
++                if (pp->fs_samplers >> i & 1) {
++                    ii[nw] = (VkDescriptorImageInfo){
++                        .sampler = sampler_get(e, task, i < MAX_SLOTS ? cs.smp[i] : 0) };
++                    w[nw] = (VkWriteDescriptorSet){
++                        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
++                        .dstBinding = A2S_SAMPLER_BINDING + i, .descriptorCount = 1,
++                        .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER, .pImageInfo = &ii[nw] };
++                    nw++;
++                }
++            }
++            for (int i = 0; i < pp->fs_const_samplers; i++) {
++                ii[nw] = (VkDescriptorImageInfo){ .sampler = pp->const_smp[i] ? pp->const_smp[i] :
++                                                             e->sampler };
++                w[nw] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
++                    .dstBinding = A2S_CONST_SAMPLER_BINDING + i, .descriptorCount = 1,
++                    .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER, .pImageInfo = &ii[nw] };
++                nw++;
++            }
++            vkCmdBindPipeline(e->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pp->pipe);
++            vkCmdPushConstants(e->cmd, pp->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
++                               (pp->push_size + 3) & ~3u, pc);
++            if (nw) {
++                e->push_descriptor(e->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pp->layout, 0, nw, w);
++            }
++            vkCmdDispatch(e->cmd, groups[0], groups[1], groups[2]);
++            {
++                /* later dispatches / the read-back see this one's writes */
++                VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++                    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++                    .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT };
++
++                vkCmdPipelineBarrier(e->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                                     VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0,
++                                     NULL);
++            }
++            dispatches++;
++            e->stats.dispatches++;
++            break;
++        }
++        default:        /* fences, barriers, threadgroup memory length: nothing to do yet */
++            break;
++        }
++    }
++    if (!started) {
++        return;
++    }
++    /* storage images: image -> arena, then rows -> guest memory */
++    for (uint32_t i = 0; i < nout; i++) {
++        if (out[i].image) {
++            uint64_t size = (uint64_t)out[i].gi.row_bytes * out[i].gi.height;
++            VkBufferImageCopy r = {
++                .bufferRowLength = out[i].gi.row_bytes / out[i].gi.bpp,
++                .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++                .imageExtent = { out[i].gi.width, out[i].gi.height, 1 },
++            };
++
++            out[i].arena_off = arena_alloc(e, size);
++            if (out[i].arena_off == UINT64_MAX) {
++                continue;
++            }
++            r.bufferOffset = out[i].arena_off;
++            barrier(e, out[i].hi->image, VK_IMAGE_LAYOUT_GENERAL,
++                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++            vkCmdCopyImageToBuffer(e->cmd, out[i].hi->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                                   e->arena, 1, &r);
++            out[i].size = size;
++        }
++    }
++    vkEndCommandBuffer(e->cmd);
++    if (!submit_wait(e, &si)) {
++        return;
++    }
++    for (uint32_t i = 0; i < nout; i++) {
++        if (out[i].arena_off == UINT64_MAX || !out[i].size) {
++            continue;
++        }
++        if (out[i].image) {
++            note_write(e, out[i].gi.task, out[i].gi.va, out[i].size, 'C');
++            e->host.write(e->host.opaque, out[i].gi.task, out[i].gi.va,
++                          e->arena_ptr + out[i].arena_off, out[i].size);
++        } else {
++            note_write(e, task, out[i].va, out[i].size, 'C');
++            e->host.write(e->host.opaque, task, out[i].va, e->arena_ptr + out[i].arena_off,
++                          out[i].size);
++        }
++        e->stats.writebacks++;
++    }
++    /* uploads were only valid for this submission */
++    e->arena_used = 0;
++    g_hash_table_remove_all(e->uploaded);
++}
++
+ static void exec_blit_segment(PVGExec *e, uint32_t task, const uint8_t *p, uint32_t len)
+ {
+     for (uint32_t off = 0; off + 8 <= len;) {
+@@ -2504,6 +2919,8 @@ void pvg_exec_cmdbuf(PVGExec *e, uint32_t task, const uint8_t *buf, uint64_t len
+         }
+         if (enc == 2) {
+             exec_blit_segment(e, task, buf + off + 8, seglen - 8);
++        } else if (enc == 1) {
++            exec_compute_segment(e, task, buf + off + 8, seglen - 8);
+         } else if (enc == 0) {
+             if (buf[off + 5]) {
+                 e->stats.continuations++;
+diff --git a/hw/display/pvg/pvg-exec.h b/hw/display/pvg/pvg-exec.h
+index 3559bf4..54f106b 100644
+--- a/hw/display/pvg/pvg-exec.h
++++ b/hw/display/pvg/pvg-exec.h
+@@ -27,6 +27,7 @@ typedef struct PVGExecHost {
+ typedef struct PVGExecStats {
+     uint64_t segments, render_passes, draws, skipped_draws, pipelines, pipeline_failures;
+     uint64_t uploads, writebacks, blits, skipped_passes, continuations, feedback_copies;
++    uint64_t compute_segments, dispatches;
+ } PVGExecStats;
+ 
+ typedef struct PVGExec PVGExec;
+diff --git a/hw/display/pvg/pvg-gpu.c b/hw/display/pvg/pvg-gpu.c
+index fe06aa4..f66fe27 100644
+--- a/hw/display/pvg/pvg-gpu.c
++++ b/hw/display/pvg/pvg-gpu.c
+@@ -74,6 +74,8 @@ int pvg_gpu_init(PVGGpu *g, bool validation, char *err, size_t errlen)
+             .fragmentStoresAndAtomics = VK_TRUE, .independentBlend = VK_TRUE,
+             .samplerAnisotropy = VK_TRUE, .fillModeNonSolid = VK_TRUE, .depthClamp = VK_TRUE,
+             .imageCubeArray = VK_TRUE,
++            .shaderStorageImageReadWithoutFormat = VK_TRUE,
++            .shaderStorageImageWriteWithoutFormat = VK_TRUE,
+         },
+     };
+     VkDeviceCreateInfo dci = {
+diff --git a/hw/display/pvg/spv.h b/hw/display/pvg/spv.h
+index e832b6d..b34e692 100644
+--- a/hw/display/pvg/spv.h
++++ b/hw/display/pvg/spv.h
+@@ -19,7 +19,7 @@ enum {
+     SpvCapabilityInt64 = 11, SpvCapabilityInt16 = 22, SpvCapabilityInt8 = 39,
+     SpvCapabilitySampled1D = 43, SpvCapabilityImage1D = 44, SpvCapabilityImageQuery = 50,
+     SpvCapabilityDerivativeControl = 51,
+-    SpvCapabilityStorageImageReadWithoutFormat = 55,
++    SpvCapabilityStorageImageReadWithoutFormat = 55, SpvCapabilityGroupNonUniform = 61,
+     SpvCapabilityStorageImageWriteWithoutFormat = 56,
+     SpvCapabilityPhysicalStorageBufferAddresses = 5347,
+     SpvCapabilityDemoteToHelperInvocation = 5379,
+@@ -39,7 +39,10 @@ enum {
+ enum { SpvDim1D = 0, SpvDim2D = 1, SpvDim3D = 2, SpvDimCube = 3, SpvDimBuffer = 5 };
+ 
+ enum {
+-    SpvDecorationSpecId = 1, SpvDecorationBlock = 2, SpvDecorationArrayStride = 6, SpvDecorationBuiltIn = 11,
++    SpvDecorationSpecId = 1, SpvExecutionModeLocalSizeId = 38,
++    SpvBuiltInNumWorkgroups = 24, SpvBuiltInWorkgroupId = 26, SpvBuiltInLocalInvocationId = 27,
++    SpvBuiltInGlobalInvocationId = 28, SpvBuiltInLocalInvocationIndex = 29,
++    SpvBuiltInSubgroupSize = 36, SpvBuiltInSubgroupId = 40, SpvBuiltInSubgroupLocalInvocationId = 41, SpvDecorationBlock = 2, SpvDecorationArrayStride = 6, SpvDecorationBuiltIn = 11,
+     SpvDecorationNoPerspective = 13, SpvDecorationFlat = 14, SpvDecorationCentroid = 16,
+     SpvDecorationSample = 17, SpvDecorationNonWritable = 24, SpvDecorationLocation = 30,
+     SpvDecorationIndex = 32, SpvDecorationBinding = 33, SpvDecorationDescriptorSet = 34,
+@@ -71,7 +74,8 @@ enum {
+     SpvOpCompositeConstruct = 80, SpvOpCompositeExtract = 81, SpvOpCompositeInsert = 82,
+     SpvOpCopyObject = 83, SpvOpSampledImage = 86, SpvOpImageSampleImplicitLod = 87,
+     SpvOpImageSampleExplicitLod = 88, SpvOpImageFetch = 95, SpvOpImageRead = 98,
+-    SpvOpImageWrite = 99, SpvOpImageQuerySizeLod = 103, SpvOpConvertFToU = 109,
++    SpvOpImageWrite = 99, SpvOpControlBarrier = 224, SpvOpMemoryBarrier = 225,
++    SpvOpExecutionModeId = 331, SpvOpImageQuerySizeLod = 103, SpvOpConvertFToU = 109,
+     SpvOpConvertFToS = 110, SpvOpConvertSToF = 111, SpvOpConvertUToF = 112, SpvOpUConvert = 113,
+     SpvOpSConvert = 114, SpvOpFConvert = 115, SpvOpConvertPtrToU = 117, SpvOpConvertUToPtr = 120,
+     SpvOpBitcast = 124, SpvOpSNegate = 126, SpvOpFNegate = 127, SpvOpIAdd = 128, SpvOpFAdd = 129,
+diff --git a/hw/display/trace-events b/hw/display/trace-events
+index 607ce92..6e9d245 100644
+--- a/hw/display/trace-events
++++ b/hw/display/trace-events
+@@ -250,7 +250,7 @@ pvg_linux_segment_bad(uint32_t task, uint64_t off, uint32_t seglen, uint64_t len
+ pvg_linux_gpu(const char *name, bool validation) "host GPU %s (validation %d)"
+ pvg_linux_ref(uint32_t task, const char *cmd, uint32_t slot, uint32_t ref, uint32_t type, uint32_t len, uint32_t kind, uint32_t w0, uint32_t w1) "task %u %s[%u] -> object %u type=0x%x len=0x%x kind=0x%x body=0x%x,0x%x"
+ pvg_linux_exec(const char *msg) "%s"
+-pvg_linux_exec_stats(uint64_t cmdbufs, uint64_t passes, uint64_t draws, uint64_t skipped, uint64_t pipelines, uint64_t pipe_fail, uint64_t writebacks, uint64_t blits, uint64_t feedback) "cmdbufs=%"PRIu64" passes=%"PRIu64" draws=%"PRIu64" skipped=%"PRIu64" pipelines=%"PRIu64" failed=%"PRIu64" writebacks=%"PRIu64" blits=%"PRIu64" feedback=%"PRIu64
++pvg_linux_exec_stats(uint64_t cmdbufs, uint64_t passes, uint64_t draws, uint64_t skipped, uint64_t pipelines, uint64_t pipe_fail, uint64_t writebacks, uint64_t blits, uint64_t feedback, uint64_t dispatches) "cmdbufs=%"PRIu64" passes=%"PRIu64" draws=%"PRIu64" skipped=%"PRIu64" pipelines=%"PRIu64" failed=%"PRIu64" writebacks=%"PRIu64" blits=%"PRIu64" feedback=%"PRIu64" dispatches=%"PRIu64
+ pvg_linux_child_poke(uint32_t index, uint32_t written, uint32_t read, uint32_t length) "child FIFO %u written=0x%x read=0x%x length=0x%x"
+ pvg_linux_cmd_stub(uint32_t op) "op=0x%02x not implemented, completed"
+ pvg_linux_signal_stamp(uint32_t index, uint32_t value) "stamps[%u]=%u"
+-- 
+2.43.0
+

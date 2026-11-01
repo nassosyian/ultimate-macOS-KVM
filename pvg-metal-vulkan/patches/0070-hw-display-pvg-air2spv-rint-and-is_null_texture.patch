@@ -1,0 +1,69 @@
+From 8934101bddd2226617fc1abccfe80351b2f86f9c Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Sat, 31 Oct 2026 13:10:41 +0200
+Subject: [PATCH 70/71] hw/display/pvg: air2spv: rint and is_null_texture
+
+air.rint (and llvm.rint/nearbyint/roundeven) map to GLSL RoundEven.
+air.is_null_texture_* translates to false: bound texture slots always
+hold an image (a zero placeholder when unset). Weather's precipitation
+overlay shaders failed to translate on both.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/air2spv.c | 12 +++++++++++-
+ hw/display/pvg/spv.h     |  2 +-
+ 2 files changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/hw/display/pvg/air2spv.c b/hw/display/pvg/air2spv.c
+index 3184c74..0f3278a 100644
+--- a/hw/display/pvg/air2spv.c
++++ b/hw/display/pvg/air2spv.c
+@@ -1456,7 +1456,8 @@ static const struct { const char *name; int glsl; int nargs; } glsl_map[] = {
+     { "sqrt", GLSLstd450Sqrt, 1 }, { "rsqrt", GLSLstd450InverseSqrt, 1 },
+     { "fabs", GLSLstd450FAbs, 1 }, { "sign", GLSLstd450FSign, 1 }, { "floor", GLSLstd450Floor, 1 },
+     { "ceil", GLSLstd450Ceil, 1 }, { "fract", GLSLstd450Fract, 1 }, { "trunc", GLSLstd450Trunc, 1 },
+-    { "round", GLSLstd450Round, 1 }, { "exp", GLSLstd450Exp, 1 }, { "exp2", GLSLstd450Exp2, 1 },
++    { "round", GLSLstd450Round, 1 }, { "rint", GLSLstd450RoundEven, 1 },
++    { "exp", GLSLstd450Exp, 1 }, { "exp2", GLSLstd450Exp2, 1 },
+     { "log", GLSLstd450Log, 1 }, { "log2", GLSLstd450Log2, 1 }, { "pow", GLSLstd450Pow, 2 },
+     { "powr", GLSLstd450Pow, 2 }, { "atan2", GLSLstd450Atan2, 2 }, { "sin", GLSLstd450Sin, 1 },
+     { "cos", GLSLstd450Cos, 1 }, { "tan", GLSLstd450Tan, 1 }, { "asin", GLSLstd450Asin, 1 },
+@@ -1962,6 +1963,8 @@ static int call_inst(Ctx *c, LLVMValueRef call, uint32_t result)
+             { "minnum", GLSLstd450NMin }, { "maxnum", GLSLstd450NMax },
+             { "floor", GLSLstd450Floor }, { "ceil", GLSLstd450Ceil },
+             { "trunc", GLSLstd450Trunc }, { "round", GLSLstd450Round },
++            { "rint", GLSLstd450RoundEven }, { "nearbyint", GLSLstd450RoundEven },
++            { "roundeven", GLSLstd450RoundEven },
+             { "sqrt", GLSLstd450Sqrt }, { "exp2", GLSLstd450Exp2 }, { "log2", GLSLstd450Log2 },
+             { "exp", GLSLstd450Exp }, { "log", GLSLstd450Log }, { "sin", GLSLstd450Sin },
+             { "cos", GLSLstd450Cos }, { "pow", GLSLstd450Pow },
+@@ -2078,6 +2081,13 @@ static int call_inst(Ctx *c, LLVMValueRef call, uint32_t result)
+         !strncmp(base, "get_num_mip_levels_texture", 26)) {
+         return texture_query(c, call, base, result);
+     }
++    if (!strncmp(base, "is_null_texture", 15)) {
++        /* bound texture slots always hold an image (a zero placeholder when unset) */
++        uint32_t f = spv_const(&c->m, SpvOpConstantFalse, c->t_bool, NULL, 0);
++
++        emit(c, SpvOpCopyObject, c->t_bool, result, &f, 1);
++        return 0;
++    }
+     if (!strcmp(base, "discard_fragment")) {
+         spv_capability(&c->m, SpvCapabilityDemoteToHelperInvocation);
+         spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpDemoteToHelperInvocation, NULL, 0);
+diff --git a/hw/display/pvg/spv.h b/hw/display/pvg/spv.h
+index 1a2cc5c..a6946f5 100644
+--- a/hw/display/pvg/spv.h
++++ b/hw/display/pvg/spv.h
+@@ -129,7 +129,7 @@ enum {
+ 
+ /* GLSL.std.450 extended instructions */
+ enum {
+-    GLSLstd450Round = 1, GLSLstd450Trunc = 3, GLSLstd450FAbs = 4, GLSLstd450SAbs = 5,
++    GLSLstd450Round = 1, GLSLstd450RoundEven = 2, GLSLstd450Trunc = 3, GLSLstd450FAbs = 4, GLSLstd450SAbs = 5,
+     GLSLstd450FSign = 6, GLSLstd450SSign = 7, GLSLstd450Floor = 8, GLSLstd450Ceil = 9,
+     GLSLstd450Fract = 10, GLSLstd450Sin = 13, GLSLstd450Cos = 14, GLSLstd450Tan = 15,
+     GLSLstd450Asin = 16, GLSLstd450Acos = 17, GLSLstd450Atan = 18, GLSLstd450Atan2 = 25,
+-- 
+2.43.0
+

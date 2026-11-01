@@ -1,0 +1,97 @@
+From 32499291ae03a31fba5d04cca3117ff4c15d432a Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Sun, 1 Nov 2026 01:48:18 +0200
+Subject: [PATCH] ui/gtk: hand files dropped on the window to a sharing daemon
+
+With QEMU_GTK_DROP_SOCKET set, the guest display accepts text/uri-list
+drops and sends {"t": "drop", "paths": [...]} to that unix socket; a
+host daemon (scripts/vm-share/kvm-share.py in kvm-osx) copies the files
+into the guest.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ui/gtk.c | 54 ++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 54 insertions(+)
+
+diff --git a/ui/gtk.c b/ui/gtk.c
+index 7078d89..f912dc4 100644
+--- a/ui/gtk.c
++++ b/ui/gtk.c
+@@ -61,6 +61,7 @@
+ #include "system/system.h"
+ #include "keymaps.h"
+ #include "chardev/char.h"
++#include "qemu/sockets.h"
+ #include "qom/object.h"
+ 
+ #define VC_WINDOW_X_MIN  320
+@@ -2193,6 +2194,58 @@ static void gd_vcs_init(GtkDisplayState *s)
+ }
+ #endif /* CONFIG_VTE */
+ 
++/** File drops **/
++
++/*
++ * Files dropped on the guest display are handed to a host-side sharing daemon (which copies
++ * them into the guest) over the unix socket named by $QEMU_GTK_DROP_SOCKET: one line
++ * {"t": "drop", "paths": ["file:///...", ...]}. Without the variable the window takes no drops.
++ */
++static void gd_drag_data_received(GtkWidget *widget, GdkDragContext *ctx, gint x, gint y,
++                                  GtkSelectionData *data, guint info, guint time,
++                                  gpointer opaque)
++{
++    const char *path = g_getenv("QEMU_GTK_DROP_SOCKET");
++    g_auto(GStrv) uris = gtk_selection_data_get_uris(data);
++    g_autoptr(GString) msg = g_string_new("{\"t\": \"drop\", \"paths\": [");
++    int fd, n = 0;
++
++    for (int i = 0; uris && uris[i]; i++) {
++        /* file URIs are percent-encoded: nothing to escape, anything else is skipped */
++        if (!g_str_has_prefix(uris[i], "file://") || strpbrk(uris[i], "\"\\\n")) {
++            continue;
++        }
++        g_string_append_printf(msg, "%s\"%s\"", n++ ? ", " : "", uris[i]);
++    }
++    g_string_append(msg, "]}\n");
++    gtk_drag_finish(ctx, n > 0, FALSE, time);
++    if (!n || !path) {
++        return;
++    }
++    fd = unix_connect(path, NULL);
++    if (fd < 0) {
++        warn_report("gtk: file drop: sharing daemon not reachable at %s", path);
++        return;
++    }
++    if (qemu_write_full(fd, msg->str, msg->len) != (ssize_t)msg->len) {
++        warn_report("gtk: file drop: could not hand %d file(s) to the sharing daemon", n);
++    }
++    close(fd);
++}
++
++static void gd_vc_accept_drops(VirtualConsole *vc)
++{
++    static const GtkTargetEntry uri_list = { (gchar *)"text/uri-list", 0, 0 };
++
++    if (!g_getenv("QEMU_GTK_DROP_SOCKET")) {
++        return;
++    }
++    gtk_drag_dest_set(vc->gfx.drawing_area, GTK_DEST_DEFAULT_MOTION | GTK_DEST_DEFAULT_HIGHLIGHT |
++                      GTK_DEST_DEFAULT_DROP, &uri_list, 1, GDK_ACTION_COPY);
++    g_signal_connect(vc->gfx.drawing_area, "drag-data-received",
++                     G_CALLBACK(gd_drag_data_received), vc);
++}
++
+ /** Window Creation **/
+ 
+ static void gd_connect_vc_gfx_signals(VirtualConsole *vc)
+@@ -2236,6 +2289,7 @@ static void gd_connect_vc_gfx_signals(VirtualConsole *vc)
+                          G_CALLBACK(gd_configure), vc);
+         g_signal_connect(vc->gfx.drawing_area, "grab-broken-event",
+                          G_CALLBACK(gd_grab_broken_event), vc);
++        gd_vc_accept_drops(vc);
+     } else {
+         g_signal_connect(vc->gfx.drawing_area, "key-press-event",
+                          G_CALLBACK(gd_text_key_down), vc);
+-- 
+2.43.0
+

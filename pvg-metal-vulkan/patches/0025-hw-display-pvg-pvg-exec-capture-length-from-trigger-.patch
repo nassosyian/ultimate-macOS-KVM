@@ -1,0 +1,71 @@
+From a17335eea0d767adaf9e13f791399c3eeda3fd8f Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 15:03:57 +0200
+Subject: [PATCH 25/54] hw/display/pvg/pvg-exec: capture length from trigger
+ file, downscaled large-target dumps
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/pvg-exec.c | 29 +++++++++++++++++++++++++----
+ 1 file changed, 25 insertions(+), 4 deletions(-)
+
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index 0f0cb11..93c49a5 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -2211,9 +2211,26 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                  "x %ux%u fmt %d load %u store %u", e->capture_seq, i, att[i].ref, att[i].level,
+                  att[i].slice, att[i].gi.task, att[i].gi.va, att[i].gi.width, att[i].gi.height,
+                  att[i].gi.format, att[i].load, att[i].store);
+-            if (att[i].wb_off != UINT64_MAX) {
++            if (att[i].wb_off != UINT64_MAX && att[i].gi.width >= 1024 && att[i].gi.bpp == 4) {
++                /* large targets: every 4th pixel of every 4th row */
++                uint32_t w = att[i].gi.width / 4, h = att[i].gi.height / 4;
++                g_autofree uint32_t *px = g_new(uint32_t, w * h);
+                 g_autofree char *path = g_strdup_printf(
+-                    "%s/cap-%04u-t%u-r%u-att%u-fmt%d-%ux%u-s%u.raw", e->dump_dir,
++                    "%s/cap-%05u-t%u-r%u-att%u-fmt%d-%ux%u-s%u.raw", e->dump_dir,
++                    e->capture_seq, task, att[i].ref, i, att[i].gi.format, w, h, w * 4);
++
++                for (uint32_t y = 0; y < h; y++) {
++                    const uint32_t *row = (const uint32_t *)(e->arena_ptr + att[i].wb_off +
++                                                             (uint64_t)y * 4 * att[i].gi.row_bytes);
++
++                    for (uint32_t x = 0; x < w; x++) {
++                        px[y * w + x] = row[x * 4];
++                    }
++                }
++                g_file_set_contents(path, (const char *)px, (gssize)w * h * 4, NULL);
++            } else if (att[i].wb_off != UINT64_MAX) {
++                g_autofree char *path = g_strdup_printf(
++                    "%s/cap-%05u-t%u-r%u-att%u-fmt%d-%ux%u-s%u.raw", e->dump_dir,
+                     e->capture_seq, task, att[i].ref, i, att[i].gi.format, att[i].gi.width,
+                     att[i].gi.height, att[i].gi.row_bytes);
+ 
+@@ -2415,9 +2432,13 @@ void pvg_exec_cmdbuf(PVGExec *e, uint32_t task, const uint8_t *buf, uint64_t len
+         /* frame capture on demand: touch <dump-dir>/capture */
+         g_autofree char *trig = g_build_filename(e->dump_dir, "capture", NULL);
+ 
++        g_autofree char *count = NULL;
++
+         if (g_file_test(trig, G_FILE_TEST_EXISTS)) {
++            /* the file may hold the number of segments to record */
++            g_file_get_contents(trig, &count, NULL, NULL);
+             g_unlink(trig);
+-            e->capture_left = 400;
++            e->capture_left = count && atoi(count) > 0 ? MIN(atoi(count), 20000) : 400;
+             elog(e, "capture: recording %u segments from seq %u", e->capture_left,
+                  e->capture_seq);
+         }
+@@ -2425,7 +2446,7 @@ void pvg_exec_cmdbuf(PVGExec *e, uint32_t task, const uint8_t *buf, uint64_t len
+     e->arena_used = 0;
+     g_hash_table_remove_all(e->uploaded);
+     if (e->capture_left) {
+-        g_autofree char *path = g_strdup_printf("%s/cap-cb-%04u-t%u.bin", e->dump_dir,
++        g_autofree char *path = g_strdup_printf("%s/cap-cb-%05u-t%u.bin", e->dump_dir,
+                                                 e->capture_seq, task);
+ 
+         g_file_set_contents(path, (const char *)buf, (gssize)len, NULL);
+-- 
+2.43.0
+

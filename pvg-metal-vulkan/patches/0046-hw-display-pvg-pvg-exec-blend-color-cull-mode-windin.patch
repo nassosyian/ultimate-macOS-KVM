@@ -1,0 +1,175 @@
+From 4fba389721d3f32398781be896325d57861f358b Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Fri, 30 Oct 2026 00:36:35 +0200
+Subject: [PATCH 46/54] hw/display/pvg/pvg-exec: blend color, cull mode,
+ winding, depth bias, viewport/scissor arrays as dynamic state; barrier/fence
+ no-ops; census of unexecuted commands
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/pvg-exec.c | 79 ++++++++++++++++++++++++++++++++++++++-
+ hw/display/pvg/pvg-gpu.c  |  2 +-
+ 2 files changed, 79 insertions(+), 2 deletions(-)
+
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index 1eb3f8a..e1de380 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -157,6 +157,7 @@ struct PVGExec {
+     GHashTable *uploaded;       /* per command buffer: task << 32 | id → arena offset + 1 */
+     GHashTable *samplers;       /* task << 32 | id → VkSampler (as pointer) */
+     uint32_t upload_failures, ds_kind_logged, ds_states_logged, ds_dumps, blends_logged;
++    uint8_t unhandled_seen[3][128];   /* command ids already reported */
+     uint32_t texfail_logged, blit_unhandled, resolve_logged, cwb_logged, cio_dumps, buffail_logged, ccmd_logged;
+     DSAttachmentSave last_ds;
+     HostImage dummy[7];         /* 1x1 placeholders per VkImageViewType */
+@@ -1384,6 +1385,9 @@ static Pipeline *pipeline_get(PVGExec *e, uint32_t task, uint32_t ref, const VkF
+                                  VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
+                                  VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
+                                  VK_DYNAMIC_STATE_BLEND_CONSTANTS,
++                                 VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE,
++                                 VK_DYNAMIC_STATE_DEPTH_BIAS,
++                                 VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE,
+                                  VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
+                                  VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
+                                  VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
+@@ -1442,6 +1446,18 @@ fail:
+     return p;
+ }
+ 
++/* census: the first time an encoder command id is seen but not executed */
++static void note_unhandled(PVGExec *e, const char *enc, uint32_t id, uint32_t len)
++{
++    int k = enc[0] == 'r' ? 0 : enc[0] == 'c' ? 1 : 2;
++    uint32_t slot = id & 0x3ff;
++
++    if (slot < 1024 && !(e->unhandled_seen[k][slot >> 3] & (1u << (slot & 7)))) {
++        e->unhandled_seen[k][slot >> 3] |= 1u << (slot & 7);
++        elog(e, "%s command 0x%x (len %u) not executed", enc, id, len);
++    }
++}
++
+ /* ---- render segments ---- */
+ 
+ typedef struct RenderState {
+@@ -1455,6 +1471,9 @@ typedef struct RenderState {
+      * back << 5; per face {u32 compare | sfail << 3 | dfail << 6 | pass << 9, read, write} */
+     uint32_t ds_w0, ds_face[2][3];
+     uint32_t stencil_ref[2];
++    float blend_color[4];
++    uint32_t cull, winding;         /* MTLCullMode: 0 none 1 front 2 back; MTLWinding: 0 CW 1 CCW */
++    float depth_bias[3];            /* constant, slope scale, clamp */
+ } RenderState;
+ 
+ static void set_bindings(Binding *b, const uint8_t *a, uint32_t alen)
+@@ -1480,6 +1499,15 @@ static void set_refs(uint32_t *r, const uint8_t *a, uint32_t alen)
+     }
+ }
+ 
++static float ldf(const uint8_t *p)
++{
++    uint32_t v = ldl(p);
++    float f;
++
++    memcpy(&f, &v, 4);
++    return f;
++}
++
+ static double ldd(const uint8_t *p)
+ {
+     double d;
+@@ -2230,6 +2258,42 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+         case 0x72: set_refs(st.ftex, a, alen); break;
+         case 0x70: case 0x71: set_refs(st.fsmp, a, alen); break;    /* SetFragmentSamplerStates[LODClamp] */
+         case 0x7f: case 0x80: set_refs(st.vsmp, a, alen); break;    /* SetVertexSamplerStates[LODClamp] */
++        case 0x65:      /* SetBlendColor {f32 r, g, b, a} */
++            if (alen >= 16) {
++                for (int k = 0; k < 4; k++) {
++                    st.blend_color[k] = ldf(a + 4 * k);
++                }
++            }
++            break;
++        case 0x6b:      /* SetCullMode {u64 MTLCullMode} */
++            st.cull = alen >= 4 ? ldl(a) : 0;
++            break;
++        case 0x73:      /* SetFrontFacingWinding {u64 MTLWinding} */
++            st.winding = alen >= 4 ? ldl(a) : 0;
++            break;
++        case 0x6c:      /* SetDepthBias {f32 bias, f32 slopeScale, f32 clamp} */
++            if (alen >= 12) {
++                for (int k = 0; k < 3; k++) {
++                    st.depth_bias[k] = ldf(a + 4 * k);
++                }
++            }
++            break;
++        case 0x17:      /* RenderBarrierScope: commands execute in order here */
++        case 0x18:      /* RenderUpdateFence / wait: likewise */
++            break;
++        case 0x83:      /* SetViewports {u32 count, count x 6 doubles}: the first one */
++            if (alen >= 52 && ldl(a)) {
++                double x = ldd(a + 4), y = ldd(a + 12), w = ldd(a + 20), h = ldd(a + 28);
++
++                st.viewport = (VkViewport){ x, y + h, w, -h, ldd(a + 36), ldd(a + 44) };
++            }
++            break;
++        case 0x76:      /* SetScissorRects {u64 count, count x 4 u64}: the first one */
++            if (alen >= 40 && ldq(a)) {
++                st.scissor = (VkRect2D){ { (int32_t)ldq(a + 8), (int32_t)ldq(a + 16) },
++                                         { (uint32_t)ldq(a + 24), (uint32_t)ldq(a + 32) } };
++            }
++            break;
+         case 0x82:      /* SetViewport: 6 doubles */
+             if (alen >= 48) {
+                 double x = ldd(a), y = ldd(a + 8), w = ldd(a + 16), h = ldd(a + 24);
+@@ -2374,6 +2438,17 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+             }
+             vkCmdSetViewport(e->cmd, 0, 1, &st.viewport);
+             vkCmdSetScissor(e->cmd, 0, 1, &st.scissor);
++            vkCmdSetBlendConstants(e->cmd, st.blend_color);
++            vkCmdSetCullMode(e->cmd, st.cull == 1 ? VK_CULL_MODE_FRONT_BIT :
++                             st.cull == 2 ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE);
++            /*
++             * Metal decides facing with y up; the y-flipped viewport mirrors the triangle
++             * in framebuffer space, so Metal's clockwise is Vulkan's counter-clockwise
++             */
++            vkCmdSetFrontFace(e->cmd, st.winding ? VK_FRONT_FACE_CLOCKWISE :
++                              VK_FRONT_FACE_COUNTER_CLOCKWISE);
++            vkCmdSetDepthBiasEnable(e->cmd, st.depth_bias[0] != 0 || st.depth_bias[1] != 0);
++            vkCmdSetDepthBias(e->cmd, st.depth_bias[0], st.depth_bias[2], st.depth_bias[1]);
+             vkCmdSetPrimitiveTopology(e->cmd, mtl_topology(prim));
+             /* Metal always restarts indexed strips at 0xffff / 0xffffffff */
+             vkCmdSetPrimitiveRestartEnable(e->cmd, indexed && (prim == 2 || prim == 4));
+@@ -2396,6 +2471,7 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+             break;
+         }
+         default:
++            note_unhandled(e, "render", id, clen);
+             break;
+         }
+     }
+@@ -3018,7 +3094,8 @@ static void exec_compute_segment(PVGExec *e, uint32_t task, const uint8_t *p, ui
+             e->stats.dispatches++;
+             break;
+         }
+-        default:        /* fences, barriers, threadgroup memory length: nothing to do yet */
++        default:        /* fences, barriers, memory barriers: nothing to do (in order) */
++            note_unhandled(e, "compute", id, clen);
+             break;
+         }
+     }
+diff --git a/hw/display/pvg/pvg-gpu.c b/hw/display/pvg/pvg-gpu.c
+index 1030190..8da62ed 100644
+--- a/hw/display/pvg/pvg-gpu.c
++++ b/hw/display/pvg/pvg-gpu.c
+@@ -73,7 +73,7 @@ int pvg_gpu_init(PVGGpu *g, bool validation, char *err, size_t errlen)
+         .features = {
+             .shaderInt64 = VK_TRUE, .shaderInt16 = VK_TRUE, .shaderFloat64 = VK_TRUE,
+             .fragmentStoresAndAtomics = VK_TRUE, .independentBlend = VK_TRUE,
+-            .samplerAnisotropy = VK_TRUE, .fillModeNonSolid = VK_TRUE, .depthClamp = VK_TRUE,
++            .samplerAnisotropy = VK_TRUE, .fillModeNonSolid = VK_TRUE, .depthClamp = VK_TRUE, .depthBiasClamp = VK_TRUE,
+             .imageCubeArray = VK_TRUE,
+             .shaderStorageImageReadWithoutFormat = VK_TRUE,
+             .shaderStorageImageWriteWithoutFormat = VK_TRUE,
+-- 
+2.43.0
+

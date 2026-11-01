@@ -1,0 +1,85 @@
+From 6cf10c0bce666ac292d9438997ca03d9030a83aa Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Sat, 31 Oct 2026 16:51:26 +0200
+Subject: [PATCH] hw/display/pvg: dmabuf scanout diagnostics
+
+PVG_SCANOUT_CHECK=1 copies the exported scanout images back and logs how
+many sampled pixels are non-black; PVG_SCANOUT_LINEAR=1 restricts the
+images to the linear DRM modifier. Scanout images get TRANSFER_SRC usage
+for the read-back.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/pvg-exec.c | 35 ++++++++++++++++++++++++++++++++---
+ 1 file changed, 32 insertions(+), 3 deletions(-)
+
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index 0fe3e1f..cbf2467 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -266,7 +266,7 @@ struct PVGExec {
+         int fd;
+     } scan[PVG_SCANOUT_BUFS];
+     PVGScanout scan_info;       /* of the current set (generation changes with the size) */
+-    uint32_t scan_next;
++    uint32_t scan_next, scan_checks;
+ 
+     GHashTable *images;         /* key: task << 32 | id → HostImage* */
+     GHashTable *pipelines;      /* key: task << 32 | id → Pipeline* */
+@@ -2733,7 +2733,8 @@ static bool scanout_init(PVGExec *e, uint32_t w, uint32_t h)
+     vkGetPhysicalDeviceFormatProperties2(g->phys, VK_FORMAT_B8G8R8A8_UNORM, &fp);
+     for (uint32_t i = 0; i < ml.drmFormatModifierCount && i < 32; i++) {
+         if (mp[i].drmFormatModifierPlaneCount == 1 &&
+-            (mp[i].drmFormatModifierTilingFeatures & VK_FORMAT_FEATURE_TRANSFER_DST_BIT)) {
++            (mp[i].drmFormatModifierTilingFeatures & VK_FORMAT_FEATURE_TRANSFER_DST_BIT) &&
++            (!g_getenv("PVG_SCANOUT_LINEAR") || mp[i].drmFormatModifier == 0)) {
+             mods[nmods++] = mp[i].drmFormatModifier;
+         }
+     }
+@@ -2754,7 +2755,7 @@ static bool scanout_init(PVGExec *e, uint32_t w, uint32_t h)
+             .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_B8G8R8A8_UNORM,
+             .extent = { w, h, 1 }, .mipLevels = 1, .arrayLayers = 1,
+             .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+-            .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++            .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+         };
+         VkMemoryDedicatedAllocateInfo dai = {
+@@ -2907,6 +2908,34 @@ int pvg_exec_scanout(PVGExec *e, uint32_t task, uint64_t va, uint32_t width, uin
+     }
+     e->arena_used = mark;
+     e->stats.surface_reads += hi != NULL;
++    if (g_getenv("PVG_SCANOUT_CHECK") && e->scan_checks++ < 20) {
++        /* diagnostics: what the exported image holds (copied back through the arena) */
++        VkBufferImageCopy r = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++                                .imageExtent = { width, height, 1 } };
++        uint64_t n = 0, coff = arena_alloc(e, (uint64_t)width * height * 4);
++
++        if (coff != UINT64_MAX) {
++            r.bufferOffset = coff;
++            vkResetCommandBuffer(e->cmd, 0);
++            vkBeginCommandBuffer(e->cmd, &bi);
++            barrier(e, e->scan[idx].image, VK_IMAGE_LAYOUT_GENERAL,
++                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++            vkCmdCopyImageToBuffer(e->cmd, e->scan[idx].image,
++                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, e->arena, 1, &r);
++            vkEndCommandBuffer(e->cmd);
++            if (submit_wait(e, &si)) {
++                const uint32_t *px = (const uint32_t *)(e->arena_ptr + coff);
++
++                for (uint64_t k = 0; k < (uint64_t)width * height; k += 97) {
++                    n += (px[k] & 0xffffff) != 0;
++                }
++            }
++            e->arena_used = mark;
++        }
++        elog(e, "scanout check %ux%u buf %u from %s: %" G_GUINT64_FORMAT "/%" G_GUINT64_FORMAT
++             " sampled pixels non-black", width, height, idx, hi ? "GPU image" : "guest memory",
++             n, (uint64_t)width * height / 97);
++    }
+     *info = e->scan_info;
+     return (int)idx;
+ }
+-- 
+2.43.0
+

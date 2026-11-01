@@ -1,0 +1,345 @@
+From f8fe15147fff009d9926e40a0f57952ea9621984 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 18:29:52 +0200
+Subject: [PATCH 31/54] hw/display/pvg: kernel coverage and run-37 validation
+ fixes
+
+air2spv: llvm.umax/umin/smax/smin/abs, air.pack/unpack (unorm/snorm 4x8,
+2x16, half2x16), air.wg.barrier -> OpControlBarrier, signed ConstOffset
+(texel offsets were emitted unsigned: -1 became 4294967295), resource
+handles found through nested insertvalue/extractvalue wrappers (CoreImage
+coreimage::Sampler_h). Executor: maintenance4 (LocalSizeId), pipelines
+keyed by topology class, tracked image layouts for kernel read-back, one
+upload per texture per dispatch, diagnostics for unresolvable textures.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/air2spv.c  | 113 +++++++++++++++++++++++++++++++++++++-
+ hw/display/pvg/pvg-exec.c |  61 ++++++++++++++++----
+ hw/display/pvg/pvg-gpu.c  |   1 +
+ 3 files changed, 163 insertions(+), 12 deletions(-)
+
+diff --git a/hw/display/pvg/air2spv.c b/hw/display/pvg/air2spv.c
+index 0e622b1..f46cf3b 100644
+--- a/hw/display/pvg/air2spv.c
++++ b/hw/display/pvg/air2spv.c
+@@ -586,8 +586,51 @@ static uint32_t image_type(Ctx *c, const char *tname, uint32_t *dim, bool *array
+     return spv_type(&c->m, SpvOpTypeImage, ops, 7);
+ }
+ 
++/*
++ * The value an extractvalue chain reads out of insertvalue chains (resource handles wrapped in
++ * by-value structs such as metal::texture2d or coreimage::Sampler_h after inlining), or NULL.
++ */
++static LLVMValueRef unwrap_aggregate(LLVMValueRef v)
++{
++    unsigned path[16], np = 0;
++
++    for (int guard = 0; v && guard < 256; guard++) {
++        if (LLVMIsAExtractValueInst(v)) {
++            unsigned n = LLVMGetNumIndices(v);
++
++            if (np + n > 16) {
++                return NULL;
++            }
++            memmove(path + n, path, np * sizeof(path[0]));
++            memcpy(path, LLVMGetIndices(v), n * sizeof(path[0]));
++            np += n;
++            v = LLVMGetOperand(v, 0);
++        } else if (np && LLVMIsAInsertValueInst(v)) {
++            unsigned n = LLVMGetNumIndices(v), m = n < np ? n : np;
++
++            if (memcmp(LLVMGetIndices(v), path, m * sizeof(path[0]))) {
++                v = LLVMGetOperand(v, 0);       /* another member */
++            } else if (n <= np) {
++                v = LLVMGetOperand(v, 1);       /* the member, or a struct containing it */
++                memmove(path, path + n, (np - n) * sizeof(path[0]));
++                np -= n;
++            } else {
++                return NULL;                    /* only part of the wanted member is known */
++            }
++        } else {
++            break;
++        }
++    }
++    return np ? NULL : v;
++}
++
+ static Resource *resource_for(Ctx *c, LLVMValueRef v)
+ {
++    LLVMValueRef u = v && LLVMIsAExtractValueInst(v) ? unwrap_aggregate(v) : NULL;
++
++    if (u) {
++        v = u;
++    }
+     for (int i = 0; i < c->nrsrc; i++) {
+         if (c->rsrc[i].key == v) {
+             return &c->rsrc[i];
+@@ -1500,8 +1543,20 @@ static int texture_call(Ctx *c, LLVMValueRef call, const char *name, uint32_t re
+             nops = 4;
+         }
+         if (offset) {
++            /* ConstOffset must be a signed integer vector */
++            uint32_t i32 = spv_type_int(&c->m, 32, true), comps[4];
++            unsigned on = LLVMGetVectorSize(LLVMTypeOf(offset_arg));
++
++            for (unsigned k = 0; k < on && k < 4; k++) {
++                LLVMValueRef el = LLVMGetAggregateElement(offset_arg, k);
++                uint32_t w = (uint32_t)(el && LLVMIsAConstantInt(el) ?
++                                        LLVMConstIntGetSExtValue(el) : 0);
++
++                comps[k] = spv_const(&c->m, SpvOpConstant, i32, &w, 1);
++            }
+             mask |= SpvImageOperandsConstOffset;
+-            ops[nops == 2 ? 3 : 4] = const_val(c, offset_arg);
++            ops[nops == 2 ? 3 : 4] = on == 1 ? comps[0] :
++                spv_const(&c->m, SpvOpConstantComposite, spv_type_vec(&c->m, i32, on), comps, on);
+             nops = nops == 2 ? 4 : 5;
+         }
+         ops[2] = mask;
+@@ -1536,9 +1591,16 @@ static int call_inst(Ctx *c, LLVMValueRef call, uint32_t result)
+             { "sqrt", GLSLstd450Sqrt }, { "exp2", GLSLstd450Exp2 }, { "log2", GLSLstd450Log2 },
+             { "exp", GLSLstd450Exp }, { "log", GLSLstd450Log }, { "sin", GLSLstd450Sin },
+             { "cos", GLSLstd450Cos }, { "pow", GLSLstd450Pow },
++            { "umax", GLSLstd450UMax }, { "umin", GLSLstd450UMin },
++            { "smax", GLSLstd450SMax }, { "smin", GLSLstd450SMin },
+         };
+         const char *n = full + 5;
+ 
++        if (!strncmp(n, "abs.i", 5)) {
++            args[0] = val(c, LLVMGetOperand(call, 0));
++            ext(c, rty, result, GLSLstd450SAbs, args, 1);
++            return 0;
++        }
+         if (!strncmp(n, "lifetime.", 9) || !strncmp(n, "assume", 6) ||
+             !strncmp(n, "experimental.noalias", 20) || !strncmp(n, "dbg.", 4)) {
+             return 0;
+@@ -1566,6 +1628,49 @@ static int call_inst(Ctx *c, LLVMValueRef call, uint32_t result)
+     dot = strchr(full, '.');
+     snprintf(base, sizeof(base), "%.*s", dot ? (int)(dot - full) : (int)strlen(full), full);
+ 
++    if ((!strcmp(base, "pack") || !strcmp(base, "unpack")) && dot) {
++        /* air.pack.unorm4x8.v4f32 / air.unpack.unorm4x8.v4f32 ... -> GLSL.std.450 */
++        static const struct { const char *name; int pack, unpack; } pk[] = {
++            { "snorm4x8", 54, 63 }, { "unorm4x8", 55, 64 }, { "snorm2x16", 56, 60 },
++            { "unorm2x16", 57, 61 }, { "half2x16", 58, 62 },
++        };
++        bool pack = !strcmp(base, "pack");
++
++        for (size_t i = 0; i < sizeof(pk) / sizeof(pk[0]); i++) {
++            if (!strncmp(dot + 1, pk[i].name, strlen(pk[i].name))) {
++                uint32_t arg = val(c, LLVMGetOperand(call, 0));
++                LLVMTypeRef at = LLVMTypeOf(LLVMGetOperand(call, 0));
++
++                if (LLVMGetTypeKind(at) == LLVMVectorTypeKind &&
++                    LLVMGetTypeKind(LLVMGetElementType(at)) == LLVMHalfTypeKind) {
++                    arg = emit(c, SpvOpFConvert, spv_type_vec(&c->m, c->t_f32,
++                               LLVMGetVectorSize(at)), 0, &arg, 1);
++                }
++                if (pack || LLVMGetTypeKind(LLVMGetElementType(rt)) == LLVMFloatTypeKind) {
++                    ext(c, rty, result, pack ? pk[i].pack : pk[i].unpack, &arg, 1);
++                } else {
++                    /* unpack into a half vector: unpack to float, then narrow */
++                    uint32_t f = spv_type_vec(&c->m, c->t_f32, LLVMGetVectorSize(rt));
++                    uint32_t tmp = ext(c, f, 0, pk[i].unpack, &arg, 1);
++
++                    emit(c, SpvOpFConvert, rty, result, &tmp, 1);
++                }
++                return 0;
++            }
++        }
++    }
++    if (!strcmp(base, "wg") && dot && !strncmp(dot + 1, "barrier", 7)) {
++        /* air.wg.barrier(i32 mem_flags: 1 device, 2 threadgroup, 4 texture; i32 scope) */
++        LLVMValueRef fl = nargs > 0 ? LLVMGetOperand(call, 0) : NULL;
++        uint32_t f = fl && LLVMIsAConstantInt(fl) ? (uint32_t)LLVMConstIntGetZExtValue(fl) : 7;
++        uint32_t sem = (f ? 0x8 : 0) | (f & 1 ? 0x40 : 0) | (f & 2 ? 0x100 : 0) |
++                       (f & 4 ? 0x800 : 0);    /* AcquireRelease, Uniform/Workgroup/Image */
++        uint32_t ops[3] = { spv_const_u32(&c->m, 2), spv_const_u32(&c->m, 2),
++                            spv_const_u32(&c->m, sem) };   /* Workgroup scopes */
++
++        spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpControlBarrier, ops, 3);
++        return 0;
++    }
+     if (!strncmp(base, "write_texture", 13)) {
+         /* write_texture_2d(tex, int2 coord, value, i32 lod, i32 access) */
+         Resource *tex = resource_for(c, LLVMGetOperand(call, 0));
+@@ -2363,6 +2468,12 @@ static int instruction(Ctx *c, Cfg *g, int bi, LLVMValueRef inst)
+         bool ins = op == LLVMInsertValue;
+         size_t k = 0;
+ 
++        if (ins && resource_for(c, LLVMGetOperand(inst, 1))) {
++            /* a texture/sampler handle is not data: users find it via resource_for() */
++            ops[0] = val(c, LLVMGetOperand(inst, 0));
++            emit(c, SpvOpCopyObject, tid, r, ops, 1);
++            return 0;
++        }
+         if (ins) {
+             ops[k++] = val(c, LLVMGetOperand(inst, 1));
+         }
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index 4e92799..48e3805 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -79,6 +79,7 @@ typedef struct HostImage {
+     VkFormat format;
+     uint32_t width, height, depth, layers, mips;
+     VkImageViewType view_type;
++    VkImageLayout layout;       /* after the last image_upload */
+     bool initialized;           /* depth/stencil: contents defined (host-only images) */
+ } HostImage;
+ 
+@@ -154,6 +155,7 @@ struct PVGExec {
+     GHashTable *uploaded;       /* per command buffer: task << 32 | id → arena offset + 1 */
+     GHashTable *samplers;       /* task << 32 | id → VkSampler (as pointer) */
+     uint32_t upload_failures, ds_kind_logged, ds_states_logged, ds_dumps, blends_logged;
++    uint32_t texfail_logged;
+     DSAttachmentSave last_ds;
+     HostImage dummy[7];         /* 1x1 placeholders per VkImageViewType */
+     GHashTable *written;
+@@ -264,6 +266,14 @@ static VkBlendFactor mtl_blend_factor(uint32_t f)
+     return f < G_N_ELEMENTS(map) ? map[f] : VK_BLEND_FACTOR_ONE;
+ }
+ 
++/* pipelines are built per topology class: Vulkan only lets the topology vary within one */
++static VkPrimitiveTopology topology_class(uint32_t t)
++{
++    return t == 0 ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST :
++           t == 1 || t == 2 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST :
++           VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++}
++
+ static VkPrimitiveTopology mtl_topology(uint32_t t)
+ {
+     switch (t) {
+@@ -740,6 +750,7 @@ static bool image_upload(PVGExec *e, const GuestImage *gi, HostImage *hi, VkImag
+     vkCmdCopyBufferToImage(e->cmd, e->arena, hi->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            gi->mips, r);
+     barrier(e, hi->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, final);
++    hi->layout = final;
+     e->stats.uploads++;
+     return true;
+ }
+@@ -961,11 +972,11 @@ static VkShaderModule shader_module(PVGExec *e, const A2SResult *r)
+ /* pipelines are specialised per render pass attachment formats (dynamic rendering needs a match) */
+ static Pipeline *pipeline_get(PVGExec *e, uint32_t task, uint32_t ref, const VkFormat *pass_formats,
+                               uint32_t npass, VkFormat dfmt, VkFormat sfmt,
+-                              const uint32_t unnorm[2])
++                              const uint32_t unnorm[2], VkPrimitiveTopology topo)
+ {
+     PVGGpu *g = e->gpu;
+-    g_autofree char *key = g_strdup_printf("%u:%u:%d,%d:%x,%x:%d,%d,%d,%d,%d,%d,%d,%d", task,
+-        ref, dfmt, sfmt, unnorm[0], unnorm[1],
++    g_autofree char *key = g_strdup_printf("%u:%u:%d,%d:%x,%x:t%d:%d,%d,%d,%d,%d,%d,%d,%d", task,
++        ref, dfmt, sfmt, unnorm[0], unnorm[1], topo,
+         pass_formats[0], npass > 1 ? pass_formats[1] : 0, npass > 2 ? pass_formats[2] : 0,
+         npass > 3 ? pass_formats[3] : 0, npass > 4 ? pass_formats[4] : 0,
+         npass > 5 ? pass_formats[5] : 0, npass > 6 ? pass_formats[6] : 0,
+@@ -1218,7 +1229,7 @@ static Pipeline *pipeline_get(PVGExec *e, uint32_t task, uint32_t ref, const VkF
+             .vertexAttributeDescriptionCount = nattr, .pVertexAttributeDescriptions = vattr };
+         VkPipelineInputAssemblyStateCreateInfo ia = {
+             .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+-            .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
++            .topology = topo };     /* class only: the exact topology is dynamic */
+         VkPipelineViewportStateCreateInfo vp = {
+             .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+             .viewportCount = 1, .scissorCount = 1 };
+@@ -2130,7 +2141,8 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                 break;
+             }
+             pp = st.pipeline ? pipeline_get(e, task, st.pipeline, formats, natt, dfmt, sfmt,
+-                                                   unnorm_masks(e, task, &st, unnorm)) : NULL;
++                                                   unnorm_masks(e, task, &st, unnorm),
++                                                   topology_class(prim)) : NULL;
+             if (pp && pp->draws_logged < 3) {
+                 pp->draws_logged++;
+                 elog(e, "task %u pipeline %u draw 0x%x prim %u count %u first %u inst %u "
+@@ -2656,23 +2668,49 @@ static void exec_compute_segment(PVGExec *e, uint32_t task, const uint8_t *p, ui
+             stl(pc + A2S_PUSH_GRID, grid[0]);
+             stl(pc + A2S_PUSH_GRID + 4, grid[1]);
+             stl(pc + A2S_PUSH_GRID + 8, grid[2]);
+-            /* textures: sampled or storage images, uploaded from guest memory */
++            /*
++             * textures: sampled or storage images, uploaded from guest memory once per
++             * dispatch; a texture that is also bound for writing stays in GENERAL everywhere
++             */
++            uint32_t up_ref[32], nup = 0;
++
+             for (int i = 0; i < 32; i++) {
+                 GuestImage gi;
+                 HostImage *hi = NULL;
+-                bool storage = pp->storage_mask >> i & 1;
++                bool storage = pp->storage_mask >> i & 1, general = storage, seen = false;
+ 
+                 if (!(pp->fs_textures >> i & 1)) {
+                     continue;
+                 }
++                for (int k = 0; k < MAX_SLOTS && i < MAX_SLOTS; k++) {
++                    general |= (pp->storage_mask >> k & 1) && cs.tex[k] == cs.tex[i];
++                }
++                for (uint32_t k = 0; i < MAX_SLOTS && k < nup; k++) {
++                    seen |= up_ref[k] == cs.tex[i];
++                }
+                 if (i < MAX_SLOTS && cs.tex[i] && guest_image(e, task, cs.tex[i], &gi) &&
+                     gi.view_type == pp->texture_view[i] &&
+                     (hi = host_image(e, task, cs.tex[i], &gi, false))) {
+-                    image_upload(e, &gi, hi, storage ? VK_IMAGE_LAYOUT_GENERAL :
+-                                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++                    if (!seen) {
++                        image_upload(e, &gi, hi, general ? VK_IMAGE_LAYOUT_GENERAL :
++                                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++                        up_ref[nup++] = cs.tex[i];
++                    }
+                     if (storage && nout < G_N_ELEMENTS(out)) {
+                         out[nout++] = (ComputeOutput){ .image = true, .gi = gi, .hi = hi };
+                     }
++                } else if (i < MAX_SLOTS && cs.tex[i] && e->texfail_logged < 40) {
++                    uint8_t obj[MAX_OBJ];
++                    uint32_t olen;
++                    uint8_t ty = object(e, task, cs.tex[i], obj, &olen);
++
++                    e->texfail_logged++;
++                    elog(e, "task %u kernel %s: texture %d ref %u: object type 0x%x len 0x%x "
++                         "words %08x %08x %08x %08x | tail %08x %08x %08x %08x", task,
++                         pp->fs_name, i, cs.tex[i], ty, olen, ldl(obj), ldl(obj + 4),
++                         ldl(obj + 8), ldl(obj + 12), olen >= 16 ? ldl(obj + olen - 16) : 0,
++                         olen >= 12 ? ldl(obj + olen - 12) : 0,
++                         olen >= 8 ? ldl(obj + olen - 8) : 0, olen >= 4 ? ldl(obj + olen - 4) : 0);
+                 }
+                 if (!hi) {
+                     hi = dummy_image(e, pp->texture_view[i]);
+@@ -2685,7 +2723,7 @@ static void exec_compute_segment(PVGExec *e, uint32_t task, const uint8_t *p, ui
+                     }
+                 }
+                 ii[nw] = (VkDescriptorImageInfo){ .imageView = hi->view,
+-                    .imageLayout = storage ? VK_IMAGE_LAYOUT_GENERAL :
++                    .imageLayout = hi->layout == VK_IMAGE_LAYOUT_GENERAL ? VK_IMAGE_LAYOUT_GENERAL :
+                                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+                 w[nw] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                     .dstBinding = A2S_TEXTURE_BINDING + i, .descriptorCount = 1,
+@@ -2760,8 +2798,9 @@ static void exec_compute_segment(PVGExec *e, uint32_t task, const uint8_t *p, ui
+                 continue;
+             }
+             r.bufferOffset = out[i].arena_off;
+-            barrier(e, out[i].hi->image, VK_IMAGE_LAYOUT_GENERAL,
++            barrier(e, out[i].hi->image, out[i].hi->layout,
+                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++            out[i].hi->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+             vkCmdCopyImageToBuffer(e->cmd, out[i].hi->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                    e->arena, 1, &r);
+             out[i].size = size;
+diff --git a/hw/display/pvg/pvg-gpu.c b/hw/display/pvg/pvg-gpu.c
+index f66fe27..1030190 100644
+--- a/hw/display/pvg/pvg-gpu.c
++++ b/hw/display/pvg/pvg-gpu.c
+@@ -59,6 +59,7 @@ int pvg_gpu_init(PVGGpu *g, bool validation, char *err, size_t errlen)
+     VkPhysicalDeviceVulkan13Features f13 = {
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+         .shaderDemoteToHelperInvocation = VK_TRUE, .dynamicRendering = VK_TRUE,
++        .maintenance4 = VK_TRUE,    /* LocalSizeId (kernel threadgroup size as spec constants) */
+         .synchronization2 = VK_TRUE,
+     };
+     VkPhysicalDeviceVulkan12Features f12 = {
+-- 
+2.43.0
+

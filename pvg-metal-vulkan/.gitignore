@@ -1,0 +1,17 @@
+src/
+tools/
+re/
+build/
+*.qcow2
+*.log
+scripts/a2s-check/a2s-check
+logs/
+__pycache__/
+# never committed
+docs/pvg-protocol.md
+docs/pvg-decoder-tables.txt
+# Apple material collected from the guest (also under re/)
+*.rom
+dyld_shared_cache*
+CLAUDE.md
+.claude/

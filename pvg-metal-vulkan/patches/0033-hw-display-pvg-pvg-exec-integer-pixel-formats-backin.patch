@@ -1,0 +1,59 @@
+From 71c03b4b0c679d2328f039230c1f8b966559e6cf Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 19:18:46 +0200
+Subject: [PATCH 33/54] hw/display/pvg/pvg-exec: integer pixel formats;
+ backing-ref textures use their own size
+
+VideoToolbox views IOSurfaces as R32Uint / RGBA32Uint textures whose size
+differs from the surface plane's.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/pvg-exec.c | 24 ++++++++++++++++++++++--
+ 1 file changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index 235d002..3dd13c4 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -223,6 +223,25 @@ static VkFormat mtl_pixel_format(uint32_t f, uint32_t *bpp, VkComponentMapping *
+     case 90: *bpp = 4; return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+     case 92: *bpp = 4; return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+     case 94: *bpp = 4; return VK_FORMAT_A2R10G10B10_UNORM_PACK32;
++    case 13: *bpp = 1; return VK_FORMAT_R8_UINT;
++    case 14: *bpp = 1; return VK_FORMAT_R8_SINT;
++    case 23: *bpp = 2; return VK_FORMAT_R16_UINT;
++    case 24: *bpp = 2; return VK_FORMAT_R16_SINT;
++    case 33: *bpp = 2; return VK_FORMAT_R8G8_UINT;
++    case 34: *bpp = 2; return VK_FORMAT_R8G8_SINT;
++    case 53: *bpp = 4; return VK_FORMAT_R32_UINT;
++    case 54: *bpp = 4; return VK_FORMAT_R32_SINT;
++    case 63: *bpp = 4; return VK_FORMAT_R16G16_UINT;
++    case 64: *bpp = 4; return VK_FORMAT_R16G16_SINT;
++    case 73: *bpp = 4; return VK_FORMAT_R8G8B8A8_UINT;
++    case 74: *bpp = 4; return VK_FORMAT_R8G8B8A8_SINT;
++    case 91: *bpp = 4; return VK_FORMAT_A2B10G10R10_UINT_PACK32;
++    case 103: *bpp = 8; return VK_FORMAT_R32G32_UINT;
++    case 104: *bpp = 8; return VK_FORMAT_R32G32_SINT;
++    case 113: *bpp = 8; return VK_FORMAT_R16G16B16A16_UINT;
++    case 114: *bpp = 8; return VK_FORMAT_R16G16B16A16_SINT;
++    case 123: *bpp = 16; return VK_FORMAT_R32G32B32A32_UINT;
++    case 124: *bpp = 16; return VK_FORMAT_R32G32B32A32_SINT;
+     case 105: *bpp = 8; return VK_FORMAT_R32G32_SFLOAT;
+     case 110: *bpp = 8; return VK_FORMAT_R16G16B16A16_UNORM;
+     case 115: *bpp = 8; return VK_FORMAT_R16G16B16A16_SFLOAT;
+@@ -533,8 +552,9 @@ static bool guest_image_ex(PVGExec *e, uint32_t task, uint32_t ref, int level, u
+         pl = bobj + 0x14 + 16 * plane;
+         gi->task = 0;
+         gi->va = ((uint64_t)ldl(bobj + 0x08) << 12) + ldl(pl);
+-        gi->width = ldl(pl + 4);
+-        gi->height = ldl(pl + 8);
++        /* a texture may view the surface's pixels in another format: its own size wins */
++        gi->width = ldl(desc + 4) ? ldl(desc + 4) : ldl(pl + 4);
++        gi->height = ldl(desc + 8) ? ldl(desc + 8) : ldl(pl + 8);
+         gi->row_bytes = ldl(pl + 12) & 0xffffff;
+         gi->view_type = VK_IMAGE_VIEW_TYPE_2D;
+         gi->depth = gi->layers = 1;
+-- 
+2.43.0
+

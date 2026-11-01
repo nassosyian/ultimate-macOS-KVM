@@ -1,0 +1,239 @@
+From 08c04721040c17981e2155793833e87fa1ca06b7 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Sat, 31 Oct 2026 13:30:21 +0200
+Subject: [PATCH] hw/display/pvg: guest fixup for Metal's argument-encoder
+ abort
+
+The Games app crashed seconds after launch: VFX (animated game icons) asks
+for an argument encoder, -[MTLIOAccelDevice newIndirectArgumentEncoder-
+WithLayout:] is an abort() stub, and the x86 paravirtual GPU plugin does
+not override it (it reports no argument buffer support). Patch it to
+return nil (the caller continues without an encoder), with a RAM-scan
+signature and an instruction breakpoint like the sliceIDForDevice fixup.
+
+kvm: kvm_set_host_breakpoints() takes up to two addresses.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/pvg-guest-fixups.c | 61 ++++++++++++++++++++++++-------
+ include/system/kvm.h              | 13 ++++---
+ target/i386/kvm/kvm.c             | 30 ++++++++++-----
+ 3 files changed, 76 insertions(+), 28 deletions(-)
+
+diff --git a/hw/display/pvg/pvg-guest-fixups.c b/hw/display/pvg/pvg-guest-fixups.c
+index 6bddecf..aae25e9 100644
+--- a/hw/display/pvg/pvg-guest-fixups.c
++++ b/hw/display/pvg/pvg-guest-fixups.c
+@@ -75,17 +75,40 @@ static const uint8_t slice_branch_sig[] = {
+ };
+ static const uint8_t je_next[] = { 0x00 };
+ 
++/*
++ * -[MTLIOAccelDevice newIndirectArgumentEncoderWithLayout:], Metal 26.x: the base class aborts
++ * and the paravirtual GPU plugin does not override it (it reports no argument buffer support,
++ * but VFX, e.g. the Games app's icons, asks for an encoder anyway). Returning nil instead lets
++ * the caller go on without one (messages to nil do nothing).
++ */
++static const uint8_t arg_encoder_sig[] = {
++    0x55, 0x48, 0x89, 0xe5,                     /* push rbp; mov rbp, rsp */
++    0xe8, 0x6d, 0x90, 0x00, 0x00,               /* call abort */
++    0x00, 0x00, 0x00, 0x00,                     /* padding */
++};
++static const uint8_t return_nil[] = { 0x31, 0xc0, 0xc3 };      /* xor eax, eax; ret */
++
+ static const GuestFixup fixups[] = {
+     { "Metal sliceIDForDevice nil-architecture assertion", slice_cold_sig,
+       sizeof(slice_cold_sig), 0x31b, 0, ret_insn, sizeof(ret_insn) },
+     { "Metal sliceIDForDevice nil-architecture branch", slice_branch_sig,
+       sizeof(slice_branch_sig), 0x36a, 13, je_next, sizeof(je_next) },
++    { "Metal newIndirectArgumentEncoderWithLayout abort", arg_encoder_sig,
++      sizeof(arg_encoder_sig), 0x4ec, 0, return_nil, sizeof(return_nil) },
+ };
+ 
+-/* dyld shared cache of this macOS build: unslid base and the branch's `je` (fixups[1] + 12) */
++/*
++ * dyld shared cache of this macOS build: unslid base, and the instructions that get a
++ * breakpoint (their pages may be read in by the very call that needs the patch)
++ */
+ #define SHARED_CACHE_BASE   0x7ff800000000ULL
+-#define BRANCH_JE_UNSLID    0x7ff80f5b7376ULL
+-#define BRANCH_FIXUP        1
++static const struct {
++    uint64_t unslid;            /* instruction address in the unslid cache */
++    unsigned fixup;
++} breakpoints[] = {
++    { 0x7ff80f5b7376ULL, 1 },   /* the sliceIDForDevice branch's `je` (fixups[1] + 12) */
++    { 0x7ff80f66d4ecULL, 2 },   /* newIndirectArgumentEncoderWithLayout: */
++};
+ /* vCPUs are rarely caught in user mode: sample often (a cheap walk) until it is armed */
+ #define SLIDE_SEARCH_MS     50
+ 
+@@ -107,7 +130,8 @@ struct PVGGuestFixups {
+     unsigned nsites[ARRAY_SIZE(fixups)];
+     uint64_t patches;
+     QEMUTimer *bp_timer;        /* main loop: looks for the cache slide until the bp is armed */
+-    uint64_t bp_addr;           /* armed instruction breakpoint (0: none) */
++    uint64_t bp_addr;           /* breakpoints armed (the first one's address; 0: none) */
++    uint64_t slide;             /* of the shared cache, this boot */
+     uint64_t bp_hits;
+ };
+ 
+@@ -238,13 +262,18 @@ static void *fixup_thread(void *opaque)
+ static void branch_bp_hit(CPUState *cs, uint64_t pc, void *opaque)
+ {
+     PVGGuestFixups *f = opaque;
+-    const GuestFixup *fx = &fixups[BRANCH_FIXUP];
++    const GuestFixup *fx = NULL;
+     TranslateForDebugResult tr;
+-    uint8_t buf[sizeof(slice_branch_sig)];
++    uint8_t buf[64];
+     hwaddr site;
+ 
+     f->bp_hits++;
+-    if (!cpu_translate_for_debug(cs, pc, &tr)) {
++    for (size_t i = 0; i < ARRAY_SIZE(breakpoints); i++) {
++        if (pc == breakpoints[i].unslid + f->slide) {
++            fx = &fixups[breakpoints[i].fixup];
++        }
++    }
++    if (!fx || fx->sig_len > sizeof(buf) || !cpu_translate_for_debug(cs, pc, &tr)) {
+         return;
+     }
+     site = (tr.physaddr & ~(hwaddr)0xfff) + fx->page_off;
+@@ -302,10 +331,16 @@ static void bp_search(void *opaque)
+         if (c.header_va) {
+             uint64_t slide = c.header_va - SHARED_CACHE_BASE;
+ 
+-            qatomic_set(&f->bp_addr, BRANCH_JE_UNSLID + slide);
+-            kvm_set_host_breakpoint(f->bp_addr, branch_bp_hit, f);
+-            fx_log(f, "guest fixup: shared cache slide 0x%" PRIx64 ", breakpoint at 0x%" PRIx64,
+-                   slide, f->bp_addr);
++            uint64_t addrs[ARRAY_SIZE(breakpoints)];
++
++            f->slide = slide;
++            for (size_t i = 0; i < ARRAY_SIZE(breakpoints); i++) {
++                addrs[i] = breakpoints[i].unslid + slide;
++            }
++            qatomic_set(&f->bp_addr, addrs[0]);
++            kvm_set_host_breakpoints(addrs, ARRAY_SIZE(addrs), branch_bp_hit, f);
++            fx_log(f, "guest fixup: shared cache slide 0x%" PRIx64 ", %zu breakpoints", slide,
++                   ARRAY_SIZE(addrs));
+             return;
+         }
+     }
+@@ -319,7 +354,7 @@ void pvg_guest_fixups_reset(PVGGuestFixups *f)
+     }
+     if (f->bp_addr) {
+         qatomic_set(&f->bp_addr, 0);
+-        kvm_set_host_breakpoint(0, NULL, NULL);     /* the next boot has another slide */
++        kvm_set_host_breakpoints(NULL, 0, NULL, NULL);     /* the next boot has another slide */
+     }
+     timer_mod(f->bp_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + SLIDE_SEARCH_MS);
+ }
+@@ -348,7 +383,7 @@ void pvg_guest_fixups_stop(PVGGuestFixups *f)
+     if (f->bp_timer) {
+         timer_free(f->bp_timer);
+         if (f->bp_addr) {
+-            kvm_set_host_breakpoint(0, NULL, NULL);
++            kvm_set_host_breakpoints(NULL, 0, NULL, NULL);
+         }
+     }
+     qemu_mutex_lock(&f->lock);
+diff --git a/include/system/kvm.h b/include/system/kvm.h
+index 82c4ad8..e03641b 100644
+--- a/include/system/kvm.h
++++ b/include/system/kvm.h
+@@ -462,13 +462,16 @@ int kvm_arch_on_vmfd_change(MachineState *ms, KVMState *s);
+ void kvm_cpu_synchronize_state(CPUState *cpu);
+ 
+ /*
+- * One instruction breakpoint at guest linear address addr on every vCPU, owned by host code
+- * rather than the gdbstub (x86 KVM only). fn runs on the vCPU thread with the CPU state
+- * synchronized; the vCPU then executes the instruction and continues. addr 0 removes it.
+- * Call with the BQL held, outside vCPU threads.
++ * Instruction breakpoints at guest linear addresses addrs[0..n) on every vCPU, owned by host
++ * code rather than the gdbstub (x86 KVM only; at most KVM_HOST_BP_MAX, in debug registers the
++ * gdbstub leaves free). fn runs on the vCPU thread with the CPU state synchronized; the vCPU
++ * then executes the instruction and continues. n 0 removes them. Call with the BQL held,
++ * outside vCPU threads.
+  */
++#define KVM_HOST_BP_MAX 2
+ typedef void KVMHostBreakpointFn(CPUState *cpu, uint64_t pc, void *opaque);
+-void kvm_set_host_breakpoint(uint64_t addr, KVMHostBreakpointFn *fn, void *opaque);
++void kvm_set_host_breakpoints(const uint64_t *addrs, int n, KVMHostBreakpointFn *fn,
++                              void *opaque);
+ 
+ /*
+  * x86: call fn(va, pa) for each present page of start..end (page aligned) in cpu's current
+diff --git a/target/i386/kvm/kvm.c b/target/i386/kvm/kvm.c
+index caeb841..3479726 100644
+--- a/target/i386/kvm/kvm.c
++++ b/target/i386/kvm/kvm.c
+@@ -6240,9 +6240,10 @@ void kvm_arch_remove_all_gdbstub_hw_breakpoints(void)
+ 
+ static CPUWatchpoint hw_watchpoint;
+ 
+-/* one instruction breakpoint owned by host code, after the gdbstub's (kvm_set_host_breakpoint) */
++/* instruction breakpoints owned by host code, after the gdbstub's (kvm_set_host_breakpoints) */
+ static struct {
+-    uint64_t addr;
++    uint64_t addr[KVM_HOST_BP_MAX];
++    int n;
+     KVMHostBreakpointFn *fn;
+     void *opaque;
+ } host_bp;
+@@ -6252,13 +6253,17 @@ static void kvm_host_bp_update(CPUState *cpu, run_on_cpu_data data)
+     kvm_update_guest_debug(cpu, 0);
+ }
+ 
+-void kvm_set_host_breakpoint(uint64_t addr, KVMHostBreakpointFn *fn, void *opaque)
++void kvm_set_host_breakpoints(const uint64_t *addrs, int n, KVMHostBreakpointFn *fn,
++                              void *opaque)
+ {
+     CPUState *cpu;
+ 
+     host_bp.fn = fn;
+     host_bp.opaque = opaque;
+-    host_bp.addr = addr;
++    host_bp.n = MIN(MAX(n, 0), KVM_HOST_BP_MAX);
++    for (int i = 0; i < host_bp.n; i++) {
++        host_bp.addr[i] = addrs[i];
++    }
+     CPU_FOREACH(cpu) {
+         run_on_cpu(cpu, kvm_host_bp_update, RUN_ON_CPU_NULL);
+     }
+@@ -6335,8 +6340,11 @@ static int kvm_handle_debug(X86CPU *cpu,
+     int ret = 0;
+     int n;
+ 
+-    if (host_bp.addr && arch_info->exception == EXCP01_DB &&
+-        !(arch_info->dr6 & DR6_BS) && arch_info->pc == host_bp.addr) {
++    for (n = 0; n < host_bp.n && arch_info->exception == EXCP01_DB &&
++         !(arch_info->dr6 & DR6_BS); n++) {
++        if (arch_info->pc != host_bp.addr[n]) {
++            continue;
++        }
+         cpu_synchronize_state(cs);
+         if (host_bp.fn) {
+             host_bp.fn(cs, arch_info->pc, host_bp.opaque);
+@@ -6414,11 +6422,13 @@ void kvm_arch_update_guest_debug(CPUState *cpu, struct kvm_guest_debug *dbg)
+                 ((uint32_t)len_code[hw_breakpoint[n].len] << (18 + n*4));
+         }
+     }
+-    if (host_bp.addr && nb_hw_breakpoint < 4) {
+-        /* execute breakpoint (type 0, length 1) in the next free slot, globally enabled */
++    for (n = 0; n < host_bp.n && nb_hw_breakpoint + n < 4; n++) {
++        /* execute breakpoints (type 0, length 1) in the next free slots, globally enabled */
++        int slot = nb_hw_breakpoint + n;
++
+         dbg->control |= KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_HW_BP;
+-        dbg->arch.debugreg[7] |= 0x0600 | (2 << (nb_hw_breakpoint * 2));
+-        dbg->arch.debugreg[nb_hw_breakpoint] = host_bp.addr;
++        dbg->arch.debugreg[7] |= 0x0600 | (2 << (slot * 2));
++        dbg->arch.debugreg[slot] = host_bp.addr[n];
+     }
+ }
+ 
+-- 
+2.43.0
+

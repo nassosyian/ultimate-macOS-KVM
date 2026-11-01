@@ -1,0 +1,83 @@
+From 1f52635f5673044d5a8f857cd39594d16c6845ec Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Fri, 30 Oct 2026 00:05:49 +0200
+Subject: [PATCH 44/54] hw/display/pvg/pvg-exec: derived textures (object
+ 0x08): texture views (kind 8) and buffer textures (kind 9, buffer id at +0xc)
+
+Settings/Dock icon glyphs (A8 views of R8 glyph masks) now render.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/pvg-exec.c | 43 +++++++++++++++++++++++++++++++++++----
+ 1 file changed, 39 insertions(+), 4 deletions(-)
+
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index f622d3f..1eb3f8a 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -33,7 +33,7 @@
+ #define OBJ_BACKING_REF_TEX 0x05
+ #define OBJ_FUNCTION        0x06
+ #define OBJ_SERIALIZED      0x07
+-#define OBJ_BUFFER_TEX      0x08    /* texture over an MTLBuffer (newTextureWithDescriptor:offset:bytesPerRow:) */
++#define OBJ_DERIVED_TEX     0x08    /* {u32 kind: 8 texture view, 9 texture over a buffer, ...} */
+ #define SER_RENDER_PIPELINE 0x0e
+ #define SER_COMPUTE_PIPELINE 0x0b
+ 
+@@ -589,15 +589,50 @@ static bool guest_image_ex(PVGExec *e, uint32_t task, uint32_t ref, int level, u
+         gi->view_type = VK_IMAGE_VIEW_TYPE_2D;
+         gi->depth = gi->layers = 1;
+         gi->mips = 1;
+-    } else if (type == OBJ_BUFFER_TEX && len >= 0x40) {
+-        /* {u32 buffer id, u32 ?, u32 own id, u32 ?, u64 offset, u64 bytes per row}, desc @0x20 */
++    } else if (type == OBJ_DERIVED_TEX && len >= 0x34 && ldl(obj) == 8) {
++        /*
++         * newTextureViewWithPixelFormat:textureType:levels:slices: {u32 8, u32 len, u32 id,
++         * u32 parent, u16 pixel format, u16 texture type, u64 level, u64 levels, u64 slice,
++         * u64 slices}: the parent's storage with another format / subrange.
++         */
++        uint32_t parent = ldl(obj + 0xc), pf = lduw(obj + 0x10), vtype = lduw(obj + 0x12);
++        uint32_t lbase = (uint32_t)ldq(obj + 0x14), lcount = (uint32_t)ldq(obj + 0x1c);
++        uint32_t sbase = (uint32_t)ldq(obj + 0x24);
++        VkComponentMapping swz;
++        uint32_t bpp;
++        VkFormat fmt;
++
++        if (parent == ref || !guest_image_ex(e, task, parent,
++                                             level < 0 ? (lbase ? (int)lbase : -1) :
++                                             (int)lbase + level, slice + sbase, gi)) {
++            return false;
++        }
++        fmt = mtl_pixel_format(pf, &bpp, &swz);
++        if (fmt == VK_FORMAT_UNDEFINED || bpp != gi->bpp) {
++            return false;       /* only same-size reinterpretations */
++        }
++        gi->format = fmt;
++        gi->swizzle = swz;
++        if (level < 0 && lcount && lcount < gi->mips) {
++            gi->mips = lcount;
++        }
++        if (vtype == 2 && gi->view_type == VK_IMAGE_VIEW_TYPE_2D_ARRAY) {
++            gi->view_type = VK_IMAGE_VIEW_TYPE_2D;
++            gi->layers = 1;
++        }
++        return true;
++    } else if (type == OBJ_DERIVED_TEX && len >= 0x40 && ldl(obj) == 9) {
++        /*
++         * newTextureWithDescriptor:offset:bytesPerRow: on a buffer {u32 9, u32 len, u32 id,
++         * u32 buffer, u64 offset, u64 bytes per row}, descriptor at 0x20.
++         */
+         uint64_t row = ldq(obj + 0x18), size;
+ 
+         desc = obj + 0x20;
+         gi->width = ldl(desc + 4);
+         gi->height = ldl(desc + 8);
+         size = row * gi->height;
+-        if (!gi->height || !buffer_range(e, task, ldl(obj), ldq(obj + 0x10), size, &gi->va)) {
++        if (!gi->height || !buffer_range(e, task, ldl(obj + 0xc), ldq(obj + 0x10), size, &gi->va)) {
+             return false;
+         }
+         gi->task = task;
+-- 
+2.43.0
+

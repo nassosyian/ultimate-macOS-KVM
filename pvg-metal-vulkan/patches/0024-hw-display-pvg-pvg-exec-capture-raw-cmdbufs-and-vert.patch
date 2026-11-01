@@ -1,0 +1,72 @@
+From 9efe98a8fc4ba86f2a20230c61ebb92ea70683a5 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 14:56:29 +0200
+Subject: [PATCH 24/54] hw/display/pvg/pvg-exec: capture raw cmdbufs and vertex
+ data
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/pvg-exec.c | 33 +++++++++++++++++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index e022f7a..0f0cb11 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -1668,6 +1668,32 @@ static void tex_census(PVGExec *e, uint32_t task, uint32_t ref, const GuestImage
+     }
+ }
+ 
++static bool buffer_range(PVGExec *e, uint32_t task, uint32_t ref, uint64_t off, uint64_t len,
++                         uint64_t *va);
++
++/* frame capture: vertex buffer bindings of a draw and the first words of each */
++static void capture_vertex_data(PVGExec *e, uint32_t task, const RenderState *st,
++                                const Pipeline *pp G_GNUC_UNUSED)
++{
++    for (int i = 0; i < MAX_SLOTS; i++) {
++        uint64_t va;
++        float f[8];
++
++        if (!st->vbuf[i].ref) {
++            continue;
++        }
++        if (buffer_range(e, task, st->vbuf[i].ref, st->vbuf[i].offset, sizeof(f), &va) &&
++            e->host.read(e->host.opaque, task, va, f, sizeof(f))) {
++            elog(e, "cap %u     vbuf%d ref %u +0x%" G_GINT64_MODIFIER "x: %g %g %g %g %g %g %g "
++                 "%g", e->capture_seq, i, st->vbuf[i].ref, st->vbuf[i].offset, f[0], f[1], f[2],
++                 f[3], f[4], f[5], f[6], f[7]);
++        } else {
++            elog(e, "cap %u     vbuf%d ref %u +0x%" G_GINT64_MODIFIER "x: unreadable",
++                 e->capture_seq, i, st->vbuf[i].ref, st->vbuf[i].offset);
++        }
++    }
++}
++
+ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uint32_t len,
+                                 bool cont)
+ {
+@@ -2112,6 +2138,7 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                      st.viewport.height, st.scissor.offset.x, st.scissor.offset.y,
+                      st.scissor.extent.width, st.scissor.extent.height, t->str);
+                 g_string_free(t, TRUE);
++                capture_vertex_data(e, task, &st, pp);
+             }
+             if (bound != pp) {
+                 vkCmdBindPipeline(e->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pipe);
+@@ -2397,6 +2424,12 @@ void pvg_exec_cmdbuf(PVGExec *e, uint32_t task, const uint8_t *buf, uint64_t len
+     }
+     e->arena_used = 0;
+     g_hash_table_remove_all(e->uploaded);
++    if (e->capture_left) {
++        g_autofree char *path = g_strdup_printf("%s/cap-cb-%04u-t%u.bin", e->dump_dir,
++                                                e->capture_seq, task);
++
++        g_file_set_contents(path, (const char *)buf, (gssize)len, NULL);
++    }
+     while (off + 8 <= len && !e->disabled) {
+         uint32_t seglen = ldl(buf + off);
+         uint8_t enc = buf[off + 4];
+-- 
+2.43.0
+

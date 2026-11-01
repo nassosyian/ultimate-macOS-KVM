@@ -1,0 +1,276 @@
+From c3bc55e5feefd3b1ade9d019ec406f7c693c45d3 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Sat, 31 Oct 2026 10:30:36 +0200
+Subject: [PATCH] hw/display/pvg: small uploads through resizable BAR
+
+With zero-copy, the staging twin is allocated from a device-local,
+host-visible heap when one at least 1 GiB large exists (resizable BAR)
+and mapped. Uploads up to 64 KiB (vertex/uniform buffers) are then CPU
+writes straight into VRAM instead of GPU gathers (no copy command, no
+page-run lookup); larger ones stay GPU gathers. The CPU never reads the
+mapping. Property rebar (default on).
+
+Mission Control, per 500 cmdbufs: executor 239 -> 223 ms, GPU wait
+146 -> 127 ms. CPU copies through BAR for everything (without the guest
+RAM import) measured slower than the host-cached arena (403 vs 301 ms),
+so BAR is not used without zero-copy.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-pci.c |  7 +++-
+ hw/display/pvg/pvg-exec.c  | 82 +++++++++++++++++++++++++++++---------
+ hw/display/pvg/pvg-exec.h  | 13 +++---
+ hw/display/trace-events    |  2 +-
+ 4 files changed, 77 insertions(+), 27 deletions(-)
+
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index 5c9841c..6994ffc 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -277,6 +277,7 @@ struct PVGLinuxPCIState {
+     bool msaa;
+     bool upload_cache;
+     bool zero_copy;
++    bool rebar;
+     bool private_resident;
+     MemoryRegion *dirty_ram;        /* guest RAM with dirty logging on (upload cache) */
+     int64_t dirty_sync_us;          /* of the upload cache sync time: the KVM log sync */
+@@ -1548,7 +1549,8 @@ static void pvg_exec_run_buf(PVGLinuxPCIState *s, uint32_t task, const uint8_t *
+                                   s->exec_read_bytes >> 20, s->exec_write_us / 1000,
+                                   s->exec_write_bytes >> 20, st->gpu_wait_us / 1000);
+         trace_pvg_linux_exec_private(st->priv_skipped >> 20, st->priv_flushes, st->gpu_mipmaps);
+-        trace_pvg_linux_exec_zc(st->zc_gathered >> 20, st->zc_scattered >> 20, st->zc_fallbacks);
++        trace_pvg_linux_exec_zc(st->zc_gathered >> 20, st->zc_scattered >> 20, st->zc_fallbacks,
++                                st->bar_written >> 20);
+         trace_pvg_linux_exec_cache(st->cache_hits, st->cache_saved >> 20, st->cache_invalidated,
+                                    st->cache_sync_us / 1000, s->dirty_sync_us / 1000);
+         s->dirty_sync_us = 0;
+@@ -2220,7 +2222,7 @@ static void pvg_linux_realize(PCIDevice *dev, Error **errp)
+                     pvg_exec_set_damage_limit(s->exec, s->damage_limit);
+                     pvg_exec_set_msaa(s->exec, s->msaa);
+                     if (s->zero_copy && !s->dump_dir &&
+-                        !pvg_exec_set_zero_copy(s->exec, true)) {
++                        !pvg_exec_set_zero_copy(s->exec, true, s->rebar)) {
+                         warn_report("pvg-linux-pci: zero-copy unavailable, using CPU copies");
+                     }
+                     pvg_exec_set_private_resident(s->exec, s->private_resident &&
+@@ -2337,6 +2339,7 @@ static const Property pvg_linux_properties[] = {
+     DEFINE_PROP_BOOL("msaa", PVGLinuxPCIState, msaa, true),
+     DEFINE_PROP_BOOL("upload-cache", PVGLinuxPCIState, upload_cache, false),
+     DEFINE_PROP_BOOL("zero-copy", PVGLinuxPCIState, zero_copy, true),
++    DEFINE_PROP_BOOL("rebar", PVGLinuxPCIState, rebar, true),
+     DEFINE_PROP_BOOL("private-resident", PVGLinuxPCIState, private_resident, true),
+     DEFINE_PROP_BOOL("gpu", PVGLinuxPCIState, gpu_enable, true),
+     DEFINE_PROP_BOOL("gpu-validation", PVGLinuxPCIState, gpu_validation, false),
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index d04d163..59e0daa 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -24,6 +24,8 @@
+ #define ZC_MAX_CHUNKS       64
+ #define MAX_SEG_REFS        2048    /* distinct textures one segment samples (seen: ~180) */
+ #define ZC_CHUNK            (1ull << 30)    /* guest RAM is imported in pieces of 1 GiB */
++/* with both: smaller uploads are CPU copies into BAR (no GPU copy command, no page runs) */
++#define ZC_BAR_MAX          (64u << 10)
+ #define MAX_SLOTS           16
+ #define MAX_OBJ             0x1000
+ #define MAX_MIPS            15
+@@ -171,6 +173,8 @@ struct PVGExec {
+     bool zc;
+     VkBuffer stage;
+     VkDeviceMemory stage_mem;
++    uint8_t *stage_ptr;         /* the twin mapped through resizable BAR (CPU writes only) */
++    uint32_t bar_max;           /* uploads up to this size go to the twin by CPU, not GPU */
+     struct {
+         uint64_t ram, len;      /* RAM offset range of this imported piece of guest RAM */
+         VkBuffer buf;
+@@ -674,6 +678,7 @@ static void zc_fini(PVGExec *e)
+         vkDestroyBuffer(d, e->stage, NULL);
+         e->stage = VK_NULL_HANDLE;
+     }
++    e->stage_ptr = NULL;        /* unmapped by freeing */
+     if (e->stage_mem) {
+         vkFreeMemory(d, e->stage_mem, NULL);
+         e->stage_mem = VK_NULL_HANDLE;
+@@ -687,8 +692,8 @@ static void zc_fini(PVGExec *e)
+     e->gaddr = e->arena_addr;
+ }
+ 
+-/* a device-local twin of the arena (same offsets, same uses) */
+-static bool zc_stage_init(PVGExec *e)
++/* a device-local twin of the arena (same offsets, same uses), CPU-writable with 'bar' */
++static bool zc_stage_init(PVGExec *e, bool bar)
+ {
+     PVGGpu *g = e->gpu;
+     VkBufferCreateInfo bci = {
+@@ -711,7 +716,23 @@ static bool zc_stage_init(PVGExec *e)
+         return false;
+     }
+     vkGetBufferMemoryRequirements(g->device, e->stage, &req);
+-    mt = pvg_gpu_memory_type(g, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++    /*
++     * Resizable BAR: VRAM the CPU can write directly (write-combined; never read by the CPU,
++     * reads of it crawl). Only if the heap is large: small BAR windows are scarce.
++     */
++    mt = -1;
++    if (bar) {
++        mt = pvg_gpu_memory_type(g, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
++                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++        if (mt >= 0 && g->mem_props.memoryHeaps[g->mem_props.memoryTypes[mt].heapIndex].size <
++            (1ull << 30)) {
++            mt = -1;
++        }
++    }
++    if (mt < 0) {
++        mt = pvg_gpu_memory_type(g, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++    }
+     if (mt < 0) {
+         return false;
+     }
+@@ -721,42 +742,56 @@ static bool zc_stage_init(PVGExec *e)
+         vkBindBufferMemory(g->device, e->stage, e->stage_mem, 0) != VK_SUCCESS) {
+         return false;
+     }
++    if ((g->mem_props.memoryTypes[mt].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
++        vkMapMemory(g->device, e->stage_mem, 0, ARENA_SIZE, 0, (void **)&e->stage_ptr) !=
++        VK_SUCCESS) {
++        e->stage_ptr = NULL;
++    }
+     bdai.buffer = e->stage;
+     e->gbuf = e->stage;
+     e->gaddr = vkGetBufferDeviceAddress(g->device, &bdai);
+     return true;
+ }
+ 
+-bool pvg_exec_set_zero_copy(PVGExec *e, bool on)
++bool pvg_exec_set_zero_copy(PVGExec *e, bool import_ram, bool bar)
+ {
+     uint64_t blocks[8][3];
+     uint32_t n;
+ 
+     vkQueueWaitIdle(e->gpu->queue);
+     zc_fini(e);
+-    if (!on || e->dump_dir || !e->gpu->host_import || !e->host.ram_blocks ||
+-        !e->host.ram_runs) {
++    if ((!import_ram && !bar) || e->dump_dir) {
+         return false;   /* dumps and captures read GPU results through the arena */
+     }
+-    n = e->host.ram_blocks(e->host.opaque, blocks, G_N_ELEMENTS(blocks));
+-    for (uint32_t i = 0; i < n; i++) {
+-        for (uint64_t o = 0; o < blocks[i][2]; o += ZC_CHUNK) {
+-            if (!zc_import(e, blocks[i][0] + o, (uint8_t *)(uintptr_t)blocks[i][1] + o,
+-                           MIN(ZC_CHUNK, blocks[i][2] - o))) {
+-                elog(e, "zero-copy: importing guest RAM at 0x%" G_GINT64_MODIFIER "x failed",
+-                     blocks[i][0] + o);
+-                zc_fini(e);
+-                return false;
++    if (import_ram && e->gpu->host_import && e->host.ram_blocks && e->host.ram_runs) {
++        n = e->host.ram_blocks(e->host.opaque, blocks, G_N_ELEMENTS(blocks));
++        for (uint32_t i = 0; i < n; i++) {
++            for (uint64_t o = 0; o < blocks[i][2]; o += ZC_CHUNK) {
++                if (!zc_import(e, blocks[i][0] + o, (uint8_t *)(uintptr_t)blocks[i][1] + o,
++                               MIN(ZC_CHUNK, blocks[i][2] - o))) {
++                    elog(e, "zero-copy: importing guest RAM at 0x%" G_GINT64_MODIFIER
++                         "x failed", blocks[i][0] + o);
++                    zc_fini(e);
++                    break;
++                }
+             }
+         }
+     }
+-    if (!e->zc_nram || !zc_stage_init(e)) {
++    /*
++     * Only with GPU gathers from guest RAM: CPU copies through BAR alone (write-combined, over
++     * PCIe) measured slower than CPU copies into the host-cached arena (403 vs 301 ms per 500
++     * command buffers). BAR takes the small uploads, where a GPU copy costs more than it moves.
++     */
++    if (!e->zc_nram || !zc_stage_init(e, bar)) {
+         zc_fini(e);
+         return false;
+     }
+     e->zc = true;
++    e->bar_max = e->stage_ptr ? ZC_BAR_MAX : 0;
+     e->zc_cache = g_hash_table_new_full(zc_key_hash, zc_key_equal, g_free, g_free);
+-    elog(e, "zero-copy: guest RAM imported in %u pieces", e->zc_nram);
++    elog(e, "zero-copy: guest RAM imported in %u pieces; staging in %s (CPU uploads up to "
++         "%u bytes)", e->zc_nram, e->stage_ptr ? "VRAM through resizable BAR" : "VRAM",
++         e->bar_max);
+     return true;
+ }
+ 
+@@ -914,7 +949,16 @@ static bool guest_to_arena_in(PVGExec *e, uint32_t task, uint64_t cva, uint64_t
+ {
+     VkBufferCopy r = { .srcOffset = off, .dstOffset = off, .size = len };
+ 
+-    if (e->zc && zc_copy(e, task, cva, clen, va, len, off, false)) {
++    if (e->zc && e->zc_nram && len > e->bar_max &&
++        zc_copy(e, task, cva, clen, va, len, off, false)) {
++        return true;
++    }
++    if (e->zc && e->stage_ptr) {
++        /* straight into VRAM */
++        if (!e->host.read(e->host.opaque, task, va, e->stage_ptr + off, len)) {
++            return false;
++        }
++        e->stats.bar_written += len;
+         return true;
+     }
+     if (!e->host.read(e->host.opaque, task, va, e->arena_ptr + off, len)) {
+@@ -941,7 +985,7 @@ static bool arena_to_guest_in(PVGExec *e, uint32_t task, uint64_t cva, uint64_t
+     if (!e->zc) {
+         return false;
+     }
+-    if (zc_copy(e, task, cva, clen, va, len, off, true)) {
++    if (e->zc_nram && zc_copy(e, task, cva, clen, va, len, off, true)) {
+         return true;
+     }
+     if (len) {
+diff --git a/hw/display/pvg/pvg-exec.h b/hw/display/pvg/pvg-exec.h
+index ad99128..9f8a20d 100644
+--- a/hw/display/pvg/pvg-exec.h
++++ b/hw/display/pvg/pvg-exec.h
+@@ -57,7 +57,8 @@ typedef struct PVGExecStats {
+     uint64_t cache_hits, cache_saved, cache_invalidated, cache_sync_us;
+     uint64_t priv_skipped, priv_flushes;    /* private residency: bytes not copied, flushes */
+     uint64_t gpu_mipmaps;
+-    uint64_t zc_gathered, zc_scattered, zc_fallbacks;  /* zero-copy bytes in / out, CPU fallbacks */       /* GenerateMipmaps done on the GPU (the rest: CPU fallback) */
++    uint64_t zc_gathered, zc_scattered, zc_fallbacks;  /* zero-copy bytes in / out, CPU fallbacks */
++    uint64_t bar_written;       /* bytes the CPU wrote straight into VRAM (resizable BAR) */       /* GenerateMipmaps done on the GPU (the rest: CPU fallback) */
+ } PVGExecStats;
+ 
+ typedef struct PVGExec PVGExec;
+@@ -88,11 +89,13 @@ void pvg_exec_cache_mark_stale(PVGExec *e);
+  */
+ void pvg_exec_set_private_resident(PVGExec *e, bool on);
+ /*
+- * Copy textures and buffers between guest RAM and the GPU with GPU transfers from guest RAM
+- * imported into Vulkan (VK_EXT_external_memory_host) instead of CPU copies. Returns whether
+- * it is active (needs the extension and the ram_blocks/ram_runs callbacks; off with dump-dir).
++ * Zero-copy (import_ram): textures and buffers move between guest RAM and the GPU as GPU
++ * transfers from guest RAM imported into Vulkan (VK_EXT_external_memory_host), staged in VRAM.
++ * With bar and a resizable-BAR heap, small uploads are CPU writes straight into that VRAM.
++ * Returns whether zero-copy is active (needs the extension and the RAM callbacks; off with
++ * dump-dir).
+  */
+-bool pvg_exec_set_zero_copy(PVGExec *e, bool on);
++bool pvg_exec_set_zero_copy(PVGExec *e, bool import_ram, bool bar);
+ /* the guest pages behind task va..va+len (len 0: the whole task) changed: Map, Unmap, ... */
+ void pvg_exec_mapping_changed(PVGExec *e, uint32_t task, uint64_t va, uint64_t len);
+ void pvg_exec_synchronize(PVGExec *e, uint32_t task, uint32_t id);
+diff --git a/hw/display/trace-events b/hw/display/trace-events
+index 313e256..0d00862 100644
+--- a/hw/display/trace-events
++++ b/hw/display/trace-events
+@@ -258,7 +258,7 @@ pvg_linux_exec_time(uint64_t cmdbufs, int64_t exec_ms, int64_t wall_ms, int64_t
+ pvg_linux_exec_pipelines(uint64_t pipe_ms, uint64_t spv_hits, uint64_t damage_mb) "building pipelines %"PRIu64" ms, translations reused %"PRIu64", damage rectangles saved %"PRIu64" MiB"
+ pvg_linux_exec_cache(uint64_t hits, uint64_t saved_mb, uint64_t dropped, uint64_t sync_ms, int64_t kvm_ms) "upload cache: %"PRIu64" hits, %"PRIu64" MiB not uploaded, %"PRIu64" dropped, sync %"PRIu64" ms (KVM log %"PRId64" ms)"
+ pvg_linux_exec_private(uint64_t skipped_mb, uint64_t flushes, uint64_t gpu_mipmaps) "private textures: %"PRIu64" MiB not copied, %"PRIu64" flushes; %"PRIu64" GPU mipmaps"
+-pvg_linux_exec_zc(uint64_t gathered_mb, uint64_t scattered_mb, uint64_t fallbacks) "zero-copy: %"PRIu64" MiB gathered, %"PRIu64" MiB scattered by the GPU, %"PRIu64" CPU fallbacks"
++pvg_linux_exec_zc(uint64_t gathered_mb, uint64_t scattered_mb, uint64_t fallbacks, uint64_t bar_mb) "zero-copy: %"PRIu64" MiB gathered, %"PRIu64" MiB scattered by the GPU, %"PRIu64" CPU fallbacks, %"PRIu64" MiB CPU-written to VRAM"
+ pvg_linux_child_poke(uint32_t index, uint32_t written, uint32_t read, uint32_t length) "child FIFO %u written=0x%x read=0x%x length=0x%x"
+ pvg_linux_cmd_stub(uint32_t op) "op=0x%02x not implemented, completed"
+ pvg_linux_signal_stamp(uint32_t index, uint32_t value) "stamps[%u]=%u"
+-- 
+2.43.0
+

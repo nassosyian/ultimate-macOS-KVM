@@ -1,0 +1,35 @@
+From ab8dd02ad4afdb8ad45c8ad4c66284f966bfb77d Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 12:53:29 +0200
+Subject: [PATCH 14/54] hw/display/pvg/air2spv: drop stores of resource handles
+ into private memory
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/air2spv.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/hw/display/pvg/air2spv.c b/hw/display/pvg/air2spv.c
+index b0cdcdb..e9f1de6 100644
+--- a/hw/display/pvg/air2spv.c
++++ b/hw/display/pvg/air2spv.c
+@@ -1838,9 +1838,15 @@ static int priv_store(Ctx *c, int pi, LLVMValueRef value)
+ {
+     LLVMTypeRef t = LLVMTypeOf(value);
+     LLVMTypeRef et = LLVMGetTypeKind(t) == LLVMVectorTypeKind ? LLVMGetElementType(t) : t;
+-    uint32_t etid = ty(c, et), v = val(c, value);
++    uint32_t etid, v;
+     unsigned n;
+ 
++    /* texture/sampler handles spilled into a private struct are never data; drop the store */
++    if (resource_for(c, value)) {
++        return 0;
++    }
++    etid = ty(c, et);
++    v = val(c, value);
+     if (!priv_type_ok(t, &n)) {
+         return fail(c, "private store of an unsupported type");
+     }
+-- 
+2.43.0
+

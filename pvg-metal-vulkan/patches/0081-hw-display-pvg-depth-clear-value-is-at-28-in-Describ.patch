@@ -1,0 +1,43 @@
+From 32247d454559fa2c102caa8d3d89220657835222 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Sat, 31 Oct 2026 23:27:57 +0200
+Subject: [PATCH] hw/display/pvg: depth clear value is at +28 in
+ DescribeRenderPass
+
+The depth attachment block is {u32 tex, u32 resolve, u16 x6, u16 load,
+u16 store, u32 store_options, f64 clear_depth, u32 resolve_filter}; the
+clear value was read from +32, i.e. the high word of the double plus
+resolve_filter, which decodes to ~0. Every depth buffer was cleared to 0,
+so forward-Z content (clear 1.0, compare Less) drew nothing. SceneKit
+uses reverse-Z (clear 0), which hid it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/pvg-exec.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index cbf2467..3c2a459 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -4360,7 +4360,7 @@ typedef struct Attachment {
+     GuestImage cgi;             /* the whole chain */
+ } Attachment;
+ 
+-/* DescribeRenderPass depth (bytes 0..39) and stencil (40..75) attachments */
++/* DescribeRenderPass depth (bytes 0..39, f64 clear at 28) and stencil (40..75) attachments */
+ typedef struct DSAttachment {
+     uint32_t depth_ref, stencil_ref, depth_load, stencil_load;
+     double clear_depth;
+@@ -4744,7 +4744,7 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+             if (clen - 8 >= 76) {
+                 ds.depth_ref = ldl(a);
+                 ds.depth_load = lduw(a + 20);
+-                ds.clear_depth = ldd(a + 32);
++                ds.clear_depth = ldd(a + 28);
+                 ds.stencil_ref = ldl(a + 40);
+                 ds.stencil_load = lduw(a + 60);
+                 ds.clear_stencil = ldl(a + 68);
+-- 
+2.43.0
+

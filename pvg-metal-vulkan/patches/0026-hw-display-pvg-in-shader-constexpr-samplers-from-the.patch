@@ -1,0 +1,232 @@
+From c02cc31072ba162cfaf576c07b7ce34d5f0cdda8 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 15:18:37 +0200
+Subject: [PATCH 26/54] hw/display/pvg: in-shader (constexpr) samplers from
+ their AIR state word
+
+Constant samplers were all bound to one default sampler. Their state word
+(address modes, filters, mip filter, coord::pixel; layout inferred from
+the shader corpus) now selects a real VkSampler, and coord::pixel samplers
+divide coordinates by the texture size in the shader. WindowServer's
+buffer-age copy-back (TextureCopy, pixel coordinates) sampled the source's
+edge texel and painted whole frames grey.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/air2spv.c  | 47 +++++++++++++++++++++-------------
+ hw/display/pvg/air2spv.h  |  8 ++++++
+ hw/display/pvg/pvg-exec.c | 54 +++++++++++++++++++++++++++++++++++++--
+ 3 files changed, 89 insertions(+), 20 deletions(-)
+
+diff --git a/hw/display/pvg/air2spv.c b/hw/display/pvg/air2spv.c
+index 9c3d270..c69a8b5 100644
+--- a/hw/display/pvg/air2spv.c
++++ b/hw/display/pvg/air2spv.c
+@@ -48,6 +48,7 @@ typedef struct Resource {       /* texture/sampler handle reached through an LLV
+     uint32_t dim;
+     bool arrayed;
+     int slot;                   /* sampler argument index, -1 for constant samplers */
++    uint64_t state;             /* constant sampler: AIR sampler state word */
+ } Resource;
+ 
+ typedef struct Ctx {
+@@ -738,6 +739,7 @@ static int setup_interface(Ctx *c)
+                 init && LLVMIsAConstantStruct(init) &&
+                 LLVMIsAConstantInt(LLVMGetAggregateElement(init, 0)) ?
+                 LLVMConstIntGetZExtValue(LLVMGetAggregateElement(init, 0)) : 0;
++            r->state = c->res->const_sampler_state[nconst];
+             nconst++;
+         }
+         free(nodes);
+@@ -1296,35 +1298,44 @@ static int texture_call(Ctx *c, LLVMValueRef call, const char *name, uint32_t re
+         if (!smp || !smp->is_sampler) {
+             return fail(c, "sample with unknown sampler");
+         }
+-        if (smp->slot >= 0 && smp->slot < 32 && !arrayed &&
++        if (((smp->slot >= 0 && smp->slot < 32) ||
++             (smp->slot < 0 && (smp->state & A2S_SAMPLER_PIXEL_COORDS))) && !arrayed &&
+             (tex->dim == SpvDim1D || tex->dim == SpvDim2D)) {
+-            /* unnormalised sampler bound to this slot (spec constant): coord /= size */
++            /*
++             * Pixel coordinates: a constant sampler declared coord::pixel always, a bound
++             * sampler when its slot is set in the unnormalised mask (spec constant)
++             */
+             unsigned cn = tex->dim == SpvDim2D ? 2 : 1;
+             uint32_t i32 = spv_type_int(&c->m, 32, true);
+             uint32_t ity = cn == 2 ? spv_type_vec(&c->m, i32, 2) : i32;
+             uint32_t fty = cn == 2 ? spv_type_vec(&c->m, c->t_f32, 2) : c->t_f32;
+-            uint32_t q[2] = { image, spv_const_u32(&c->m, 0) }, size, sel[3], bit[2];
++            uint32_t q[2] = { image, spv_const_u32(&c->m, 0) }, size, scaled, sel[3], bit[2];
+ 
+-            if (!c->unnorm_spec) {
+-                uint32_t sc[3] = { c->t_u32, spv_id(&c->m), 0 };
+-
+-                spv_emit(&c->m, SPV_SEC_TYPES, SpvOpSpecConstant, sc, 3);
+-                c->unnorm_spec = sc[1];
+-                decorate1(c, c->unnorm_spec, SpvDecorationSpecId, A2S_SPEC_UNNORMALIZED);
+-            }
+             spv_capability(&c->m, SpvCapabilityImageQuery);
+             size = emit(c, SpvOpImageQuerySizeLod, ity, 0, q, 2);
+             size = emit(c, SpvOpConvertSToF, fty, 0, &size, 1);
+-            bit[0] = c->unnorm_spec;
+-            bit[1] = spv_const_u32(&c->m, 1u << smp->slot);
+-            bit[0] = emit(c, SpvOpBitwiseAnd, c->t_u32, 0, bit, 2);
+-            bit[1] = spv_const_u32(&c->m, 0);
+-            sel[0] = emit(c, SpvOpINotEqual, c->t_bool, 0, bit, 2);
+             q[0] = coord;
+             q[1] = size;
+-            sel[1] = emit(c, SpvOpFDiv, fty, 0, q, 2);
+-            sel[2] = coord;
+-            coord = emit(c, SpvOpSelect, fty, 0, sel, 3);
++            scaled = emit(c, SpvOpFDiv, fty, 0, q, 2);
++            if (smp->slot < 0) {
++                coord = scaled;
++            } else {
++                if (!c->unnorm_spec) {
++                    uint32_t sc[3] = { c->t_u32, spv_id(&c->m), 0 };
++
++                    spv_emit(&c->m, SPV_SEC_TYPES, SpvOpSpecConstant, sc, 3);
++                    c->unnorm_spec = sc[1];
++                    decorate1(c, c->unnorm_spec, SpvDecorationSpecId, A2S_SPEC_UNNORMALIZED);
++                }
++                bit[0] = c->unnorm_spec;
++                bit[1] = spv_const_u32(&c->m, 1u << smp->slot);
++                bit[0] = emit(c, SpvOpBitwiseAnd, c->t_u32, 0, bit, 2);
++                bit[1] = spv_const_u32(&c->m, 0);
++                sel[0] = emit(c, SpvOpINotEqual, c->t_bool, 0, bit, 2);
++                sel[1] = scaled;
++                sel[2] = coord;
++                coord = emit(c, SpvOpSelect, fty, 0, sel, 3);
++            }
+         }
+         if (arrayed) {
+             /* coord ++ float(array index) */
+diff --git a/hw/display/pvg/air2spv.h b/hw/display/pvg/air2spv.h
+index 0ff3502..0aa57be 100644
+--- a/hw/display/pvg/air2spv.h
++++ b/hw/display/pvg/air2spv.h
+@@ -25,6 +25,14 @@ enum { A2S_VIEW_1D = 0, A2S_VIEW_2D = 1, A2S_VIEW_3D = 2, A2S_VIEW_CUBE = 3,
+  * (their coordinates are divided by the texture size; the host samplers are normalised) */
+ #define A2S_SPEC_UNNORMALIZED   0
+ 
++/*
++ * AIR constant sampler state word (inferred from the shader corpus): bits 0-2/3-5/6-8 s/t/r
++ * address (0 clamp_to_zero, 1 clamp_to_edge, 2 repeat, 3 mirrored_repeat, 4 clamp_to_border),
++ * 9-10 mag filter, 11-12 min filter (0 nearest, 1 linear), 13-14 mip filter (0 none,
++ * 1 nearest, 2 linear), 15 coord::pixel.
++ */
++#define A2S_SAMPLER_PIXEL_COORDS (1ull << 15)
++
+ typedef struct A2SResult {
+     uint32_t *spirv;            /* malloc'ed, free with free() */
+     size_t nwords;
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index 93c49a5..9777407 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -102,6 +102,7 @@ typedef struct Pipeline {
+     uint32_t vs_buffers, fs_buffers, vs_textures, fs_textures, fs_samplers, vs_samplers;
+     uint8_t texture_view[32];
+     int fs_const_samplers, vs_const_samplers;
++    VkSampler const_smp[A2S_MAX_CONST_SAMP];  /* in-shader samplers (binding 64 + i) */
+     uint32_t vertex_bindings;           /* Metal buffer indices fetched as vertex buffers */
+     uint32_t push_size;
+     uint32_t draws_logged;
+@@ -149,7 +150,8 @@ struct PVGExec {
+     GHashTable *census;     /* diagnostics: textures already reported by tex_census */
+     uint32_t census_count;
+     uint32_t capture_left, capture_seq;     /* frame capture: segments still to record */
+-    GHashTable *unnorm;     /* (task, sampler ref) with unnormalised coordinates */    /* diagnostics: guest-physical page -> writer kind */
++    GHashTable *unnorm;     /* (task, sampler ref) with unnormalised coordinates */
++    GHashTable *const_samplers;     /* AIR constant sampler state -> VkSampler */    /* diagnostics: guest-physical page -> writer kind */
+     bool creating_dummies;
+ };
+ 
+@@ -798,6 +800,42 @@ static VkSampler sampler_get(PVGExec *e, uint32_t task, uint32_t ref)
+     return smp ? smp : e->sampler;
+ }
+ 
++/*
++ * In-shader (constexpr) sampler from its AIR state word (A2S_SAMPLER_PIXEL_COORDS etc.); pixel
++ * coordinates are divided by the texture size in the shader, so the sampler is normalised.
++ */
++static VkSampler const_sampler(PVGExec *e, uint64_t state)
++{
++    static const VkSamplerAddressMode addr[8] = {
++        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
++        VK_SAMPLER_ADDRESS_MODE_REPEAT, VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT,
++        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
++        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
++    };
++    gint64 key = (gint64)state;
++    VkSampler smp = g_hash_table_lookup(e->const_samplers, &key);
++    uint32_t mip = state >> 13 & 3;
++    VkSamplerCreateInfo sci = {
++        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
++        .magFilter = (state >> 9 & 3) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
++        .minFilter = (state >> 11 & 3) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
++        .mipmapMode = mip == 2 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST,
++        .addressModeU = addr[state & 7], .addressModeV = addr[state >> 3 & 7],
++        .addressModeW = addr[state >> 6 & 7],
++        .maxLod = mip ? VK_LOD_CLAMP_NONE : 0.25f,  /* no mip filter: base level only */
++        .borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
++    };
++
++    if (smp) {
++        return smp;
++    }
++    if (vkCreateSampler(e->gpu->device, &sci, NULL, &smp) != VK_SUCCESS) {
++        return VK_NULL_HANDLE;
++    }
++    g_hash_table_insert(e->const_samplers, g_memdup2(&key, sizeof(key)), smp);
++    return smp;
++}
++
+ /* ---- pipelines ---- */
+ 
+ typedef struct PlEntry {
+@@ -1092,6 +1130,11 @@ static Pipeline *pipeline_get(PVGExec *e, uint32_t task, uint32_t ref, const VkF
+     p->fs_samplers = fs.sampler_mask;
+     p->vs_const_samplers = vs.nconst_samplers;
+     p->fs_const_samplers = fs.nconst_samplers;
++    for (int i = 0; i < MAX(vs.nconst_samplers, fs.nconst_samplers); i++) {
++        /* both stages share binding 64 + i; the fragment stage's state wins */
++        p->const_smp[i] = const_sampler(e, i < fs.nconst_samplers ? fs.const_sampler_state[i] :
++                                        vs.const_sampler_state[i]);
++    }
+     p->push_size = MAX(MAX(vs.push_size, fs.push_size), 4);
+     vsm = shader_module(e, &vs);
+     fsm = shader_module(e, &fs);
+@@ -1346,7 +1389,8 @@ static bool bind_and_push(PVGExec *e, uint32_t task, RenderState *st, Pipeline *
+         }
+     }
+     for (int i = 0; i < MAX(p->vs_const_samplers, p->fs_const_samplers); i++) {
+-        ii[nw] = (VkDescriptorImageInfo){ .sampler = e->sampler };
++        ii[nw] = (VkDescriptorImageInfo){ .sampler = p->const_smp[i] ? p->const_smp[i] :
++                                                     e->sampler };
+         w[nw] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+             .dstBinding = A2S_CONST_SAMPLER_BINDING + i, .descriptorCount = 1,
+             .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER, .pImageInfo = &ii[nw] };
+@@ -2572,6 +2616,7 @@ PVGExec *pvg_exec_new(PVGGpu *gpu, const PVGExecHost *host)
+     e->uploaded = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
+     e->samplers = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
+     e->unnorm = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
++    e->const_samplers = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
+     e->written = g_hash_table_new(g_direct_hash, g_direct_equal);
+     e->census = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+     e->push_descriptor = (PFN_vkCmdPushDescriptorSetKHR)
+@@ -2623,6 +2668,11 @@ void pvg_exec_free(PVGExec *e)
+         }
+         g_hash_table_destroy(e->samplers);
+         g_hash_table_destroy(e->unnorm);
++        g_hash_table_iter_init(&it, e->const_samplers);
++        while (g_hash_table_iter_next(&it, &k, &v)) {
++            vkDestroySampler(d, (VkSampler)v, NULL);
++        }
++        g_hash_table_destroy(e->const_samplers);
+         g_hash_table_destroy(e->written);
+         g_hash_table_destroy(e->census);
+     }
+-- 
+2.43.0
+

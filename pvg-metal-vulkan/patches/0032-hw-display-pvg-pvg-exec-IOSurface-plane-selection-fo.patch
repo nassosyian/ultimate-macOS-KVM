@@ -1,0 +1,68 @@
+From f86fe2a6ca165e62dce1d3eea44a71168853e1b5 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 18:56:17 +0200
+Subject: [PATCH 32/54] hw/display/pvg/pvg-exec: IOSurface plane selection for
+ backing-ref textures; rejection diagnostics
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/pvg-exec.c | 31 ++++++++++++++++++++++++-------
+ 1 file changed, 24 insertions(+), 7 deletions(-)
+
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index 48e3805..235d002 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -513,18 +513,29 @@ static bool guest_image_ex(PVGExec *e, uint32_t task, uint32_t ref, int level, u
+             }
+         }
+     } else if (type == OBJ_BACKING_REF_TEX && len >= 0x34) {
+-        uint32_t bid = ldl(obj);
++        /* {u32 backing id (kernel task), u32 plane, ...}, descriptor at +0x14 */
++        uint32_t bid = ldl(obj), plane = ldl(obj + 4), btype;
++        const uint8_t *pl;
+ 
+         desc = obj + 0x14;
+-        /* the backing lives in the kernel task (task 0) */
+-        if (object(e, 0, bid, bobj, &blen) != OBJ_BACKING || blen < 0x24 || !ldl(bobj + 0x10)) {
++        btype = object(e, 0, bid, bobj, &blen);
++        if (btype != OBJ_BACKING || blen < 0x24 || plane >= ldl(bobj + 0x10) ||
++            0x14 + 16 * (plane + 1) > MIN(blen, MAX_OBJ)) {
++            if (e->texfail_logged < 60) {
++                e->texfail_logged++;
++                elog(e, "task %u texture %u: backing %u plane %u unusable (type 0x%x len 0x%x "
++                     "planes %u fourcc %08x)", task, ref, bid, plane, btype, blen,
++                     blen >= 0x14 ? ldl(bobj + 0x10) : 0, blen >= 0x10 ? ldl(bobj + 0x0c) : 0);
++            }
+             return false;
+         }
++        /* APVObjectBacking planes: {u32 offset, u32 width, u32 height, u32 bpp << 24 | row} */
++        pl = bobj + 0x14 + 16 * plane;
+         gi->task = 0;
+-        gi->va = ((uint64_t)ldl(bobj + 0x08) << 12) + ldl(bobj + 0x14);
+-        gi->width = ldl(bobj + 0x18);
+-        gi->height = ldl(bobj + 0x1c);
+-        gi->row_bytes = ldl(bobj + 0x20) & 0xffffff;
++        gi->va = ((uint64_t)ldl(bobj + 0x08) << 12) + ldl(pl);
++        gi->width = ldl(pl + 4);
++        gi->height = ldl(pl + 8);
++        gi->row_bytes = ldl(pl + 12) & 0xffffff;
+         gi->view_type = VK_IMAGE_VIEW_TYPE_2D;
+         gi->depth = gi->layers = 1;
+         gi->mips = 1;
+@@ -549,6 +560,12 @@ static bool guest_image_ex(PVGExec *e, uint32_t task, uint32_t ref, int level, u
+         }
+     }
+     gi->format = mtl_pixel_format(lduw(desc + 2), &gi->bpp, &gi->swizzle);
++    if (gi->format == VK_FORMAT_UNDEFINED && type == OBJ_BACKING_REF_TEX &&
++        e->texfail_logged < 60) {
++        e->texfail_logged++;
++        elog(e, "task %u texture %u: MTLPixelFormat %u not mapped (%ux%u row %u)", task, ref,
++             lduw(desc + 2), gi->width, gi->height, gi->row_bytes);
++    }
+     return gi->format != VK_FORMAT_UNDEFINED && gi->width && gi->height &&
+            gi->width <= 16384 && gi->height <= 16384 && gi->row_bytes >= gi->width * gi->bpp &&
+            gi->depth <= 2048 && gi->layers <= 2048 &&
+-- 
+2.43.0
+

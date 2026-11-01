@@ -1,0 +1,95 @@
+From 3792725808b238b04a747dac137b7b5ee2d595f2 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 22:17:17 +0200
+Subject: [PATCH 39/54] hw/display/pvg: EFI scanout reads system memory and is
+ not overdrawn by the idle background
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-pci.c | 24 +++++++++++++++++-------
+ hw/display/trace-events    |  1 +
+ 2 files changed, 18 insertions(+), 7 deletions(-)
+
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index f40f9b1..27bf563 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -905,6 +905,11 @@ static void pvg_display_redraw(PVGLinuxPCIState *s)
+         /* frames come from Transaction3; the UI draws the cursor itself */
+         return;
+     }
++    if (s->regs[PVG_REG_EFI_DISPLAY / 4] && s->regs[PVG_REG_EFI_FB_START / 4] &&
++        s->regs[PVG_REG_EFI_FB_MODE / 4]) {
++        /* firmware framebuffer: pvg_efi_scanout() owns the surface */
++        return;
++    }
+     pvg_display_ensure_surface(s, pvg_display_modes[0].width,
+                                pvg_display_modes[0].height);
+     fb = surface_data(s->surface);
+@@ -1690,19 +1695,19 @@ static void pvg_linux_mmio_write(void *opaque, hwaddr addr, uint64_t val,
+  */
+ static bool pvg_efi_translate(PVGLinuxPCIState *s, uint64_t va, uint64_t *gpa)
+ {
+-    PCIDevice *d = PCI_DEVICE(s);
+     uint64_t root = (uint64_t)s->regs[PVG_REG_EFI_FB_START / 4] << 12;
+     uint32_t table, depth, entry;
+ 
+-    ldl_le_pci_dma(d, root, &table, MEMTXATTRS_UNSPECIFIED);
+-    ldl_le_pci_dma(d, root + 4, &depth, MEMTXATTRS_UNSPECIFIED);
++    ldl_le_dma(&address_space_memory, root, &table, MEMTXATTRS_UNSPECIFIED);
++    ldl_le_dma(&address_space_memory, root + 4, &depth, MEMTXATTRS_UNSPECIFIED);
+     if (depth < 1 || depth > 4 || !table) {
+         *gpa = root + va;
+         return true;
+     }
+     for (int level = depth - 1; level >= 0; level--) {
+-        ldl_le_pci_dma(d, ((uint64_t)table << 12) + ((va >> (12 + 10 * level)) & 0x3ff) * 4,
+-                       &entry, MEMTXATTRS_UNSPECIFIED);
++        ldl_le_dma(&address_space_memory,
++                   ((uint64_t)table << 12) + ((va >> (12 + 10 * level)) & 0x3ff) * 4,
++                   &entry, MEMTXATTRS_UNSPECIFIED);
+         table = entry & 0x7fffffff;
+         if (!table) {
+             return false;
+@@ -1712,7 +1717,10 @@ static bool pvg_efi_translate(PVGLinuxPCIState *s, uint64_t va, uint64_t *gpa)
+     return true;
+ }
+ 
+-/* copy the EFI framebuffer (32-bit BGRX) to the console, ~30 Hz */
++/*
++ * copy the EFI framebuffer (32-bit BGRX) to the console, ~30 Hz. Read through system memory,
++ * not the device's DMA view: the firmware clears bus mastering once the GOP is set up.
++ */
+ static void pvg_efi_scanout(void *opaque)
+ {
+     PVGLinuxPCIState *s = opaque;
+@@ -1738,11 +1746,13 @@ static void pvg_efi_scanout(void *opaque)
+             uint32_t chunk = MIN(w * 4 - x, 0x1000 - (va & 0xfff));
+ 
+             if (pvg_efi_translate(s, va, &gpa)) {
+-                pci_dma_read(PCI_DEVICE(s), gpa, fb + y * fstride + x, chunk);
++                dma_memory_read(&address_space_memory, gpa, fb + y * fstride + x, chunk,
++                                MEMTXATTRS_UNSPECIFIED);
+             }
+             x += chunk;
+         }
+     }
++    trace_pvg_linux_efi_scanout(w, h, *(uint32_t *)fb);
+     qemu_console_update_full(s->con);
+     timer_mod(s->efi_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 33);
+ }
+diff --git a/hw/display/trace-events b/hw/display/trace-events
+index b9fbb4a..2880b8b 100644
+--- a/hw/display/trace-events
++++ b/hw/display/trace-events
+@@ -243,6 +243,7 @@ pvg_linux_present(uint32_t port, uint32_t task, uint32_t surface) "port %u task
+ pvg_linux_present_done(uint32_t events, uint32_t mask) "events=0x%x mask=0x%x"
+ pvg_linux_fps(uint32_t fps) "presents per second %u"
+ pvg_linux_efi_display(uint32_t on, uint32_t start, uint32_t len, uint32_t mode, uint32_t stride) "efi display %u start 0x%x len 0x%x mode 0x%x stride %u"
++pvg_linux_efi_scanout(uint32_t w, uint32_t h, uint32_t px0) "efi scanout %ux%u first pixel 0x%x"
+ pvg_linux_object_list(uint32_t task, uint64_t va, uint32_t len) "task %u objects at va=0x%"PRIx64" len=0x%x"
+ pvg_linux_scanout(uint32_t surface, uint32_t w, uint32_t h, uint64_t va, uint32_t missing_rows, uint32_t nonzero_samples) "surface %u %ux%u va=0x%"PRIx64" unreadable_rows=%u nonzero_samples=%u"
+ pvg_linux_scanout_skip(uint32_t surface, const char *why) "surface %u: %s"
+-- 
+2.43.0
+

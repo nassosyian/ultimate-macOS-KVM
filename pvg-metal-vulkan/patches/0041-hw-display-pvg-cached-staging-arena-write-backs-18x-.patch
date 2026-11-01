@@ -1,0 +1,208 @@
+From c6c5cce56a7e4614b3b262a6f0ae62db7b89cf1c Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 22:57:14 +0200
+Subject: [PATCH 41/54] hw/display/pvg: cached staging arena (write-backs 18x
+ faster); executor timing trace; coalesced guest writes
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-pci.c | 56 ++++++++++++++++++++++++++++++++++----
+ hw/display/pvg/pvg-exec.c  | 20 ++++++++++++--
+ hw/display/pvg/pvg-exec.h  |  2 ++
+ hw/display/trace-events    |  1 +
+ 4 files changed, 71 insertions(+), 8 deletions(-)
+
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index 27bf563..09f187d 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -256,6 +256,9 @@ struct PVGLinuxPCIState {
+     bool scanout_valid;             /* console holds a presented frame */
+     uint8_t gamma_lut[3][256];      /* Transaction3 gamma table, 8-bit per channel */
+     bool gamma_active;              /* table set and not the identity */
++    int64_t exec_us, exec_max_us, exec_window_start;   /* executor time per 500 cmdbufs */
++    int64_t exec_read_us, exec_write_us;            /* ... of it copying guest memory */
++    uint64_t exec_read_bytes, exec_write_bytes;
+     QEMUTimer *efi_timer;           /* EFI display scanout while the GOP driver owns the screen */
+     int64_t fps_start;              /* frame-rate window (realtime ms) */
+     uint32_t fps_frames;
+@@ -575,24 +578,36 @@ static bool pvg_task_read(PVGLinuxPCIState *s, uint32_t task, uint64_t va,
+     return true;
+ }
+ 
++/* guest-physically contiguous pages are written in one call: per-call overhead dominates */
+ static bool pvg_task_write(PVGLinuxPCIState *s, uint32_t task, uint64_t va,
+                            const void *buf, uint64_t len)
+ {
+-    const uint8_t *p = buf;
++    const uint8_t *p = buf, *run_p = buf;
++    uint64_t run_gpa = 0, run_len = 0;
+ 
+     while (len) {
+         uint64_t chunk = MIN(len, 0x1000 - (va & 0xfff));
+         uint64_t gpa;
+ 
+-        if (!pvg_task_translate(s, task, va, &gpa) ||
+-            pci_dma_write(PCI_DEVICE(s), gpa, p, chunk) != MEMTX_OK) {
++        if (!pvg_task_translate(s, task, va, &gpa)) {
+             return false;
+         }
++        if (run_len && gpa != run_gpa + run_len) {
++            if (pci_dma_write(PCI_DEVICE(s), run_gpa, run_p, run_len) != MEMTX_OK) {
++                return false;
++            }
++            run_len = 0;
++        }
++        if (!run_len) {
++            run_gpa = gpa;
++            run_p = p;
++        }
++        run_len += chunk;
+         p += chunk;
+         va += chunk;
+         len -= chunk;
+     }
+-    return true;
++    return !run_len || pci_dma_write(PCI_DEVICE(s), run_gpa, run_p, run_len) == MEMTX_OK;
+ }
+ 
+ /* CmdDefineTask2: {u32 id << 1 | flag, u64 length, u32 task root PFN} */
+@@ -1175,13 +1190,25 @@ static void pvg_display_scanout(PVGLinuxPCIState *s, uint32_t surface_id)
+ 
+ static bool pvg_exec_read(void *opaque, uint32_t task, uint64_t va, void *buf, uint64_t len)
+ {
+-    return pvg_task_read(opaque, task, va, buf, len);
++    PVGLinuxPCIState *s = opaque;
++    int64_t t0 = g_get_monotonic_time();
++    bool ok = pvg_task_read(s, task, va, buf, len);
++
++    s->exec_read_us += g_get_monotonic_time() - t0;
++    s->exec_read_bytes += len;
++    return ok;
+ }
+ 
+ static bool pvg_exec_write(void *opaque, uint32_t task, uint64_t va, const void *buf,
+                            uint64_t len)
+ {
+-    return pvg_task_write(opaque, task, va, buf, len);
++    PVGLinuxPCIState *s = opaque;
++    int64_t t0 = g_get_monotonic_time();
++    bool ok = pvg_task_write(s, task, va, buf, len);
++
++    s->exec_write_us += g_get_monotonic_time() - t0;
++    s->exec_write_bytes += len;
++    return ok;
+ }
+ 
+ static bool pvg_exec_translate(void *opaque, uint32_t task, uint64_t va, uint64_t *gpa)
+@@ -1378,8 +1405,25 @@ static void pvg_cmd_exec_indirect2(PVGLinuxPCIState *s, const uint8_t *p,
+         }
+         pvg_parse_cmdbuf(s, task, buf, cblen);
+         if (s->exec) {
++            int64_t t0 = g_get_monotonic_time(), dt;
++
+             pvg_exec_cmdbuf(s->exec, task, buf, cblen);
++            dt = g_get_monotonic_time() - t0;
++            s->exec_us += dt;
++            s->exec_max_us = MAX(s->exec_max_us, dt);
+             if (++s->exec_cmdbufs % 500 == 0) {
++                trace_pvg_linux_exec_time(s->exec_cmdbufs, s->exec_us / 1000,
++                                          (t0 + dt - s->exec_window_start) / 1000,
++                                          s->exec_max_us, s->exec_read_us / 1000,
++                                          s->exec_read_bytes >> 20, s->exec_write_us / 1000,
++                                          s->exec_write_bytes >> 20,
++                                          pvg_exec_stats(s->exec)->gpu_wait_us / 1000);
++                s->exec_us = s->exec_max_us = s->exec_read_us = s->exec_write_us = 0;
++                s->exec_read_bytes = s->exec_write_bytes = 0;
++                s->exec_window_start = t0 + dt;
++                pvg_exec_reset_wait(s->exec);
++            }
++            if (s->exec_cmdbufs % 500 == 0) {
+                 const PVGExecStats *st = pvg_exec_stats(s->exec);
+ 
+                 trace_pvg_linux_exec_stats(s->exec_cmdbufs, st->render_passes, st->draws,
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index bb446a7..f03a98e 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -330,8 +330,17 @@ static int arena_init(PVGExec *e)
+         return -1;
+     }
+     vkGetBufferMemoryRequirements(g->device, e->arena, &req);
++    /*
++     * Cached if possible: write-backs read rendered pixels back through the CPU, and reads
++     * of write-combined memory crawl (~340 MB/s measured, 75% of executor time).
++     */
+     mt = pvg_gpu_memory_type(g, req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+-                             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++                             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
++                             VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
++    if (mt < 0) {
++        mt = pvg_gpu_memory_type(g, req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++    }
+     if (mt < 0) {
+         return -1;
+     }
+@@ -1501,11 +1510,13 @@ static bool submit_wait(PVGExec *e, const VkSubmitInfo *si)
+     if (e->dry_run) {
+         return false;
+     }
+-    r = vkQueueSubmit(e->gpu->queue, 1, si, e->fence);
++    int64_t t0 = g_get_monotonic_time();
+ 
++    r = vkQueueSubmit(e->gpu->queue, 1, si, e->fence);
+     if (r == VK_SUCCESS) {
+         r = vkWaitForFences(d, 1, &e->fence, VK_TRUE, 2000000000ull);
+     }
++    e->stats.gpu_wait_us += g_get_monotonic_time() - t0;
+     if (r != VK_SUCCESS) {
+         /* the host GPU also drives the host desktop: never risk a second hang */
+         e->disabled = true;
+@@ -3159,6 +3170,11 @@ static gboolean match_task_str(gpointer key, gpointer value, gpointer task)
+     return (uint32_t)strtoul(key, NULL, 10) == GPOINTER_TO_UINT(task);
+ }
+ 
++void pvg_exec_reset_wait(PVGExec *e)
++{
++    e->stats.gpu_wait_us = 0;
++}
++
+ void pvg_exec_object_deleted(PVGExec *e, uint32_t task, uint32_t id)
+ {
+     g_autofree char *prefix = g_strdup_printf("%u:%u:", task, id);
+diff --git a/hw/display/pvg/pvg-exec.h b/hw/display/pvg/pvg-exec.h
+index 54f106b..b1da442 100644
+--- a/hw/display/pvg/pvg-exec.h
++++ b/hw/display/pvg/pvg-exec.h
+@@ -28,6 +28,7 @@ typedef struct PVGExecStats {
+     uint64_t segments, render_passes, draws, skipped_draws, pipelines, pipeline_failures;
+     uint64_t uploads, writebacks, blits, skipped_passes, continuations, feedback_copies;
+     uint64_t compute_segments, dispatches;
++    uint64_t gpu_wait_us;       /* since pvg_exec_reset_wait() */
+ } PVGExecStats;
+ 
+ typedef struct PVGExec PVGExec;
+@@ -38,6 +39,7 @@ void pvg_exec_set_dump_dir(PVGExec *e, const char *dir);
+ /* build pipelines and record work but never submit it to the GPU */
+ void pvg_exec_set_dry_run(PVGExec *e, bool dry);
+ void pvg_exec_free(PVGExec *e);
++void pvg_exec_reset_wait(PVGExec *e);
+ /* Execute one serialized Metal command buffer of a user task */
+ void pvg_exec_cmdbuf(PVGExec *e, uint32_t task, const uint8_t *buf, uint64_t len);
+ /* An object id of a task was deleted (ids are recycled): drop what is cached for it */
+diff --git a/hw/display/trace-events b/hw/display/trace-events
+index 2880b8b..c6941b4 100644
+--- a/hw/display/trace-events
++++ b/hw/display/trace-events
+@@ -254,6 +254,7 @@ pvg_linux_gpu(const char *name, bool validation) "host GPU %s (validation %d)"
+ pvg_linux_ref(uint32_t task, const char *cmd, uint32_t slot, uint32_t ref, uint32_t type, uint32_t len, uint32_t kind, uint32_t w0, uint32_t w1) "task %u %s[%u] -> object %u type=0x%x len=0x%x kind=0x%x body=0x%x,0x%x"
+ pvg_linux_exec(const char *msg) "%s"
+ pvg_linux_exec_stats(uint64_t cmdbufs, uint64_t passes, uint64_t draws, uint64_t skipped, uint64_t pipelines, uint64_t pipe_fail, uint64_t writebacks, uint64_t blits, uint64_t feedback, uint64_t dispatches) "cmdbufs=%"PRIu64" passes=%"PRIu64" draws=%"PRIu64" skipped=%"PRIu64" pipelines=%"PRIu64" failed=%"PRIu64" writebacks=%"PRIu64" blits=%"PRIu64" feedback=%"PRIu64" dispatches=%"PRIu64
++pvg_linux_exec_time(uint64_t cmdbufs, int64_t exec_ms, int64_t wall_ms, int64_t max_us, int64_t read_ms, uint64_t read_mb, int64_t write_ms, uint64_t write_mb, uint64_t wait_ms) "cmdbufs=%"PRIu64" exec %"PRId64" ms of %"PRId64" ms wall, slowest %"PRId64" us; guest read %"PRId64" ms %"PRIu64" MiB, write %"PRId64" ms %"PRIu64" MiB, gpu wait %"PRIu64" ms"
+ pvg_linux_child_poke(uint32_t index, uint32_t written, uint32_t read, uint32_t length) "child FIFO %u written=0x%x read=0x%x length=0x%x"
+ pvg_linux_cmd_stub(uint32_t op) "op=0x%02x not implemented, completed"
+ pvg_linux_signal_stamp(uint32_t index, uint32_t value) "stamps[%u]=%u"
+-- 
+2.43.0
+

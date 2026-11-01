@@ -1,0 +1,41 @@
+From f8666d54d7ee07612e29055ea6387cedc80bbe44 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 13:13:20 +0200
+Subject: [PATCH 17/54] hw/display/pvg/pvg-exec: report placeholder-bound
+ texture slots
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/pvg-exec.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index f06c46f..6ca3315 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -91,6 +91,7 @@ typedef struct Pipeline {
+     uint32_t vertex_bindings;           /* Metal buffer indices fetched as vertex buffers */
+     uint32_t push_size;
+     uint32_t draws_logged;
++    uint32_t dummy_logged;      /* texture slots already reported as placeholder-bound */
+ } Pipeline;
+ 
+ typedef struct Binding {
+@@ -1538,6 +1539,14 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                 if (((pp->vs_textures | pp->fs_textures) >> i & 1) &&
+                     (pp->texture_view[i] != VK_IMAGE_VIEW_TYPE_2D || !draw_tex[i])) {
+                     seg_dummy++;
++                    if (!(pp->dummy_logged >> i & 1)) {
++                        pp->dummy_logged |= 1u << i;
++                        elog(e, "task %u pipeline %u: texture slot %d placeholder (view %d, %s, "
++                             "ref %u%s)", task, st.pipeline, i, pp->texture_view[i],
++                             pp->vs_textures >> i & 1 ? "vertex" : "fragment", st.ftex[i],
++                             st.ftex[i] && is_attachment(att, natt, st.ftex[i]) ?
++                             " = attachment" : draw_tex[i] ? "" : " not uploaded");
++                    }
+                 }
+             }
+             if (!pp || !pp->ok || !bind_and_push(e, task, &st, pp, draw_tex)) {
+-- 
+2.43.0
+

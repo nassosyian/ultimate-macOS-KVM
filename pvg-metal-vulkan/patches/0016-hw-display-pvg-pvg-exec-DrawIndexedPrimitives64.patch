@@ -1,0 +1,76 @@
+From c88eddcd8a47b64c22376f6ace9f5f06caacc4e5 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 13:09:00 +0200
+Subject: [PATCH 16/54] hw/display/pvg/pvg-exec: DrawIndexedPrimitives64
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/pvg-exec.c | 27 +++++++++++++++++++--------
+ 1 file changed, 19 insertions(+), 8 deletions(-)
+
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index 5bccf55..f06c46f 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -1468,23 +1468,33 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                                          { (uint32_t)ldq(a + 16), (uint32_t)ldq(a + 24) } };
+             }
+             break;
+-        case 0x01: case 0x07: case 0x03: case 0x09: {
++        case 0x01: case 0x07: case 0x03: case 0x09: case 0x06: {
+             /*
+              * Draw[Indexed][Instanced]Primitives16, layouts from the PGDeserializerRenderDecoder
+              * decoders: 0x01 {u32 prim, u16 start, u16 count}; 0x03 {u16 start, u16 count,
+              * u16 instances, u16 prim}; 0x07/0x09 {u16 prim, u16 indexType, u32 ib,
+-             * u16 count, u16 offset[, u16 instances]}
++             * u16 count, u16 offset[, u16 instances]}; 0x06 DrawIndexedPrimitives64 {u16 prim,
++             * u16 indexType, u32 ib, u64 count, u64 offset}
+              */
+-            bool indexed = id == 0x07 || id == 0x09;
++            bool indexed = id == 0x06 || id == 0x07 || id == 0x09;
+             uint32_t prim, count, first = 0, instances = 1, idx_size = 2;
+             Pipeline *pp;
+             HostImage *draw_tex[32] = { NULL };
+-            uint32_t ib = 0, ib_off = 0;
++            uint32_t ib = 0;
++            uint64_t ib_off = 0;
+ 
+-            if (alen < (id == 0x09 ? 14u : id == 0x07 ? 12u : 8u)) {
++            if (alen < (id == 0x06 ? 24u : id == 0x09 ? 14u : id == 0x07 ? 12u : 8u)) {
+                 break;
+             }
+-            if (indexed) {
++            if (id == 0x06) {
++                uint64_t n = ldq(a + 8);
++
++                prim = lduw(a);
++                idx_size = lduw(a + 2) ? 4 : 2;
++                ib = ldl(a + 4);
++                count = n > UINT32_MAX ? UINT32_MAX : (uint32_t)n;
++                ib_off = ldq(a + 16);
++            } else if (indexed) {
+                 prim = lduw(a);
+                 idx_size = lduw(a + 2) ? 4 : 2;
+                 ib = ldl(a + 4);
+@@ -1511,7 +1521,7 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+             if (pp && pp->draws_logged < 3) {
+                 pp->draws_logged++;
+                 elog(e, "task %u pipeline %u draw 0x%x prim %u count %u first %u inst %u "
+-                     "ib %u+%u target %ux%u x%u", task, st.pipeline, id, prim, count, first,
++                     "ib %u+%" G_GUINT64_FORMAT " target %ux%u x%u", task, st.pipeline, id, prim, count, first,
+                      instances, ib, ib_off, rw, rh, natt);
+             }
+             for (int i = 0; i < MAX_SLOTS; i++) {
+@@ -1546,7 +1556,8 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+             if (indexed) {
+                 uint64_t size, io = buffer_upload(e, task, ib, &size);
+ 
+-                if (io == UINT64_MAX || ib_off + (uint64_t)idx_size * count > size) {
++                if (io == UINT64_MAX || ib_off > size ||
++                    (uint64_t)idx_size * count > size - ib_off) {
+                     e->stats.skipped_draws++;
+                     break;
+                 }
+-- 
+2.43.0
+

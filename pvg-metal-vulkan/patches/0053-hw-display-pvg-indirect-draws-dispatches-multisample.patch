@@ -1,0 +1,576 @@
+From 7268ec02532d9769b811615971f1d1a5ba0a2486 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Fri, 30 Oct 2026 11:04:17 +0200
+Subject: [PATCH 53/54] hw/display/pvg: indirect draws/dispatches, multisample
+ render passes, 3D mipmaps
+
+- DrawPrimitivesIndirect (0x10), DrawIndexedPrimitivesIndirect (0x11),
+  DispatchThreadgroupsIndirect (0xc9), DispatchThreadsIndirect (0xe6): the
+  argument structs are read from guest memory (earlier segments are written
+  back before a segment is recorded) and executed as direct commands;
+  base vertex / base instance honoured.
+- MSAA: a pass whose attachments carry a resolve texture and a multisample
+  source renders into an N-sample host image (kept between passes for Load),
+  N-sample depth and pipelines, and resolves (average / sample 0 for integer
+  formats) into the resolve texture that is written back. Property msaa.
+- generateMipmaps handles 3D textures (2x2x2 box filter).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-pci.c |   3 +
+ hw/display/pvg/pvg-exec.c  | 272 ++++++++++++++++++++++++++++++-------
+ hw/display/pvg/pvg-exec.h  |   2 +
+ 3 files changed, 229 insertions(+), 48 deletions(-)
+
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index abe884f..e558fb7 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -269,6 +269,7 @@ struct PVGLinuxPCIState {
+      */
+     bool async_exec;
+     bool damage_limit;
++    bool msaa;
+     QemuThread exec_thread;
+     QemuMutex exec_lock;
+     QemuCond exec_cond;
+@@ -2073,6 +2074,7 @@ static void pvg_linux_realize(PCIDevice *dev, Error **errp)
+                 if (s->exec) {
+                     pvg_exec_set_dry_run(s->exec, s->exec_dry_run);
+                     pvg_exec_set_damage_limit(s->exec, s->damage_limit);
++                    pvg_exec_set_msaa(s->exec, s->msaa);
+                 }
+                 if (!s->exec) {
+                     warn_report("pvg-linux-pci: Metal executor initialisation failed");
+@@ -2167,6 +2169,7 @@ static const Property pvg_linux_properties[] = {
+     DEFINE_PROP_BOOL("guest-fixups", PVGLinuxPCIState, guest_fixups_enable, true),
+     DEFINE_PROP_BOOL("async", PVGLinuxPCIState, async_exec, false),
+     DEFINE_PROP_BOOL("damage-limit", PVGLinuxPCIState, damage_limit, true),
++    DEFINE_PROP_BOOL("msaa", PVGLinuxPCIState, msaa, true),
+     DEFINE_PROP_BOOL("gpu", PVGLinuxPCIState, gpu_enable, true),
+     DEFINE_PROP_BOOL("gpu-validation", PVGLinuxPCIState, gpu_validation, false),
+     DEFINE_PROP_BOOL("exec", PVGLinuxPCIState, exec_enable, true),
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index 1a6e3f6..d88874a 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -79,7 +79,7 @@ typedef struct HostImage {
+     VkDeviceMemory mem;
+     VkImageView view;
+     VkFormat format;
+-    uint32_t width, height, depth, layers, mips;
++    uint32_t width, height, depth, layers, mips, samples;
+     VkImageViewType view_type;
+     VkImageLayout layout;       /* after the last image_upload */
+     bool initialized;           /* depth/stencil: contents defined (host-only images) */
+@@ -93,6 +93,8 @@ typedef struct GuestImage {
+     uint32_t depth, layers;     /* 3D depth; array layers (6 per cube) */
+     uint64_t slice_bytes;       /* bytes per 2D image / array layer */
+     uint32_t mips;              /* levels described below (1 for a single level/slice view) */
++    uint32_t samples;           /* host image sample count (set only for MSAA render targets) */
++    uint32_t desc_samples;      /* MTLTextureDescriptor sampleCount */
+     uint64_t span;              /* bytes from va that belong to the object (0 = unknown) */
+     uint64_t mip_off[MAX_MIPS], mip_slice[MAX_MIPS];   /* relative to va; bytes per image */
+     uint32_t mip_row[MAX_MIPS];
+@@ -162,6 +164,7 @@ struct PVGExec {
+     GHashTable *spv_cache;      /* SHA-256 of translator inputs -> A2SResult */
+     VkPipelineCache vk_cache;
+     bool damage_limit;          /* upload / write back only what a pass draws */
++    bool msaa;                  /* render multisample passes multisampled (else into the resolve texture) */
+     uint8_t unhandled_seen[3][128];   /* command ids already reported */
+     uint32_t texfail_logged, blit_unhandled, resolve_logged, cwb_logged, cio_dumps, buffail_logged, ccmd_logged;
+     DSAttachmentSave last_ds;
+@@ -261,6 +264,23 @@ static VkFormat mtl_pixel_format(uint32_t f, uint32_t *bpp, VkComponentMapping *
+     }
+ }
+ 
++/* integer colour formats (resolve by taking sample 0; no blending or averaging) */
++static bool format_is_integer(VkFormat f)
++{
++    switch (f) {
++    case VK_FORMAT_R8_UINT: case VK_FORMAT_R8_SINT: case VK_FORMAT_R8G8_UINT:
++    case VK_FORMAT_R8G8_SINT: case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_R8G8B8A8_SINT:
++    case VK_FORMAT_R16_UINT: case VK_FORMAT_R16_SINT: case VK_FORMAT_R16G16_UINT:
++    case VK_FORMAT_R16G16_SINT: case VK_FORMAT_R16G16B16A16_UINT:
++    case VK_FORMAT_R16G16B16A16_SINT: case VK_FORMAT_R32_UINT: case VK_FORMAT_R32_SINT:
++    case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32_SINT: case VK_FORMAT_R32G32B32A32_UINT:
++    case VK_FORMAT_R32G32B32A32_SINT: case VK_FORMAT_A2B10G10R10_UINT_PACK32:
++        return true;
++    default:
++        return false;
++    }
++}
++
+ /*
+  * MTLVertexFormat -> VkFormat. 3-component 8/16-bit formats have no vertex-buffer support on
+  * common hosts: they read as 4 components (the shader input ignores the extra one).
+@@ -701,6 +721,7 @@ static bool guest_image_ex(PVGExec *e, uint32_t task, uint32_t ref, int level, u
+         }
+     }
+     gi->format = mtl_pixel_format(lduw(desc + 2), &gi->bpp, &gi->swizzle);
++    gi->desc_samples = MAX(lduw(desc + 18), 1);
+     if (gi->format == VK_FORMAT_UNDEFINED && e->texfail_logged < 60) {
+         e->texfail_logged++;
+         elog(e, "task %u texture %u: MTLPixelFormat %u not mapped (%ux%u row %u, %s)", task, ref,
+@@ -749,10 +770,12 @@ static HostImage *host_image(PVGExec *e, uint32_t task, uint32_t ref, const Gues
+                      VK_IMAGE_TYPE_1D : vt == VK_IMAGE_VIEW_TYPE_3D ? VK_IMAGE_TYPE_3D :
+                      VK_IMAGE_TYPE_2D,
+         .format = gi->format, .extent = { gi->width, gi->height, gi->depth },
+-        .mipLevels = gi->mips, .arrayLayers = gi->layers, .samples = VK_SAMPLE_COUNT_1_BIT,
++        .mipLevels = gi->mips, .arrayLayers = gi->layers,
++        .samples = gi->samples > 1 ? (VkSampleCountFlagBits)gi->samples : VK_SAMPLE_COUNT_1_BIT,
+         .tiling = VK_IMAGE_TILING_OPTIMAL,
+-        /* only plain 2D images are ever render targets */
+-        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
++        /* only plain 2D images are ever render targets; multisample ones are host-only */
++        .usage = gi->samples > 1 ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT :
++                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                  (is2d ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0) |
+                  (format_storage_ok(e, gi->format) ? VK_IMAGE_USAGE_STORAGE_BIT : 0),
+@@ -769,7 +792,7 @@ static HostImage *host_image(PVGExec *e, uint32_t task, uint32_t ref, const Gues
+     (void)render_target;
+     if (hi && hi->format == gi->format && hi->width == gi->width && hi->height == gi->height &&
+         hi->depth == gi->depth && hi->layers == gi->layers && hi->view_type == gi->view_type &&
+-        hi->mips == gi->mips) {
++        hi->mips == gi->mips && hi->samples == MAX(gi->samples, 1)) {
+         return hi;
+     }
+     if (hi) {
+@@ -800,6 +823,7 @@ static HostImage *host_image(PVGExec *e, uint32_t task, uint32_t ref, const Gues
+     hi->depth = gi->depth;
+     hi->layers = gi->layers;
+     hi->mips = gi->mips;
++    hi->samples = MAX(gi->samples, 1);
+     hi->view_type = gi->view_type;
+     g_hash_table_insert(e->images, key_new(task, ref), hi);
+     return hi;
+@@ -1517,7 +1541,8 @@ static Pipeline *pipeline_get(PVGExec *e, uint32_t task, uint32_t ref, const VkF
+             .frontFace = VK_FRONT_FACE_CLOCKWISE, .lineWidth = 1.0f };
+         VkPipelineMultisampleStateCreateInfo ms = {
+             .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+-            .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
++            .rasterizationSamples = raster >> 8 > 1 ? (VkSampleCountFlagBits)(raster >> 8) :
++                                    VK_SAMPLE_COUNT_1_BIT };
+         VkPipelineDepthStencilStateCreateInfo ds = {
+             .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+         VkPipelineColorBlendStateCreateInfo cb = {
+@@ -1630,7 +1655,8 @@ static VkRect2D segment_damage(const uint8_t *p, uint32_t off, uint32_t len, uin
+             sy0 = (int64_t)ldq(r + 8);
+             sx1 = sx0 + (int64_t)ldq(r + 16);
+             sy1 = sy0 + (int64_t)ldq(r + 24);
+-        } else if (id == 0x01 || id == 0x03 || id == 0x06 || id == 0x07 || id == 0x09) {
++        } else if (id == 0x01 || id == 0x03 || id == 0x06 || id == 0x07 || id == 0x09 ||
++                   id == 0x10 || id == 0x11) {
+             dx0 = MIN(dx0, MAX(vx0, sx0));
+             dy0 = MIN(dy0, MAX(vy0, sy0));
+             dx1 = MAX(dx1, MIN(vx1, sx1));
+@@ -1840,6 +1866,9 @@ typedef struct Attachment {
+     HostImage *img;
+     uint64_t wb_off;
+     VkRect2D damage;            /* region drawn (and uploaded / written back) */
++    /* MSAA: gi/img describe the resolve texture; rendering goes to a host-only image */
++    uint32_t ms_ref, samples;
++    HostImage *msimg;
+ } Attachment;
+ 
+ /* DescribeRenderPass depth (bytes 0..39) and stencil (40..75) attachments */
+@@ -1897,7 +1926,8 @@ static void ds_barrier(PVGExec *e, VkImage img, VkImageLayout from, VkImageLayou
+ }
+ 
+ /* host-only depth/stencil image of a texture object (Metal keeps these on the GPU too) */
+-static HostImage *ds_image(PVGExec *e, uint32_t task, uint32_t ref, uint32_t w, uint32_t h)
++static HostImage *ds_image(PVGExec *e, uint32_t task, uint32_t ref, uint32_t w, uint32_t h,
++                           uint32_t samples)
+ {
+     PVGGpu *g = e->gpu;
+     gint64 key = key_of(task, ref | 0x40000000u);
+@@ -1905,7 +1935,8 @@ static HostImage *ds_image(PVGExec *e, uint32_t task, uint32_t ref, uint32_t w,
+     VkImageCreateInfo ici = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+         .format = DS_FORMAT, .extent = { w, h, 1 }, .mipLevels = 1, .arrayLayers = 1,
+-        .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
++        .samples = samples > 1 ? (VkSampleCountFlagBits)samples : VK_SAMPLE_COUNT_1_BIT,
++        .tiling = VK_IMAGE_TILING_OPTIMAL,
+         .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+     };
+@@ -1918,7 +1949,8 @@ static HostImage *ds_image(PVGExec *e, uint32_t task, uint32_t ref, uint32_t w,
+     VkMemoryRequirements req;
+     VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+ 
+-    if (hi && hi->width == w && hi->height == h) {
++    samples = MAX(samples, 1);
++    if (hi && hi->width == w && hi->height == h && hi->samples == samples) {
+         return hi;
+     }
+     if (hi) {
+@@ -1926,6 +1958,7 @@ static HostImage *ds_image(PVGExec *e, uint32_t task, uint32_t ref, uint32_t w,
+         g_hash_table_remove(e->images, &key);
+     }
+     hi = g_new0(HostImage, 1);
++    hi->samples = samples;
+     if (vkCreateImage(g->device, &ici, NULL, &hi->image) != VK_SUCCESS) {
+         g_free(hi);
+         return NULL;
+@@ -2155,7 +2188,7 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+     HostImage *dsimg = NULL;
+     bool has_depth = false, has_stencil = false;
+     VkFormat dfmt = VK_FORMAT_UNDEFINED, sfmt = VK_FORMAT_UNDEFINED;
+-    uint32_t off = 0, natt = 0, rw = 0, rh = 0;
++    uint32_t off = 0, natt = 0, rw = 0, rh = 0, pass_samples = 0;
+     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                     .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
+@@ -2226,6 +2259,7 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                              "load %u store %u", task, i, att[i].ref, ldl(c + 4), lduw(c + 14),
+                              lduw(c + 16), att[i].load, att[i].store);
+                     }
++                    att[i].ms_ref = att[i].ref;
+                     att[i].ref = ldl(c + 4);
+                     att[i].level = lduw(c + 14);
+                     att[i].slice = lduw(c + 16) + lduw(c + 18);
+@@ -2261,6 +2295,27 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+             att[i].ref = 0;
+         }
+     }
++    /* MSAA: every multisample attachment must agree on the sample count, else none is used */
++    for (uint32_t i = 0; e->msaa && i < natt; i++) {
++        GuestImage mg;
++
++        if (att[i].ref && att[i].ms_ref &&
++            guest_image_ex(e, task, att[i].ms_ref, 0, 0, &mg) && mg.desc_samples > 1 &&
++            mg.desc_samples <= 8 && mg.width == att[i].gi.width &&
++            mg.height == att[i].gi.height && mg.format == att[i].gi.format) {
++            att[i].samples = mg.desc_samples;
++            pass_samples = pass_samples ? pass_samples : att[i].samples;
++            if (att[i].samples != pass_samples) {
++                pass_samples = UINT32_MAX;
++            }
++        }
++    }
++    if (pass_samples == UINT32_MAX || pass_samples == 1) {
++        pass_samples = 0;
++        for (uint32_t i = 0; i < natt; i++) {
++            att[i].samples = 0;
++        }
++    }
+     if (!natt) {
+         uint8_t obj[MAX_OBJ];
+         uint32_t olen;
+@@ -2290,7 +2345,7 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+             elog(e, "task %u: depth/stencil attachment %u not usable", task, dref);
+         }
+         if (has_depth || has_stencil) {
+-            dsimg = ds_image(e, task, dref, w, h);
++            dsimg = ds_image(e, task, dref, w, h, pass_samples);
+             if (!dsimg) {
+                 has_depth = has_stencil = false;
+                 dfmt = sfmt = VK_FORMAT_UNDEFINED;
+@@ -2312,6 +2367,16 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+             vkEndCommandBuffer(e->cmd);
+             return;
+         }
++        if (att[i].samples > 1) {
++            GuestImage mg = att[i].gi;
++
++            mg.samples = att[i].samples;
++            mg.mips = mg.layers = mg.depth = 1;
++            att[i].msimg = host_image(e, task, att[i].ms_ref | 0x20000000u, &mg, true);
++            if (!att[i].msimg) {
++                att[i].samples = 0;     /* render single-sampled into the resolve texture */
++            }
++        }
+     }
+ 
+     /* prepass: upload every texture this segment samples, once */
+@@ -2383,6 +2448,32 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+             continue;
+         }
+         att[i].damage = (VkRect2D){ { 0, 0 }, { att[i].gi.width, att[i].gi.height } };
++        if (att[i].msimg && att[i].samples > 1) {
++            /*
++             * Multisample: render into the host-only image (kept between passes, so Load
++             * works), resolve into the resolve texture, which is written back as a whole
++             */
++            barrier(e, att[i].msimg->image, att[i].msimg->initialized ?
++                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
++                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++            att[i].msimg->initialized = true;
++            barrier(e, att[i].img->image, VK_IMAGE_LAYOUT_UNDEFINED,
++                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++            ca[i].imageView = att[i].msimg->view;
++            ca[i].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++            ca[i].resolveMode = format_is_integer(att[i].gi.format) ?
++                                VK_RESOLVE_MODE_SAMPLE_ZERO_BIT : VK_RESOLVE_MODE_AVERAGE_BIT;
++            ca[i].resolveImageView = att[i].img->view;
++            ca[i].resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++            ca[i].loadOp = att[i].load == 2 ? VK_ATTACHMENT_LOAD_OP_CLEAR :
++                           att[i].load == 1 ? VK_ATTACHMENT_LOAD_OP_LOAD :
++                           VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++            ca[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++            for (int k = 0; k < 4; k++) {
++                ca[i].clearValue.color.float32[k] = (float)att[i].clear[k];
++            }
++            continue;
++        }
+         if (e->damage_limit && att[i].load != 2 && att[i].gi.mips == 1 &&
+             att[i].gi.layers * att[i].gi.depth == 1 &&
+             att[i].gi.width == rw && att[i].gi.height == rh) {
+@@ -2545,7 +2636,7 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                                          { (uint32_t)ldq(a + 16), (uint32_t)ldq(a + 24) } };
+             }
+             break;
+-        case 0x01: case 0x07: case 0x03: case 0x09: case 0x06: {
++        case 0x01: case 0x07: case 0x03: case 0x09: case 0x06: case 0x10: case 0x11: {
+             /*
+              * Draw[Indexed][Instanced]Primitives16, layouts from the PGDeserializerRenderDecoder
+              * decoders: 0x01 {u32 prim, u16 start, u16 count}; 0x03 {u16 start, u16 count,
+@@ -2553,17 +2644,50 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+              * u16 count, u16 offset[, u16 instances]}; 0x06 DrawIndexedPrimitives64 {u16 prim,
+              * u16 indexType, u32 ib, u64 count, u64 offset}
+              */
+-            bool indexed = id == 0x06 || id == 0x07 || id == 0x09;
+-            uint32_t prim, count, first = 0, instances = 1, idx_size = 2;
++            bool indexed = id == 0x06 || id == 0x07 || id == 0x09 || id == 0x11;
++            uint32_t prim, count, first = 0, instances = 1, idx_size = 2, base_instance = 0;
++            int32_t base_vertex = 0;
+             Pipeline *pp;
+             HostImage *draw_tex[32] = { NULL }, *draw_vtex[32] = { NULL };
+             uint32_t ib = 0, unnorm[2];
+             uint64_t ib_off = 0;
+ 
+-            if (alen < (id == 0x06 ? 24u : id == 0x09 ? 14u : id == 0x07 ? 12u : 8u)) {
++            if (alen < (id == 0x06 ? 24u : id == 0x11 ? 28u : id == 0x10 ? 14u :
++                        id == 0x09 ? 14u : id == 0x07 ? 12u : 8u)) {
+                 break;
+             }
+-            if (id == 0x06) {
++            if (id == 0x10 || id == 0x11) {
++                /*
++                 * Draw[Indexed]PrimitivesIndirect: 0x10 {u64 offset, u32 buffer, u16 prim};
++                 * 0x11 {u16 prim, u16 indexType, u32 ib, u32 buffer, u64 ibOffset, u64 offset}.
++                 * Arguments come from guest memory: anything a previous segment computed into
++                 * them was written back before this one is recorded.
++                 */
++                uint32_t args[5] = { 0 }, abuf = id == 0x10 ? ldl(a + 8) : ldl(a + 8);
++                uint64_t aoff = id == 0x10 ? ldq(a) : ldq(a + 20), ava;
++
++                if (!buffer_range(e, task, abuf, aoff, id == 0x10 ? 16 : 20, &ava) ||
++                    !e->host.read(e->host.opaque, task, ava, args, id == 0x10 ? 16 : 20)) {
++                    e->stats.skipped_draws++;
++                    break;
++                }
++                if (id == 0x10) {
++                    prim = lduw(a + 12);
++                    count = args[0];
++                    instances = args[1];
++                    first = args[2];
++                    base_instance = args[3];
++                } else {
++                    prim = lduw(a);
++                    idx_size = lduw(a + 2) ? 4 : 2;
++                    ib = ldl(a + 4);
++                    count = args[0];
++                    instances = args[1];
++                    ib_off = ldq(a + 12) + (uint64_t)args[2] * idx_size;
++                    base_vertex = (int32_t)args[3];
++                    base_instance = args[4];
++                }
++            } else if (id == 0x06) {
+                 uint64_t n = ldq(a + 8);
+ 
+                 prim = lduw(a);
+@@ -2601,7 +2725,8 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                                                    topology_class(prim),
+                                                    st.depth_clamp | (st.fill_lines &&
+                                                    topology_class(prim) ==
+-                                                   VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST) << 1)
++                                                   VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST) << 1 |
++                                                   pass_samples << 8)
+                                : NULL;
+             e->stats.pipeline_us += g_get_monotonic_time() - pt0;
+             if (pp && pp->draws_logged < 3) {
+@@ -2713,9 +2838,9 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                 }
+                 vkCmdBindIndexBuffer(e->cmd, e->arena, io + ib_off,
+                                      idx_size == 4 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
+-                vkCmdDrawIndexed(e->cmd, count, instances, 0, 0, 0);
++                vkCmdDrawIndexed(e->cmd, count, instances, 0, base_vertex, base_instance);
+             } else {
+-                vkCmdDraw(e->cmd, count, instances, first, 0);
++                vkCmdDraw(e->cmd, count, instances, first, base_instance);
+             }
+             e->stats.draws++;
+             break;
+@@ -3107,6 +3232,7 @@ static void exec_compute_segment(PVGExec *e, uint32_t task, const uint8_t *p, ui
+         uint32_t id = ldl(p + off), clen = ldl(p + off + 4);
+         const uint8_t *a = p + off + 8;
+         uint32_t alen = clen - 8;
++        uint8_t direct[48];     /* an indirect dispatch rewritten as a direct one */
+ 
+         if (clen < 8 || off + clen > len) {
+             break;
+@@ -3142,6 +3268,33 @@ static void exec_compute_segment(PVGExec *e, uint32_t task, const uint8_t *p, ui
+                 cs.tg_bytes[ldl(a + 8)] = (uint32_t)MIN(ldq(a), 64 * 1024);
+             }
+             break;
++        case 0xc9: case 0xe6: {
++            /*
++             * Dispatch{Threadgroups,Threads}Indirect {u64 offset, u32 buffer[, u64 tpt[3]]}:
++             * MTLDispatchThreadgroupsIndirectArguments {u32 groups[3]} (threads per
++             * threadgroup from the command) or {u32 threads[3], u32 tpt[3]}. Arguments that
++             * an earlier segment computed are already in guest memory.
++             */
++            uint32_t args[6] = { 0 };
++            uint64_t ava;
++            bool tg = id == 0xc9;
++
++            if (alen < 12 || !buffer_range(e, task, ldl(a + 8), ldq(a), tg ? 12 : 24, &ava) ||
++                !e->host.read(e->host.opaque, task, ava, args, tg ? 12 : 24) ||
++                (tg && alen < 36)) {
++                elog(e, "task %u dispatch 0x%x: indirect arguments unreadable, skipped", task, id);
++                e->stats.skipped_draws++;
++                break;
++            }
++            for (int k = 0; k < 3; k++) {
++                stq(direct + 8 * k, args[k]);
++                stq(direct + 24 + 8 * k, tg ? ldq(a + 12 + 8 * k) : args[3 + k]);
++            }
++            a = direct;
++            alen = sizeof(direct);
++            id = tg ? 0xc8 : 0xca;
++        }
++            /* fall through */
+         case 0xc8: case 0xca: {
+             uint32_t local[3], groups[3], grid[3], unnorm = 0;
+             uint8_t pc[256] = { 0 };
+@@ -3523,54 +3676,72 @@ static void mip_store(uint8_t *p, int kind, int c, float v)
+     }
+ }
+ 
++/* 3D textures: slice argument of guest_image_ex selects the depth plane */
+ static void generate_mipmaps(PVGExec *e, uint32_t task, uint32_t ref)
+ {
+-    GuestImage all, src, dst;
++    GuestImage all, src0, src1, dst;
+     int kind, nc;
+ 
+     if (!guest_image_ex(e, task, ref, -1, 0, &all) || all.mips < 2) {
+         return;
+     }
+     nc = mip_channels(all.format, &kind);
+-    if (!nc || all.depth > 1) {
+-        elog(e, "task %u texture %u: generateMipmaps for format %d / 3D not supported", task, ref,
++    if (!nc) {
++        elog(e, "task %u texture %u: generateMipmaps for format %d not supported", task, ref,
+              all.format);
+         return;
+     }
+     for (uint32_t slice = 0; slice < all.layers; slice++) {
+         for (uint32_t l = 1; l < all.mips; l++) {
+-            g_autofree uint8_t *in = NULL, *out = NULL;
++            uint32_t sdepth = MAX(all.depth >> (l - 1), 1), ddepth = MAX(all.depth >> l, 1);
++
++            for (uint32_t z = 0; z < ddepth; z++) {
++                /* the two source planes (the same one when the source has a single plane) */
++                uint32_t z0 = MIN(2 * z, sdepth - 1), z1 = MIN(2 * z + 1, sdepth - 1);
++                uint32_t sl = all.depth > 1 ? 0 : slice;
++                g_autofree uint8_t *in0 = NULL, *in1 = NULL, *out = NULL;
++
++                if (!guest_image_ex(e, task, ref, l - 1, all.depth > 1 ? z0 : sl, &src0) ||
++                    !guest_image_ex(e, task, ref, l - 1, all.depth > 1 ? z1 : sl, &src1) ||
++                    !guest_image_ex(e, task, ref, l, all.depth > 1 ? z : sl, &dst) ||
++                    src0.bpp != dst.bpp || !dst.width || !dst.height) {
++                    return;
++                }
++                in0 = g_malloc((size_t)src0.row_bytes * src0.height);
++                in1 = g_malloc((size_t)src1.row_bytes * src1.height);
++                out = g_malloc((size_t)dst.width * dst.bpp);
++                if (!e->host.read(e->host.opaque, src0.task, src0.va, in0,
++                                  (uint64_t)src0.row_bytes * src0.height) ||
++                    !e->host.read(e->host.opaque, src1.task, src1.va, in1,
++                                  (uint64_t)src1.row_bytes * src1.height)) {
++                    return;
++                }
++                for (uint32_t y = 0; y < dst.height; y++) {
++                    uint32_t y0 = MIN(2 * y, src0.height - 1), y1 = MIN(2 * y + 1, src0.height - 1);
+ 
+-            if (!guest_image_ex(e, task, ref, l - 1, slice, &src) ||
+-                !guest_image_ex(e, task, ref, l, slice, &dst) ||
+-                src.bpp != dst.bpp || !dst.width || !dst.height) {
+-                return;
+-            }
+-            in = g_malloc((size_t)src.row_bytes * src.height);
+-            out = g_malloc((size_t)dst.width * dst.bpp);
+-            if (!e->host.read(e->host.opaque, src.task, src.va, in,
+-                              (uint64_t)src.row_bytes * src.height)) {
+-                return;
+-            }
+-            for (uint32_t y = 0; y < dst.height; y++) {
+-                uint32_t y0 = MIN(2 * y, src.height - 1), y1 = MIN(2 * y + 1, src.height - 1);
++                    for (uint32_t x = 0; x < dst.width; x++) {
++                        uint32_t x0 = MIN(2 * x, src0.width - 1);
++                        uint32_t x1 = MIN(2 * x + 1, src0.width - 1);
+ 
+-                for (uint32_t x = 0; x < dst.width; x++) {
+-                    uint32_t x0 = MIN(2 * x, src.width - 1), x1 = MIN(2 * x + 1, src.width - 1);
++                        for (int c = 0; c < nc; c++) {
++                            float v = 0;
+ 
+-                    for (int c = 0; c < nc; c++) {
+-                        float v = mip_load(in + y0 * src.row_bytes + x0 * src.bpp, kind, c) +
+-                                  mip_load(in + y0 * src.row_bytes + x1 * src.bpp, kind, c) +
+-                                  mip_load(in + y1 * src.row_bytes + x0 * src.bpp, kind, c) +
+-                                  mip_load(in + y1 * src.row_bytes + x1 * src.bpp, kind, c);
++                            for (int pl = 0; pl < 2; pl++) {
++                                const uint8_t *in = pl ? in1 : in0;
+ 
+-                        mip_store(out + x * dst.bpp, kind, c, v * 0.25f);
++                                v += mip_load(in + y0 * src0.row_bytes + x0 * src0.bpp, kind, c) +
++                                     mip_load(in + y0 * src0.row_bytes + x1 * src0.bpp, kind, c) +
++                                     mip_load(in + y1 * src0.row_bytes + x0 * src0.bpp, kind, c) +
++                                     mip_load(in + y1 * src0.row_bytes + x1 * src0.bpp, kind, c);
++                            }
++                            mip_store(out + x * dst.bpp, kind, c, v * 0.125f);
++                        }
+                     }
++                    e->host.write(e->host.opaque, dst.task, dst.va + (uint64_t)y * dst.row_bytes,
++                                  out, (uint64_t)dst.width * dst.bpp);
+                 }
+-                e->host.write(e->host.opaque, dst.task, dst.va + (uint64_t)y * dst.row_bytes, out,
+-                              (uint64_t)dst.width * dst.bpp);
++                note_write(e, dst.task, dst.va, (uint64_t)dst.row_bytes * dst.height, 'M');
+             }
+-            note_write(e, dst.task, dst.va, (uint64_t)dst.row_bytes * dst.height, 'M');
+         }
+     }
+     e->stats.blits++;
+@@ -3830,6 +4001,11 @@ void pvg_exec_set_damage_limit(PVGExec *e, bool on)
+     e->damage_limit = on;
+ }
+ 
++void pvg_exec_set_msaa(PVGExec *e, bool on)
++{
++    e->msaa = on;
++}
++
+ void pvg_exec_set_dump_dir(PVGExec *e, const char *dir)
+ {
+     g_free(e->dump_dir);
+diff --git a/hw/display/pvg/pvg-exec.h b/hw/display/pvg/pvg-exec.h
+index a0c510d..73a1bc2 100644
+--- a/hw/display/pvg/pvg-exec.h
++++ b/hw/display/pvg/pvg-exec.h
+@@ -43,6 +43,8 @@ void pvg_exec_set_dump_dir(PVGExec *e, const char *dir);
+ void pvg_exec_set_dry_run(PVGExec *e, bool dry);
+ /* upload / write back only the rectangle a render pass draws into (default on) */
+ void pvg_exec_set_damage_limit(PVGExec *e, bool on);
++/* multisample render passes on the host (default on); off renders into the resolve texture */
++void pvg_exec_set_msaa(PVGExec *e, bool on);
+ void pvg_exec_free(PVGExec *e);
+ void pvg_exec_reset_wait(PVGExec *e);
+ /* Execute one serialized Metal command buffer of a user task */
+-- 
+2.43.0
+

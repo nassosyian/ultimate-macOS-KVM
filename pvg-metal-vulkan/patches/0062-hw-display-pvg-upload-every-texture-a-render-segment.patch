@@ -1,0 +1,85 @@
+From 26c1993dab0f1b6199bacc64e3a7fc2d45ffe8ac Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Fri, 30 Oct 2026 23:58:42 +0200
+Subject: [PATCH] hw/display/pvg: upload every texture a render segment samples
+
+The render prepass uploaded at most 64 distinct textures per segment.
+WindowServer's full-screen composite samples ~175 (one per text and icon
+layer), so later layers were drawn from never-filled images: Activity
+Monitor lost its text after the 7th row, its column headers, and its
+Dock icon went black. Track uploaded textures in a hash set, and look
+at up to 2048 texture references (was 128) when flushing GPU-only
+textures before a segment.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/pvg-exec.c | 21 +++++++++------------
+ 1 file changed, 9 insertions(+), 12 deletions(-)
+
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index c7c461c..d04d163 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -22,6 +22,7 @@
+ 
+ #define ARENA_SIZE          (256u << 20)
+ #define ZC_MAX_CHUNKS       64
++#define MAX_SEG_REFS        2048    /* distinct textures one segment samples (seen: ~180) */
+ #define ZC_CHUNK            (1ull << 30)    /* guest RAM is imported in pieces of 1 GiB */
+ #define MAX_SLOTS           16
+ #define MAX_OBJ             0x1000
+@@ -3445,7 +3446,8 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+ 
+     if (e->private_resident && e->priv_imgs->len) {
+         /* guest copies this pass may upload must include other images' stale contents */
+-        uint32_t refs[128], n = segment_texture_refs(p, off, len, refs, 128);
++        uint32_t refs[MAX_SEG_REFS];
++        uint32_t n = segment_texture_refs(p, off, len, refs, MAX_SEG_REFS);
+ 
+         for (uint32_t i = 0; i < natt; i++) {
+             if (att[i].ref) {
+@@ -3491,7 +3493,8 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+ 
+     /* prepass: upload every texture this segment samples, once */
+     {
+-        uint32_t done[64], ndone = 0;
++        /* a full-screen composite samples hundreds (one texture per text/icon layer) */
++        g_autoptr(GHashTable) done = g_hash_table_new(NULL, NULL);
+ 
+         for (uint32_t o = off; o + 8 <= len;) {
+             uint32_t id = ldl(p + o), clen = ldl(p + o + 4);
+@@ -3505,19 +3508,12 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                 for (int i = 0; i < MAX_SLOTS; i++) {
+                     GuestImage gi;
+                     HostImage *hi;
+-                    bool seen = false;
+ 
+-                    if (!refs[i] || is_attachment(att, natt, refs[i])) {
+-                        continue;
+-                    }
+-                    for (uint32_t k = 0; k < ndone; k++) {
+-                        seen |= done[k] == refs[i];
+-                    }
+-                    if (seen || ndone == G_N_ELEMENTS(done) ||
++                    if (!refs[i] || is_attachment(att, natt, refs[i]) ||
++                        !g_hash_table_add(done, GUINT_TO_POINTER(refs[i])) ||
+                         !guest_image(e, task, refs[i], &gi)) {
+                         continue;
+                     }
+-                    done[ndone++] = refs[i];
+                     hi = host_image(e, task, refs[i], &gi, false);
+                     if (hi) {
+                         texture_prepare(e, &gi, hi, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+@@ -4453,7 +4449,8 @@ static void exec_compute_segment(PVGExec *e, uint32_t task, const uint8_t *p, ui
+ 
+     e->stats.compute_segments++;
+     if (e->private_resident && e->priv_imgs->len) {
+-        uint32_t refs[128], n = segment_texture_refs(p, 0, len, refs, 128);
++        uint32_t refs[MAX_SEG_REFS];
++        uint32_t n = segment_texture_refs(p, 0, len, refs, MAX_SEG_REFS);
+ 
+         priv_prepare_refs(e, task, refs, n);
+     }
+-- 
+2.43.0
+

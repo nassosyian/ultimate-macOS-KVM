@@ -1,0 +1,364 @@
+From 52117b484da139cc52559a44394d2c5922a3a869 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 10:13:03 +0200
+Subject: [PATCH 04/54] hw/display/pvg-linux-pci: child FIFOs via the shared
+ root page
+
+Child FIFO control nodes live in the root page; data pages come from a
+page list. wakeFifo/resumeChildFifo run them through the same command
+loop as the root FIFO and publish their own stamp index. Fixes root FIFO
+wrap-around handling.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-pci.c | 215 ++++++++++++++++++++++++++++++-------
+ hw/display/trace-events    |   4 +-
+ 2 files changed, 177 insertions(+), 42 deletions(-)
+
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index 1b0a070..5d9dbd2 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -41,7 +41,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(PVGLinuxPCIState, PVG_LINUX_PCI)
+ #define PVG_REG_FIFO_START      0x1010  /* command data offset in base page */
+ #define PVG_REG_IRQ_STATUS      0x1014  /* read-and-clear */
+ #define PVG_REG_STAMP_STATUS    0x1018  /* read-and-clear, bit n = stamps[n] */
+-#define PVG_REG_ROOT_PAGE       0x101c
++#define PVG_REG_ROOT_PAGE       0x101c  /* PFN of the shared root page */
++#define PVG_REG_WAKE_FIFO       0x1020  /* child FIFO index */
++#define PVG_REG_RESUME_CHILD    0x1028  /* child FIFO index */
+ #define PVG_REG_FIFO_BASE_PAGE  0x1030
+ #define PVG_REG_DISPLAY_PORTS   0x122c
+ 
+@@ -56,6 +58,28 @@ OBJECT_DECLARE_SIMPLE_TYPE(PVGLinuxPCIState, PVG_LINUX_PCI)
+ #define PVG_CMD_GET_DEVICE_INFO     0x3a
+ 
+ #define PVG_ROOT_STAMP_INDEX    0
++#define PVG_MAX_FIFOS           0x40
++
++/*
++ * Child FIFO control node in the root page: rootPage + 0x400 + (i-1) * 0x14
++ * (-[_PGDevice createFIFOInternal:restoring:], PGChildFIFO).
++ */
++#define PVG_CHILD_NODES_OFF     0x400
++#define PVG_CHILD_NODE_SIZE     0x14
++#define PVG_NODE_WRITTEN        0x0     /* u32, guest, monotonic bytes */
++#define PVG_NODE_READ           0x4     /* u32, host, monotonic bytes */
++#define PVG_NODE_FAULT          0x8     /* u32, 0xffffffff = no fault */
++#define PVG_NODE_STAMP_INDEX    0xc     /* u16 */
++#define PVG_NODE_PAGE_LIST      0x10    /* u32 PFN of a page of data PFNs */
++#define PVG_CHILD_MAX_PAGES     0x400
++
++/* Where a FIFO's command bytes live: one contiguous range or a page list */
++typedef struct PVGFifoView {
++    uint32_t length;
++    uint64_t base;          /* contiguous case */
++    uint32_t npages;        /* page-list case, 0 if contiguous */
++    uint64_t pages[PVG_CHILD_MAX_PAGES];
++} PVGFifoView;
+ 
+ typedef struct QEMU_PACKED PVGCmdHeader {
+     uint16_t opcode;
+@@ -103,6 +127,7 @@ struct PVGLinuxPCIState {
+     uint32_t irq_status;
+     uint32_t stamp_status;
+     uint8_t *payload;
++    PVGFifoView *view;
+ 
+     /* properties */
+     uint16_t vendor_id;
+@@ -122,18 +147,21 @@ static uint64_t pvg_fifo_base(PVGLinuxPCIState *s)
+     return (uint64_t)pvg_reg(s, PVG_REG_FIFO_BASE_PAGE) << 12;
+ }
+ 
+-static bool pvg_fifo_read(PVGLinuxPCIState *s, uint32_t off, void *buf,
+-                          uint32_t len)
++static bool pvg_fifo_read(PVGLinuxPCIState *s, const PVGFifoView *v,
++                          uint32_t off, void *buf, uint32_t len)
+ {
+-    uint32_t size = pvg_reg(s, PVG_REG_FIFO_LENGTH);
+-    uint64_t base = pvg_fifo_base(s) + pvg_reg(s, PVG_REG_FIFO_START);
+     uint8_t *p = buf;
+ 
+     while (len) {
+-        uint32_t o = off % size;
+-        uint32_t chunk = MIN(len, size - o);
++        uint32_t o = off % v->length;
++        uint32_t chunk = MIN(len, v->length - o);
++        uint64_t addr = v->base + o;
+ 
+-        if (pci_dma_read(PCI_DEVICE(s), base + o, p, chunk) != MEMTX_OK) {
++        if (v->npages) {
++            chunk = MIN(chunk, 0x1000 - (o & 0xfff));
++            addr = v->pages[o >> 12] + (o & 0xfff);
++        }
++        if (pci_dma_read(PCI_DEVICE(s), addr, p, chunk) != MEMTX_OK) {
+             return false;
+         }
+         p += chunk;
+@@ -143,6 +171,34 @@ static bool pvg_fifo_read(PVGLinuxPCIState *s, uint32_t off, void *buf,
+     return true;
+ }
+ 
++static uint64_t pvg_child_node(PVGLinuxPCIState *s, uint32_t index)
++{
++    return ((uint64_t)pvg_reg(s, PVG_REG_ROOT_PAGE) << 12) +
++           PVG_CHILD_NODES_OFF + (index - 1) * PVG_CHILD_NODE_SIZE;
++}
++
++/* -[PGChildFIFO setupMapping]: data pages listed in a zero-terminated page */
++static bool pvg_child_view(PVGLinuxPCIState *s, uint32_t index, PVGFifoView *v)
++{
++    uint32_t list_pfn = 0, pfns[PVG_CHILD_MAX_PAGES];
++
++    pci_dma_read(PCI_DEVICE(s), pvg_child_node(s, index) + PVG_NODE_PAGE_LIST,
++                 &list_pfn, 4);
++    if (!le32_to_cpu(list_pfn) ||
++        pci_dma_read(PCI_DEVICE(s), (uint64_t)le32_to_cpu(list_pfn) << 12,
++                     pfns, sizeof(pfns)) != MEMTX_OK) {
++        return false;
++    }
++    v->npages = 0;
++    while (v->npages < PVG_CHILD_MAX_PAGES && pfns[v->npages]) {
++        v->pages[v->npages] = (uint64_t)le32_to_cpu(pfns[v->npages]) << 12;
++        v->npages++;
++    }
++    v->length = v->npages * 0x1000;
++    v->base = 0;
++    return v->npages != 0;
++}
++
+ /* Equivalent of -[_PGDevice signalStamp:value:] */
+ static void pvg_signal_stamp(PVGLinuxPCIState *s, uint32_t index,
+                              uint32_t value)
+@@ -183,10 +239,32 @@ static void pvg_cmd_get_device_info(PVGLinuxPCIState *s, const uint32_t *p,
+     trace_pvg_linux_device_info(version, n, dst);
+ }
+ 
++/* CmdDefineChildFIFO, non-restoring path of -[PGChildFIFO initWithDevice:...] */
++static void pvg_cmd_define_child_fifo(PVGLinuxPCIState *s, const uint8_t *p,
++                                      uint32_t len)
++{
++    uint32_t index = len >= 4 ? ldl_le_p(p) : 0;
++    uint64_t node;
++
++    if (!index || index >= PVG_MAX_FIFOS || !pvg_reg(s, PVG_REG_ROOT_PAGE)) {
++        qemu_log_mask(LOG_GUEST_ERROR, "pvg: bad DefineChildFIFO %u\n", index);
++        return;
++    }
++    node = pvg_child_node(s, index);
++    stl_le_pci_dma(PCI_DEVICE(s), node + PVG_NODE_READ, 0,
++                   MEMTXATTRS_UNSPECIFIED);
++    stl_le_pci_dma(PCI_DEVICE(s), node + PVG_NODE_FAULT, 0xffffffff,
++                   MEMTXATTRS_UNSPECIFIED);
++    trace_pvg_linux_define_child(index, node);
++}
++
+ static void pvg_dispatch(PVGLinuxPCIState *s, const PVGCmdHeader *h,
+                          const uint8_t *payload, uint32_t len)
+ {
+     switch (h->opcode) {
++    case PVG_CMD_DEFINE_CHILD_FIFO:
++        pvg_cmd_define_child_fifo(s, payload, len);
++        break;
+     case PVG_CMD_GET_DEVICE_INFO:
+         pvg_cmd_get_device_info(s, (const uint32_t *)payload, len);
+         break;
+@@ -198,32 +276,24 @@ static void pvg_dispatch(PVGLinuxPCIState *s, const PVGCmdHeader *h,
+ }
+ 
+ /*
+- * Process every root FIFO command between the consumer and the new producer
+- * offset (-[PGFIFO processFifo]). All commands currently complete
++ * Run the commands between consumer offset *head and producer offset
++ * 'written' (-[PGFIFO processFifo]). All commands currently complete
+  * synchronously, so the stamp of the last one is published afterwards,
+- * matching PGPendingStampQueue::pump().
++ * matching PGPendingStampQueue::pump(). Returns false if nothing ran.
+  */
+-static void pvg_fifo_process(PVGLinuxPCIState *s, uint32_t written)
++static bool pvg_fifo_run(PVGLinuxPCIState *s, uint32_t fifo,
++                         const PVGFifoView *v, uint32_t *head,
++                         uint32_t written, uint32_t *last_stamp)
+ {
+-    uint32_t size = pvg_reg(s, PVG_REG_FIFO_LENGTH);
+-    uint32_t head = pvg_reg(s, PVG_REG_FIFO_READ);
+-    bool completed = false;
+-    uint32_t last_stamp = 0;
++    bool ran = false;
+ 
+-    if (!pvg_reg(s, PVG_REG_ENABLE_FIFO)) {
+-        return;
+-    }
+-    if (!size || size > 0x20000 || (size & 0xfff)) {
+-        qemu_log_mask(LOG_GUEST_ERROR, "pvg: FIFO length 0x%x unusable\n", size);
+-        return;
+-    }
+-
+-    while (head != written) {
++    while (*head != written) {
+         PVGCmdHeader h;
+         uint32_t skip, len;
+ 
+-        if (!pvg_fifo_read(s, head, &h, sizeof(h))) {
+-            qemu_log_mask(LOG_GUEST_ERROR, "pvg: FIFO read failed @0x%x\n", head);
++        if (!pvg_fifo_read(s, v, *head, &h, sizeof(h))) {
++            qemu_log_mask(LOG_GUEST_ERROR, "pvg: FIFO %u read failed @0x%x\n",
++                          fifo, *head);
+             break;
+         }
+         h.opcode = le16_to_cpu(h.opcode);
+@@ -231,16 +301,16 @@ static void pvg_fifo_process(PVGLinuxPCIState *s, uint32_t written)
+         h.length = le32_to_cpu(h.length);
+         h.stamp_value = le32_to_cpu(h.stamp_value);
+         skip = PVG_CMD_HDR_SIZE + 8 * h.barrier_count;
+-        if (h.length < skip || h.length > size ||
++        if (h.length < skip || h.length > v->length ||
+             h.barrier_count > PVG_CMD_MAX_BARRIERS ||
+             h.length - skip > PVG_CMD_MAX_PAYLOAD) {
+             qemu_log_mask(LOG_GUEST_ERROR,
+-                          "pvg: bad command op=0x%x len=0x%x @0x%x\n",
+-                          h.opcode, h.length, head);
++                          "pvg: FIFO %u bad command op=0x%x len=0x%x @0x%x\n",
++                          fifo, h.opcode, h.length, *head);
+             break;
+         }
+         len = h.length - skip;
+-        if (!pvg_fifo_read(s, head + skip, s->payload, len)) {
++        if (!pvg_fifo_read(s, v, *head + skip, s->payload, len)) {
+             break;
+         }
+         if (trace_event_get_state_backends(TRACE_PVG_LINUX_CMD)) {
+@@ -250,18 +320,70 @@ static void pvg_fifo_process(PVGLinuxPCIState *s, uint32_t written)
+                 g_string_append_printf(words, " 0x%x",
+                                        ldl_le_p(s->payload + 4 * i));
+             }
+-            trace_pvg_linux_cmd(head, h.opcode, h.barrier_count, h.length,
+-                                h.stamp_value, words->str);
++            trace_pvg_linux_cmd(fifo, *head, h.opcode, h.barrier_count,
++                                h.length, h.stamp_value, words->str);
+         }
+         /* barriers wait for other FIFOs' stamps; nothing else runs yet */
+         pvg_dispatch(s, &h, s->payload, len);
+-        head = (head + h.length) % size;
+-        s->regs[PVG_REG_FIFO_READ / 4] = head;
+-        last_stamp = h.stamp_value;
+-        completed = true;
++        *head += h.length;
++        *last_stamp = h.stamp_value;
++        ran = true;
++    }
++    return ran;
++}
++
++static void pvg_root_fifo_process(PVGLinuxPCIState *s, uint32_t written)
++{
++    PVGFifoView *v = s->view;
++    uint32_t head = pvg_reg(s, PVG_REG_FIFO_READ);
++    uint32_t stamp;
++    bool ran;
++
++    if (!pvg_reg(s, PVG_REG_ENABLE_FIFO)) {
++        return;
+     }
+-    if (completed) {
+-        pvg_signal_stamp(s, PVG_ROOT_STAMP_INDEX, last_stamp);
++    v->length = pvg_reg(s, PVG_REG_FIFO_LENGTH);
++    v->base = pvg_fifo_base(s) + pvg_reg(s, PVG_REG_FIFO_START);
++    v->npages = 0;
++    if (!v->length || v->length > 0x20000 || (v->length & 0xfff)) {
++        qemu_log_mask(LOG_GUEST_ERROR, "pvg: FIFO length 0x%x unusable\n",
++                      v->length);
++        return;
++    }
++    /* root offsets are ring positions, not monotonic counters */
++    written = head + (written + v->length - head % v->length) % v->length;
++    ran = pvg_fifo_run(s, 0, v, &head, written, &stamp);
++    s->regs[PVG_REG_FIFO_READ / 4] = head % v->length;
++    if (ran) {
++        pvg_signal_stamp(s, PVG_ROOT_STAMP_INDEX, stamp);
++    }
++}
++
++/* wakeFifo: / resumeChildFifo: -> -[PGChildFIFO poke] */
++static void pvg_child_fifo_process(PVGLinuxPCIState *s, uint32_t index)
++{
++    PVGFifoView *v = s->view;
++    uint64_t node;
++    uint32_t written, head, stamp;
++    uint16_t stamp_index;
++
++    if (!index || index >= PVG_MAX_FIFOS || !pvg_reg(s, PVG_REG_ROOT_PAGE) ||
++        !pvg_child_view(s, index, v)) {
++        qemu_log_mask(LOG_GUEST_ERROR, "pvg: child FIFO %u unusable\n", index);
++        return;
++    }
++    node = pvg_child_node(s, index);
++    ldl_le_pci_dma(PCI_DEVICE(s), node + PVG_NODE_WRITTEN, &written,
++                   MEMTXATTRS_UNSPECIFIED);
++    ldl_le_pci_dma(PCI_DEVICE(s), node + PVG_NODE_READ, &head,
++                   MEMTXATTRS_UNSPECIFIED);
++    lduw_le_pci_dma(PCI_DEVICE(s), node + PVG_NODE_STAMP_INDEX, &stamp_index,
++                    MEMTXATTRS_UNSPECIFIED);
++    trace_pvg_linux_child_poke(index, written, head, v->length);
++    if (pvg_fifo_run(s, index, v, &head, written, &stamp)) {
++        stl_le_pci_dma(PCI_DEVICE(s), node + PVG_NODE_READ, head,
++                       MEMTXATTRS_UNSPECIFIED);
++        pvg_signal_stamp(s, stamp_index, stamp);
+     }
+ }
+ 
+@@ -292,8 +414,17 @@ static void pvg_linux_mmio_write(void *opaque, hwaddr addr, uint64_t val,
+ 
+     trace_pvg_linux_mmio_write(addr, size, val);
+     memcpy((uint8_t *)s->regs + addr, &val, size);
+-    if (addr == PVG_REG_FIFO_WRITTEN && size == 4) {
+-        pvg_fifo_process(s, val);
++    if (size != 4) {
++        return;
++    }
++    switch (addr) {
++    case PVG_REG_FIFO_WRITTEN:
++        pvg_root_fifo_process(s, val);
++        break;
++    case PVG_REG_WAKE_FIFO:
++    case PVG_REG_RESUME_CHILD:
++        pvg_child_fifo_process(s, val);
++        break;
+     }
+ }
+ 
+@@ -329,6 +460,7 @@ static void pvg_linux_realize(PCIDevice *dev, Error **errp)
+ 
+     s->regs = g_malloc0(s->mmio_size);
+     s->payload = g_malloc(PVG_CMD_MAX_PAYLOAD);
++    s->view = g_new0(PVGFifoView, 1);
+     memory_region_init_io(&s->mmio, OBJECT(s), &pvg_linux_mmio_ops, s,
+                           "pvg-linux-mmio", s->mmio_size);
+     pci_register_bar(dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mmio);
+@@ -345,6 +477,7 @@ static void pvg_linux_exit(PCIDevice *dev)
+     msi_uninit(dev);
+     g_free(s->regs);
+     g_free(s->payload);
++    g_free(s->view);
+ }
+ 
+ static void pvg_linux_reset(DeviceState *dev)
+diff --git a/hw/display/trace-events b/hw/display/trace-events
+index a73239d..080fa6f 100644
+--- a/hw/display/trace-events
++++ b/hw/display/trace-events
+@@ -231,7 +231,9 @@ apple_gfx_iosfc_raise_irq(uint32_t vector) "vector=0x%x"
+ # pvg-linux-pci.c
+ pvg_linux_mmio_read(uint64_t offset, unsigned size, uint64_t val) "offset=0x%"PRIx64" size=%u val=0x%"PRIx64
+ pvg_linux_mmio_write(uint64_t offset, unsigned size, uint64_t val) "offset=0x%"PRIx64" size=%u val=0x%"PRIx64
+-pvg_linux_cmd(uint32_t off, uint32_t op, uint32_t barriers, uint32_t len, uint32_t stamp, const char *payload) "@0x%04x op=0x%02x barriers=%u len=0x%x stamp=%u |%s"
++pvg_linux_cmd(uint32_t fifo, uint32_t off, uint32_t op, uint32_t barriers, uint32_t len, uint32_t stamp, const char *payload) "fifo=%u @0x%04x op=0x%02x barriers=%u len=0x%x stamp=%u |%s"
++pvg_linux_define_child(uint32_t index, uint64_t node) "child FIFO %u node=0x%"PRIx64
++pvg_linux_child_poke(uint32_t index, uint32_t written, uint32_t read, uint32_t length) "child FIFO %u written=0x%x read=0x%x length=0x%x"
+ pvg_linux_cmd_stub(uint32_t op) "op=0x%02x not implemented, completed"
+ pvg_linux_signal_stamp(uint32_t index, uint32_t value) "stamps[%u]=%u"
+ pvg_linux_device_info(uint32_t version, uint32_t pairs, uint64_t dst) "version=0x%x pairs=%u dst=0x%"PRIx64
+-- 
+2.43.0
+

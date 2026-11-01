@@ -1,0 +1,143 @@
+From e28e76f62233e94fb977876a948ec12eb26f70e7 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 00:43:19 +0200
+Subject: [PATCH 02/54] hw/display/pvg-linux-pci: decode command ring records,
+ optional ack-ring
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-pci.c | 85 ++++++++++++++++++++++++++++++++++++++
+ hw/display/trace-events    |  1 +
+ 2 files changed, 86 insertions(+)
+
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index e8bd84f..ad64f7d 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -31,6 +31,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(PVGLinuxPCIState, PVG_LINUX_PCI)
+ 
+ #define PVG_MAX_MMIO_SIZE (64 * MiB)
+ 
++/* BAR0 registers, see docs/pvg-protocol.md (names are provisional) */
++#define PVG_REG_RING_SIZE       0x1004
++#define PVG_REG_RING_TAIL       0x1008  /* guest producer offset */
++#define PVG_REG_RING_HEAD       0x100c  /* host consumer offset */
++#define PVG_REG_RING_DATA_OFF   0x1010
++#define PVG_REG_RING_PFN        0x1030
++
++#define PVG_RECORD_HDR_SIZE     12      /* u32 opcode, u32 size, u32 seq */
++#define PVG_RECORD_TRACE_WORDS  8
++
+ struct PVGLinuxPCIState {
+     PCIDevice parent_obj;
+ 
+@@ -42,8 +52,78 @@ struct PVGLinuxPCIState {
+     uint16_t device_id;
+     uint32_t mmio_size;
+     uint32_t msi_vectors;
++    bool ack_ring;
+ };
+ 
++static uint32_t pvg_reg(PVGLinuxPCIState *s, hwaddr off)
++{
++    return s->regs[off / 4];
++}
++
++static bool pvg_ring_read(PVGLinuxPCIState *s, uint32_t off, void *buf,
++                          uint32_t len)
++{
++    uint32_t size = pvg_reg(s, PVG_REG_RING_SIZE);
++    uint64_t base = ((uint64_t)pvg_reg(s, PVG_REG_RING_PFN) << 12) +
++                    pvg_reg(s, PVG_REG_RING_DATA_OFF);
++    uint8_t *p = buf;
++
++    while (len) {
++        uint32_t o = off % size;
++        uint32_t chunk = MIN(len, size - o);
++
++        if (pci_dma_read(PCI_DEVICE(s), base + o, p, chunk) != MEMTX_OK) {
++            return false;
++        }
++        p += chunk;
++        off += chunk;
++        len -= chunk;
++    }
++    return true;
++}
++
++/* Decode and trace every record between the current head and the new tail. */
++static void pvg_ring_consume(PVGLinuxPCIState *s, uint32_t tail)
++{
++    uint32_t size = pvg_reg(s, PVG_REG_RING_SIZE);
++    uint32_t head = pvg_reg(s, PVG_REG_RING_HEAD);
++
++    if (!size || size > 16 * MiB) {
++        qemu_log_mask(LOG_GUEST_ERROR, "pvg: ring size 0x%x unusable\n", size);
++        return;
++    }
++
++    while (head != tail) {
++        uint32_t words[3 + PVG_RECORD_TRACE_WORDS] = { 0 };
++        uint32_t nwords;
++
++        if (!pvg_ring_read(s, head, words, PVG_RECORD_HDR_SIZE)) {
++            qemu_log_mask(LOG_GUEST_ERROR, "pvg: ring read failed @0x%x\n", head);
++            return;
++        }
++        if (words[1] < PVG_RECORD_HDR_SIZE || words[1] > size) {
++            qemu_log_mask(LOG_GUEST_ERROR,
++                          "pvg: bad record size 0x%x @0x%x\n", words[1], head);
++            return;
++        }
++        nwords = MIN(words[1] / 4, 3 + PVG_RECORD_TRACE_WORDS);
++        pvg_ring_read(s, head, words, nwords * 4);
++        if (trace_event_get_state_backends(TRACE_PVG_LINUX_CMD)) {
++            g_autoptr(GString) payload = g_string_new(NULL);
++
++            for (uint32_t i = 3; i < nwords; i++) {
++                g_string_append_printf(payload, " 0x%x", words[i]);
++            }
++            trace_pvg_linux_cmd(head, words[0], words[1], words[2],
++                                payload->str);
++        }
++        head = (head + words[1]) % size;
++        if (s->ack_ring) {
++            s->regs[PVG_REG_RING_HEAD / 4] = head;
++        }
++    }
++}
++
+ static uint64_t pvg_linux_mmio_read(void *opaque, hwaddr addr, unsigned size)
+ {
+     PVGLinuxPCIState *s = opaque;
+@@ -60,6 +140,9 @@ static void pvg_linux_mmio_write(void *opaque, hwaddr addr, uint64_t val,
+     PVGLinuxPCIState *s = opaque;
+ 
+     trace_pvg_linux_mmio_write(addr, size, val);
++    if (addr == PVG_REG_RING_TAIL && size == 4) {
++        pvg_ring_consume(s, val);
++    }
+     memcpy((uint8_t *)s->regs + addr, &val, size);
+ }
+ 
+@@ -123,6 +206,8 @@ static const Property pvg_linux_properties[] = {
+     DEFINE_PROP_UINT16("device-id", PVGLinuxPCIState, device_id, 0xeeee),
+     DEFINE_PROP_UINT32("mmio-size", PVGLinuxPCIState, mmio_size, 16 * KiB),
+     DEFINE_PROP_UINT32("msi-vectors", PVGLinuxPCIState, msi_vectors, 1),
++    /* advance the consumer pointer after decoding, to see the guest's next step */
++    DEFINE_PROP_BOOL("ack-ring", PVGLinuxPCIState, ack_ring, false),
+ };
+ 
+ static void pvg_linux_class_init(ObjectClass *klass, const void *data)
+diff --git a/hw/display/trace-events b/hw/display/trace-events
+index 1baf714..1b02b95 100644
+--- a/hw/display/trace-events
++++ b/hw/display/trace-events
+@@ -231,3 +231,4 @@ apple_gfx_iosfc_raise_irq(uint32_t vector) "vector=0x%x"
+ # pvg-linux-pci.c
+ pvg_linux_mmio_read(uint64_t offset, unsigned size, uint64_t val) "offset=0x%"PRIx64" size=%u val=0x%"PRIx64
+ pvg_linux_mmio_write(uint64_t offset, unsigned size, uint64_t val) "offset=0x%"PRIx64" size=%u val=0x%"PRIx64
++pvg_linux_cmd(uint32_t off, uint32_t op, uint32_t size, uint32_t seq, const char *payload) "@0x%04x op=0x%02x size=0x%x seq=%u |%s"
+-- 
+2.43.0
+

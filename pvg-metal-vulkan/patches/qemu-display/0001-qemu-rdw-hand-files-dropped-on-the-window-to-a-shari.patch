@@ -1,0 +1,78 @@
+From ba38229a02bf4bc44106bd46929897a975a29d0d Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Sun, 1 Nov 2026 01:48:18 +0200
+Subject: [PATCH] qemu-rdw: hand files dropped on the window to a sharing
+ daemon
+
+Same protocol as QEMU's GTK display: with QEMU_GTK_DROP_SOCKET set, a
+gdk::FileList drop is sent as {"t": "drop", "paths": [...]}.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ qemu-rdw/src/main.rs | 43 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 43 insertions(+)
+
+diff --git a/qemu-rdw/src/main.rs b/qemu-rdw/src/main.rs
+index 7f33248..1173886 100644
+--- a/qemu-rdw/src/main.rs
++++ b/qemu-rdw/src/main.rs
+@@ -19,6 +19,47 @@ struct App {
+     inner: Rc<Inner>,
+ }
+ 
++/// Files dropped on the window are handed to a host-side sharing daemon (which copies them into
++/// the guest) over the unix socket named by $QEMU_GTK_DROP_SOCKET, as one line
++/// {"t": "drop", "paths": ["file:///...", ...]} (the same as QEMU's GTK display). Without the
++/// variable the window takes no drops.
++#[cfg(unix)]
++fn accept_file_drops(window: &gtk::ApplicationWindow) {
++    use gtk::gdk;
++    use std::io::Write;
++    use std::os::unix::net::UnixStream;
++
++    let Some(path) = std::env::var_os("QEMU_GTK_DROP_SOCKET") else {
++        return;
++    };
++    let target = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
++    target.connect_drop(move |_, value, _, _| {
++        let Ok(list) = value.get::<gdk::FileList>() else {
++            return false;
++        };
++        // file URIs are percent-encoded: nothing to escape, anything else is skipped
++        let uris: Vec<String> = list
++            .files()
++            .iter()
++            .map(|f| f.uri().to_string())
++            .filter(|u| u.starts_with("file://") && !u.contains(['"', '\\', '\n']))
++            .map(|u| format!("\"{u}\""))
++            .collect();
++        if uris.is_empty() {
++            return false;
++        }
++        let msg = format!("{{\"t\": \"drop\", \"paths\": [{}]}}\n", uris.join(", "));
++        match UnixStream::connect(&path).and_then(|mut s| s.write_all(msg.as_bytes())) {
++            Ok(()) => true,
++            Err(e) => {
++                log::warn!("file drop: sharing daemon not reachable at {path:?}: {e}");
++                false
++            }
++        }
++    });
++    window.add_controller(target);
++}
++
+ #[derive(Debug, Default)]
+ struct AppOptions {
+     vm_name: Option<String>,
+@@ -183,6 +224,8 @@ impl App {
+             let window: gtk::ApplicationWindow =
+                 builder.object("window").expect("Couldn't get window");
+             window.set_application(Some(app));
++            #[cfg(unix)]
++            accept_file_drops(&window);
+ 
+             let app_clone = app_clone.clone();
+             let opt_clone = opt.clone();
+-- 
+2.43.0
+

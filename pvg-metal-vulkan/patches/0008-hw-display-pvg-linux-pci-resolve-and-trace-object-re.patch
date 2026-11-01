@@ -1,0 +1,121 @@
+From 2010eb9378bb9d2de4ba7848bd8d5a5db07424e4 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 11:19:12 +0200
+Subject: [PATCH 08/54] hw/display/pvg-linux-pci: resolve and trace object
+ references of render commands
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-pci.c | 76 ++++++++++++++++++++++++++++++++++++++
+ hw/display/trace-events    |  1 +
+ 2 files changed, 77 insertions(+)
+
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index 9f8cb8c..c70a844 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -1025,6 +1025,78 @@ static const char *const pvg_encoder_names[] = {
+     [0] = "render", [1] = "compute", [2] = "blit", [4] = "info", [5] = "protection",
+ };
+ 
++/* Describe object 'ref' of a task for tracing: type, and for type 7 the serialized kind */
++static void pvg_trace_ref(PVGLinuxPCIState *s, uint32_t task, const char *cmd,
++                          uint32_t slot, uint32_t ref)
++{
++    uint8_t obj[0x100];
++    uint32_t objlen = 0;
++    uint8_t type = ref ? pvg_task_object(s, task, ref, obj, sizeof(obj), &objlen) : 0;
++
++    trace_pvg_linux_ref(task, cmd, slot, ref, type, objlen,
++                        type == 7 && objlen >= 4 ? ldl_le_p(obj) : 0,
++                        objlen >= 4 ? ldl_le_p(obj) : 0, objlen >= 8 ? ldl_le_p(obj + 4) : 0);
++}
++
++/* Resolve and trace the object references of one render segment's commands */
++static void pvg_trace_render_segment(PVGLinuxPCIState *s, uint32_t task,
++                                     const uint8_t *p, uint32_t len)
++{
++    uint32_t off = 0;
++
++    while (off + 8 <= len) {
++        uint32_t id = ldl_le_p(p + off), clen = ldl_le_p(p + off + 4);
++        const uint8_t *a = p + off + 8;
++        uint32_t alen = clen - 8;
++
++        if (clen < 8 || off + clen > len) {
++            return;
++        }
++        switch (id) {
++        case 0x1a:      /* DescribeRenderPass: colour attachment textures */
++            for (int i = 0; i < 8 && (19 + 15 * i + 1) * 4 <= (int)alen; i++) {
++                uint32_t ref = ldl_le_p(a + (19 + 15 * i) * 4);
++
++                if (ref) {
++                    pvg_trace_ref(s, task, "colorAttachment", i, ref);
++                }
++            }
++            break;
++        case 0x74:      /* SetRenderPipelineState {ref} */
++            if (alen >= 4) {
++                pvg_trace_ref(s, task, "pipeline", 0, ldl_le_p(a));
++            }
++            break;
++        case 0x72:      /* SetFragmentTextures {start, count, refs[]} */
++        case 0x81:      /* SetVertexTextures */
++        case 0x70:      /* SetFragmentSamplerStates {start, count, refs[]} */
++        case 0x7f:      /* SetVertexSamplerStates */
++            if (alen >= 8) {
++                uint32_t start = ldl_le_p(a), n = ldl_le_p(a + 4);
++
++                for (uint32_t i = 0; i < n && 8 + 4 * (i + 1) <= alen; i++) {
++                    pvg_trace_ref(s, task, id == 0x72 ? "fragTexture" : id == 0x81 ?
++                                  "vertTexture" : id == 0x70 ? "fragSampler" : "vertSampler",
++                                  start + i, ldl_le_p(a + 8 + 4 * i));
++                }
++            }
++            break;
++        case 0x6e:      /* SetFragmentBuffers {start, count, {ref, u64 offset}[]} */
++        case 0x7d:      /* SetVertexBuffers */
++            if (alen >= 8) {
++                uint32_t start = ldl_le_p(a), n = ldl_le_p(a + 4);
++
++                for (uint32_t i = 0; i < n && 8 + 12 * (i + 1) <= alen; i++) {
++                    pvg_trace_ref(s, task, id == 0x6e ? "fragBuffer" : "vertBuffer",
++                                  start + i, ldl_le_p(a + 8 + 12 * i));
++                }
++            }
++            break;
++        }
++        off += clen;
++    }
++}
++
+ static void pvg_parse_cmdbuf(PVGLinuxPCIState *s, uint32_t task,
+                              const uint8_t *buf, uint64_t len)
+ {
+@@ -1042,6 +1114,10 @@ static void pvg_parse_cmdbuf(PVGLinuxPCIState *s, uint32_t task,
+         }
+         trace_pvg_linux_segment(task, off, seglen, name, buf[off + 5],
+                                 buf[off + 6]);
++        if (enc == 0 && trace_event_get_state_backends(TRACE_PVG_LINUX_REF)) {
++            pvg_trace_render_segment(s, task, buf + off + PVG_SEG_HDR_SIZE,
++                                     seglen - PVG_SEG_HDR_SIZE);
++        }
+         off += seglen;
+     }
+ }
+diff --git a/hw/display/trace-events b/hw/display/trace-events
+index a2d2f99..18abd38 100644
+--- a/hw/display/trace-events
++++ b/hw/display/trace-events
+@@ -247,6 +247,7 @@ pvg_linux_cmdbuf(uint32_t task, uint32_t nres, uint64_t va, uint64_t len) "task
+ pvg_linux_segment(uint32_t task, uint64_t off, uint32_t len, const char *enc, uint32_t cont, uint32_t end) "task %u +0x%"PRIx64" len=0x%x %s cont=%u end=%u"
+ pvg_linux_segment_bad(uint32_t task, uint64_t off, uint32_t seglen, uint64_t len) "task %u +0x%"PRIx64" bad segment length 0x%x (buffer 0x%"PRIx64")"
+ pvg_linux_gpu(const char *name, bool validation) "host GPU %s (validation %d)"
++pvg_linux_ref(uint32_t task, const char *cmd, uint32_t slot, uint32_t ref, uint32_t type, uint32_t len, uint32_t kind, uint32_t w0, uint32_t w1) "task %u %s[%u] -> object %u type=0x%x len=0x%x kind=0x%x body=0x%x,0x%x"
+ pvg_linux_child_poke(uint32_t index, uint32_t written, uint32_t read, uint32_t length) "child FIFO %u written=0x%x read=0x%x length=0x%x"
+ pvg_linux_cmd_stub(uint32_t op) "op=0x%02x not implemented, completed"
+ pvg_linux_signal_stamp(uint32_t index, uint32_t value) "stamps[%u]=%u"
+-- 
+2.43.0
+

@@ -1,0 +1,161 @@
+From 06f9d87a7cedbfe5e2d5f3b04bb9754df2ec0902 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Fri, 30 Oct 2026 19:50:17 +0200
+Subject: [PATCH 56/56] hw/display/pvg: 16-bit unorm mipmaps, 4:4:4 IOSurface
+ planes
+
+generateMipmaps on R16/RG16/RGBA16 unorm textures (10-bit video planes)
+was rejected, leaving the lower levels zero: the Wallpaper settings preview
+samples them and showed flat green.
+
+IOSurface plane selection matched views to planes by size only; on 4:4:4
+bi-planar surfaces ('444f') both planes are full size, so the RG8 chroma
+view resolved to the R8 luma plane and was rejected. Match the pixel size
+too (Displays settings preview was luma-only green).
+
+Diagnostics: unresolved compute textures log the object, backing planes
+and resolved shape; frame captures dump large uploaded textures.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/pvg-exec.c | 85 +++++++++++++++++++++++++++++++--------
+ 1 file changed, 69 insertions(+), 16 deletions(-)
+
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index 0a68da4..3ea5ec4 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -652,15 +652,32 @@ static bool guest_image_ex(PVGExec *e, uint32_t task, uint32_t ref, int level, u
+         pl = bobj + 0x14 + 16 * plane;
+         /*
+          * The plane index is 0 even for views of other planes (an NV12 surface's RG8 chroma
+-         * view): pick the plane whose size matches the view when plane 0 does not.
++         * view): pick the plane whose size and pixel size match the view when plane 0 does
++         * not. Size alone is ambiguous for 4:4:4 surfaces, whose planes are all full size.
+          */
+-        for (uint32_t p = 0; p < ldl(bobj + 0x10) && 0x14 + 16 * (p + 1) <= MIN(blen, MAX_OBJ) &&
+-             ldl(desc + 4) && (ldl(pl + 4) != ldl(desc + 4) || ldl(pl + 8) != ldl(desc + 8));
+-             p++) {
+-            const uint8_t *cand = bobj + 0x14 + 16 * p;
+-
+-            if (ldl(cand + 4) == ldl(desc + 4) && ldl(cand + 8) == ldl(desc + 8)) {
+-                pl = cand;
++        {
++            uint32_t vbpp = 0, nplanes = ldl(bobj + 0x10);
++            VkComponentMapping vswz;
++            const uint8_t *by_size = NULL;
++
++            mtl_pixel_format(lduw(desc + 2), &vbpp, &vswz);
++            /* k = 0: the given plane, then every plane in order */
++            for (uint32_t k = 0; ldl(desc + 4) && k <= nplanes &&
++                 0x14 + 16 * k <= MIN(blen, MAX_OBJ); k++) {
++                const uint8_t *cand = k ? bobj + 0x14 + 16 * (k - 1) : pl;
++
++                if (ldl(cand + 4) != ldl(desc + 4) || ldl(cand + 8) != ldl(desc + 8)) {
++                    continue;
++                }
++                if (!vbpp || ldl(cand + 12) >> 24 == vbpp) {
++                    by_size = NULL;
++                    pl = cand;
++                    break;
++                }
++                by_size = by_size ? by_size : cand;
++            }
++            if (by_size) {
++                pl = by_size;
+             }
+         }
+         gi->task = 0;
+@@ -958,6 +975,23 @@ static bool image_upload(PVGExec *e, const GuestImage *gi, HostImage *hi, VkImag
+         }
+         return false;
+     }
++    if (e->capture_left && e->dump_dir && gi->width >= 512 && gi->bpp <= 8) {
++        /* frame capture: what large textures hold (every 4th pixel of every 4th row) */
++        uint32_t w = gi->width / 4, h = gi->height / 4;
++        g_autofree uint8_t *px = g_malloc((size_t)w * h * gi->bpp);
++        g_autofree char *path = g_strdup_printf(
++            "%s/cap-%05u-up-t%u-va%" G_GINT64_MODIFIER "x-fmt%d-%ux%u-bpp%u.raw", e->dump_dir,
++            e->capture_seq, gi->task, gi->va, gi->format, w, h, gi->bpp);
++
++        for (uint32_t y = 0; y < h; y++) {
++            for (uint32_t x = 0; x < w; x++) {
++                memcpy(px + ((size_t)y * w + x) * gi->bpp,
++                       e->arena_ptr + off + (uint64_t)y * 4 * gi->row_bytes + x * 4 * gi->bpp,
++                       gi->bpp);
++            }
++        }
++        g_file_set_contents(path, (const char *)px, (gssize)w * h * gi->bpp, NULL);
++    }
+     for (uint32_t l = 0; l < gi->mips; l++) {
+         uint32_t row = gi->mip_row[l] ? gi->mip_row[l] : gi->row_bytes;
+ 
+@@ -3994,17 +4028,28 @@ static void exec_compute_segment(PVGExec *e, uint32_t task, const uint8_t *p, ui
+                         out[nout++] = (ComputeOutput){ .image = true, .gi = gi, .hi = hi };
+                     }
+                 } else if (i < MAX_SLOTS && cs.tex[i] && e->texfail_logged < 40) {
+-                    uint8_t obj[MAX_OBJ];
+-                    uint32_t olen;
++                    uint8_t obj[MAX_OBJ], bobj[MAX_OBJ];
++                    uint32_t olen, blen = 0;
+                     uint8_t ty = object(e, task, cs.tex[i], obj, &olen);
++                    g_autoptr(GString) hex = g_string_new(NULL);
++                    GuestImage dg;
++                    bool ok = guest_image(e, task, cs.tex[i], &dg);
+ 
+                     e->texfail_logged++;
++                    for (uint32_t k = 0; k < MIN(olen, 0x40u); k += 4) {
++                        g_string_append_printf(hex, " %08x", ldl(obj + k));
++                    }
++                    if (ty == OBJ_BACKING_REF_TEX && object(e, 0, ldl(obj), bobj, &blen)) {
++                        g_string_append(hex, " | backing");
++                        for (uint32_t k = 0; k < MIN(blen, 0x54u); k += 4) {
++                            g_string_append_printf(hex, " %08x", ldl(bobj + k));
++                        }
++                    }
+                     elog(e, "task %u kernel %s: texture %d ref %u: object type 0x%x len 0x%x "
+-                         "words %08x %08x %08x %08x | tail %08x %08x %08x %08x", task,
+-                         pp->fs_name, i, cs.tex[i], ty, olen, ldl(obj), ldl(obj + 4),
+-                         ldl(obj + 8), ldl(obj + 12), olen >= 16 ? ldl(obj + olen - 16) : 0,
+-                         olen >= 12 ? ldl(obj + olen - 12) : 0,
+-                         olen >= 8 ? ldl(obj + olen - 8) : 0, olen >= 4 ? ldl(obj + olen - 4) : 0);
++                         "(resolved %d fmt %d %ux%u row %u bpp %u view %d, kernel wants view %d):%s",
++                         task, pp->fs_name, i, cs.tex[i], ty, olen, ok, dg.format, dg.width,
++                         dg.height, dg.row_bytes, dg.bpp, dg.view_type, pp->texture_view[i],
++                         hex->str);
+                 }
+                 if (!hi) {
+                     hi = dummy_image(e, pp->texture_view[i]);
+@@ -4203,13 +4248,17 @@ static int mip_channels(VkFormat f, int *kind)
+     case VK_FORMAT_R32_SFLOAT: *kind = 2; return 1;
+     case VK_FORMAT_R32G32_SFLOAT: *kind = 2; return 2;
+     case VK_FORMAT_R32G32B32A32_SFLOAT: *kind = 2; return 4;
++    case VK_FORMAT_R16_UNORM: *kind = 3; return 1;      /* 10/16-bit video planes */
++    case VK_FORMAT_R16G16_UNORM: *kind = 3; return 2;
++    case VK_FORMAT_R16G16B16A16_UNORM: *kind = 3; return 4;
+     default: return 0;
+     }
+ }
+ 
+ static float mip_load(const uint8_t *p, int kind, int c)
+ {
+-    return kind == 0 ? p[c] : kind == 1 ? half_to_float(lduw(p + 2 * c)) : ldf(p + 4 * c);
++    return kind == 0 ? p[c] : kind == 1 ? half_to_float(lduw(p + 2 * c)) :
++           kind == 3 ? lduw(p + 2 * c) : ldf(p + 4 * c);
+ }
+ 
+ static void mip_store(uint8_t *p, int kind, int c, float v)
+@@ -4220,6 +4269,10 @@ static void mip_store(uint8_t *p, int kind, int c, float v)
+         uint16_t h = float_to_half(v);
+ 
+         memcpy(p + 2 * c, &h, 2);
++    } else if (kind == 3) {
++        uint16_t u = (uint16_t)MIN(MAX(v + 0.5f, 0.0f), 65535.0f);
++
++        memcpy(p + 2 * c, &u, 2);
+     } else {
+         memcpy(p + 4 * c, &v, 4);
+     }
+-- 
+2.43.0
+

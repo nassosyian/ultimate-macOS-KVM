@@ -1,0 +1,46 @@
+From 357d844ee9cfe29e3bcda89eb7df3b80df819057 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 15:41:23 +0200
+Subject: [PATCH 28/54] hw/display/pvg-linux-pci: DeleteTask drops the task's
+ mappings and executor caches
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-pci.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index ff038bb..be0973d 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -68,6 +68,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(PVGLinuxPCIState, PVG_LINUX_PCI)
+ #define PVG_CMD_DEFINE_CHILD_FIFO   0x30
+ #define PVG_CMD_SET_OBJECT_LIST     0x33
+ #define PVG_CMD_EXEC_INDIRECT2      0x37
++#define PVG_CMD_DELETE_TASK         0x20    /* {u32 task} */
+ #define PVG_CMD_DELETE_RESOURCE     0x25    /* {u32 task, u32 id} */
+ #define PVG_CMD_DELETE_OBJECT       0x28    /* {u32 task, serialized {u32 kind, u32 len, u32 id}} */
+ #define PVG_CMD_DEFINE_TASK2        0x38
+@@ -1398,6 +1399,19 @@ static void pvg_dispatch(PVGLinuxPCIState *s, const PVGCmdHeader *h,
+     case PVG_CMD_GET_DEVICE_INFO:
+         pvg_cmd_get_device_info(s, (const uint32_t *)payload, len);
+         break;
++    case PVG_CMD_DELETE_TASK:
++        if (len >= 4 && ldl_le_p(payload) && ldl_le_p(payload) < PVG_MAX_TASKS) {
++            uint32_t id = ldl_le_p(payload);
++
++            if (s->exec) {
++                pvg_exec_task_reset(s->exec, id);
++            }
++            if (s->tasks[id].mappings) {
++                g_array_set_size(s->tasks[id].mappings, 0);
++            }
++            s->tasks[id].root = 0;
++        }
++        break;
+     case PVG_CMD_DELETE_RESOURCE:
+     case PVG_CMD_DELETE_OBJECT:
+         /* ids are recycled: drop whatever the executor cached for this one */
+-- 
+2.43.0
+

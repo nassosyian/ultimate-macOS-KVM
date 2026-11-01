@@ -1,0 +1,567 @@
+From 4434d23bce44d3627a7a2d53823a2d7b83917c66 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 14:34:29 +0200
+Subject: [PATCH 22/54] hw/display/pvg: mip levels and slices, texture census,
+ gamma table
+
+- Texture objects: 0x24-byte header, then per-mip records {u64 offset,
+  u64 bytes per image, u64 row bytes, u32 w, h, d}; mipmapped textures were
+  read with the last level's size. Sampled textures upload the whole chain;
+  render targets and blits address one level/slice (blur downsample chains
+  render into levels 1..3).
+- Transaction3 gamma table (planar float32 R/G/B) applied at scanout when
+  not the identity.
+- Dump-mode census of sampled textures.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-pci.c |  51 ++++++++-
+ hw/display/pvg/pvg-exec.c  | 227 +++++++++++++++++++++++++++++--------
+ 2 files changed, 227 insertions(+), 51 deletions(-)
+
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index 2936ca6..cd5c34f 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -238,6 +238,8 @@ struct PVGLinuxPCIState {
+     bool cursor_show;
+     int16_t cursor_x, cursor_y;     /* signed: the guest parks it off-screen */
+     bool scanout_valid;             /* console holds a presented frame */
++    uint8_t gamma_lut[3][256];      /* Transaction3 gamma table, 8-bit per channel */
++    bool gamma_active;              /* table set and not the identity */
+ 
+     /* properties */
+     uint16_t vendor_id;
+@@ -1013,6 +1015,35 @@ static uint8_t pvg_task_object(PVGLinuxPCIState *s, uint32_t task, uint32_t id,
+     return head & 0xff;
+ }
+ 
++/*
++ * Transaction3 gamma table (sent only when it changes): kernel-task VA of entries x 3 planar
++ * float32 channels (R[entries], G[entries], B[entries]), identity by default.
++ */
++static void pvg_display_set_gamma(PVGLinuxPCIState *s, uint64_t va, uint64_t len,
++                                  uint32_t entries)
++{
++    g_autofree float *t = NULL;
++    bool identity = true;
++
++    if (entries < 2 || entries > 4096 || len < (uint64_t)entries * 12) {
++        return;
++    }
++    t = g_new(float, entries * 3);
++    if (!pvg_task_read(s, 0, va, t, entries * 12)) {
++        return;
++    }
++    for (int c = 0; c < 3; c++) {
++        for (int v = 0; v < 256; v++) {
++            float f = t[c * entries + v * (entries - 1) / 255];
++            int o = (int)(f * 255.0f + 0.5f);
++
++            s->gamma_lut[c][v] = o < 0 ? 0 : o > 255 ? 255 : o;
++            identity &= s->gamma_lut[c][v] == v;
++        }
++    }
++    s->gamma_active = !identity;
++}
++
+ /* Copy a presented BGRA backing (kernel task) into the console */
+ static void pvg_display_scanout(PVGLinuxPCIState *s, uint32_t surface_id)
+ {
+@@ -1052,9 +1083,19 @@ static void pvg_display_scanout(PVGLinuxPCIState *s, uint32_t surface_id)
+                            row, width * 4)) {
+             memset(row, 0, width * 4);
+             missing++;
+-        } else if (y % 64 == 0) {
+-            for (uint32_t x = 0; x < width; x += 16) {
+-                nonzero += (row[x] & 0xffffff) != 0;
++        } else {
++            if (s->gamma_active) {
++                for (uint32_t x = 0; x < width; x++) {
++                    uint32_t p = row[x];
++
++                    row[x] = (p & 0xff000000) | s->gamma_lut[0][p >> 16 & 0xff] << 16 |
++                             s->gamma_lut[1][p >> 8 & 0xff] << 8 | s->gamma_lut[2][p & 0xff];
++                }
++            }
++            if (y % 64 == 0) {
++                for (uint32_t x = 0; x < width; x += 16) {
++                    nonzero += (row[x] & 0xffffff) != 0;
++                }
+             }
+         }
+     }
+@@ -1324,6 +1365,10 @@ static void pvg_dispatch(PVGLinuxPCIState *s, const PVGCmdHeader *h,
+     case PVG_CMD_DISPLAY_TRANSACTION3:
+         if (len >= 0x24 && ldl_le_p(payload) == 0 && ldl_le_p(payload + 4) == 0) {
+             trace_pvg_linux_present(0, 0, ldl_le_p(payload + 8));
++            if (ldq_le_p(payload + 12)) {
++                pvg_display_set_gamma(s, ldq_le_p(payload + 12), ldq_le_p(payload + 20),
++                                      ldl_le_p(payload + 28));
++            }
+             pvg_display_scanout(s, ldl_le_p(payload + 8));
+             /* the host's presentFrame completion: the guest waits for it before the next frame */
+             pvg_display_event(s, DS_EVENT_PRESENTED);
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index 553a283..6d6addf 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -21,6 +21,7 @@
+ #define ARENA_SIZE          (256u << 20)
+ #define MAX_SLOTS           16
+ #define MAX_OBJ             0x1000
++#define MAX_MIPS            15
+ #define PUSH_FRAGMENT_BASE  128
+ 
+ /* PVG object types (docs/pvg-protocol.md §4d) */
+@@ -68,7 +69,7 @@ typedef struct HostImage {
+     VkDeviceMemory mem;
+     VkImageView view;
+     VkFormat format;
+-    uint32_t width, height, depth, layers;
++    uint32_t width, height, depth, layers, mips;
+     VkImageViewType view_type;
+     bool initialized;           /* depth/stencil: contents defined (host-only images) */
+ } HostImage;
+@@ -80,6 +81,9 @@ typedef struct GuestImage {
+     uint32_t row_bytes, width, height, bpp;
+     uint32_t depth, layers;     /* 3D depth; array layers (6 per cube) */
+     uint64_t slice_bytes;       /* bytes per 2D image / array layer */
++    uint32_t mips;              /* levels described below (1 for a single level/slice view) */
++    uint64_t mip_off[MAX_MIPS], mip_slice[MAX_MIPS];   /* relative to va; bytes per image */
++    uint32_t mip_row[MAX_MIPS];
+     VkImageViewType view_type;
+     VkFormat format;
+     VkComponentMapping swizzle;
+@@ -126,7 +130,7 @@ struct PVGExec {
+     /* last render pass, resumed by continuation segments */
+     bool have_last;
+     uint32_t last_task;
+-    uint8_t last_att[8 * 256];  /* Attachment[8] */
++    uint8_t last_att[8 * 512];  /* Attachment[8] */
+     uint8_t last_st[4096];      /* RenderState */
+     char *dump_dir;
+     bool dry_run;
+@@ -140,6 +144,8 @@ struct PVGExec {
+     DSAttachmentSave last_ds;
+     HostImage dummy[7];         /* 1x1 placeholders per VkImageViewType */
+     GHashTable *written;
++    GHashTable *census;     /* diagnostics: textures already reported by tex_census */
++    uint32_t census_count;
+     GHashTable *unnorm;     /* (task, sampler ref) with unnormalised coordinates */    /* diagnostics: guest-physical page -> writer kind */
+     bool creating_dummies;
+ };
+@@ -398,7 +404,30 @@ static uint64_t buffer_upload(PVGExec *e, uint32_t task, uint32_t ref, uint64_t
+ }
+ 
+ /* Resolve a texture object to its linear guest image */
+-static bool guest_image(PVGExec *e, uint32_t task, uint32_t ref, GuestImage *gi)
++/* bytes of guest memory a GuestImage spans (all levels, layers and 3D slices) */
++static uint64_t guest_image_size(const GuestImage *gi)
++{
++    uint64_t end = 0;
++
++    for (uint32_t l = 0; l < MAX(gi->mips, 1); l++) {
++        uint32_t d = MAX(gi->depth >> l, 1);
++        uint64_t e2 = gi->mip_off[l] + (gi->mip_slice[l] ? gi->mip_slice[l] : gi->slice_bytes) *
++                      gi->layers * d;
++
++        end = MAX(end, e2);
++    }
++    return end;
++}
++
++/*
++ * Resolve a texture object to its linear guest image. Texture objects: a 0x24-byte header
++ * {u32 length, u32, u32 vpage, u32, u64 base offset, ...}, one 0x24-byte record per mip level
++ * {u64 offset, u64 bytes per image, u64 row bytes, u32 w, h, d}, then id and descriptor.
++ * level < 0: the whole mip chain (for sampling); otherwise one level and array slice / 3D plane
++ * as a single 2D image (render targets, blits).
++ */
++static bool guest_image_ex(PVGExec *e, uint32_t task, uint32_t ref, int level, uint32_t slice,
++                           GuestImage *gi)
+ {
+     uint8_t obj[MAX_OBJ], bobj[MAX_OBJ];
+     uint32_t len, blen;
+@@ -407,19 +436,20 @@ static bool guest_image(PVGExec *e, uint32_t task, uint32_t ref, GuestImage *gi)
+ 
+     memset(gi, 0, sizeof(*gi));
+     if ((type == OBJ_TEXTURE_2 || type == OBJ_TEXTURE_3) && len >= 0x74) {
+-        /* header 0x18, one 0x24-byte entry per mip level, then dimensions, id, descriptor */
+-        uint32_t mips = (len - 0x50) / 0x24, tail = 0x18 + mips * 0x24;
++        uint32_t nmips = (len - 0x50) / 0x24, first = level < 0 ? 0 : (uint32_t)level;
++        const uint8_t *rec;
+ 
+-        if (tail + 0x38 > len || tail + 0x38 > MAX_OBJ) {
++        if (0x30 + nmips * 0x24 + 0x20 > MIN(len, MAX_OBJ) || first >= nmips) {
+             return false;
+         }
+-        desc = obj + tail + 0x18;
++        desc = obj + 0x30 + nmips * 0x24;
++        rec = obj + 0x24 + first * 0x24;
+         gi->task = task;
+-        gi->va = ((uint64_t)ldl(obj + 8) << 12) + ldq(obj + 0x10);
+-        gi->row_bytes = (uint32_t)ldq(obj + 0x34);      /* mip 0 */
+-        gi->slice_bytes = ldl(obj + 0x2c);              /* mip 0 bytes per image */
+-        gi->width = ldl(obj + tail);
+-        gi->height = ldl(obj + tail + 4);
++        gi->va = ((uint64_t)ldl(obj + 8) << 12) + ldq(obj + 0x10) + ldq(rec);
++        gi->row_bytes = (uint32_t)ldq(rec + 0x10);
++        gi->slice_bytes = ldq(rec + 8);
++        gi->width = ldl(rec + 0x18);
++        gi->height = ldl(rec + 0x1c);
+         /* MTLTextureType: 0 1D, 1 1DArray, 2 2D, 3 2DArray, 4 2DMS, 5 Cube, 6 CubeArray, 7 3D */
+         switch (desc[0] & 0xf) {
+         case 0: gi->view_type = VK_IMAGE_VIEW_TYPE_1D; break;
+@@ -431,12 +461,32 @@ static bool guest_image(PVGExec *e, uint32_t task, uint32_t ref, GuestImage *gi)
+         case 7: gi->view_type = VK_IMAGE_VIEW_TYPE_3D; break;
+         default: return false;
+         }
+-        gi->depth = gi->view_type == VK_IMAGE_VIEW_TYPE_3D ? MAX(ldl(desc + 12), 1) : 1;
++        gi->depth = gi->view_type == VK_IMAGE_VIEW_TYPE_3D ? MAX(ldl(rec + 0x20), 1) : 1;
+         gi->layers = MAX(lduw(desc + 20), 1);
+         if (gi->view_type == VK_IMAGE_VIEW_TYPE_CUBE ||
+             gi->view_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) {
+             gi->layers *= 6;
+         }
++        if (level >= 0) {
++            /* one 2D image: slices / 3D planes follow each other at bytes-per-image */
++            if (slice >= gi->layers * gi->depth) {
++                return false;
++            }
++            gi->va += slice * gi->slice_bytes;
++            gi->view_type = gi->height > 1 || gi->view_type != VK_IMAGE_VIEW_TYPE_1D_ARRAY ?
++                            VK_IMAGE_VIEW_TYPE_2D : VK_IMAGE_VIEW_TYPE_1D;
++            gi->layers = gi->depth = 1;
++            gi->mips = 1;
++        } else {
++            gi->mips = MIN(nmips, MAX_MIPS);
++            for (uint32_t l = 0; l < gi->mips; l++) {
++                const uint8_t *r = obj + 0x24 + l * 0x24;
++
++                gi->mip_off[l] = ldq(r) - ldq(rec);
++                gi->mip_slice[l] = ldq(r + 8);
++                gi->mip_row[l] = (uint32_t)ldq(r + 0x10);
++            }
++        }
+     } else if (type == OBJ_BACKING_REF_TEX && len >= 0x34) {
+         uint32_t bid = ldl(obj);
+ 
+@@ -452,6 +502,7 @@ static bool guest_image(PVGExec *e, uint32_t task, uint32_t ref, GuestImage *gi)
+         gi->row_bytes = ldl(bobj + 0x20) & 0xffffff;
+         gi->view_type = VK_IMAGE_VIEW_TYPE_2D;
+         gi->depth = gi->layers = 1;
++        gi->mips = 1;
+     } else {
+         return false;
+     }
+@@ -459,11 +510,29 @@ static bool guest_image(PVGExec *e, uint32_t task, uint32_t ref, GuestImage *gi)
+     if (gi->layers * gi->depth == 1 || gi->slice_bytes < (uint64_t)gi->row_bytes * gi->height) {
+         gi->slice_bytes = (uint64_t)gi->row_bytes * gi->height;
+     }
++    if (gi->mips <= 1) {
++        gi->mips = 1;
++        gi->mip_off[0] = 0;
++        gi->mip_row[0] = gi->row_bytes;
++        gi->mip_slice[0] = gi->slice_bytes;
++    }
++    for (uint32_t l = 1; l < gi->mips; l++) {
++        uint32_t lh = MAX(gi->height >> l, 1);
++
++        if (gi->mip_slice[l] < (uint64_t)gi->mip_row[l] * lh) {
++            gi->mip_slice[l] = (uint64_t)gi->mip_row[l] * lh;
++        }
++    }
+     gi->format = mtl_pixel_format(lduw(desc + 2), &gi->bpp, &gi->swizzle);
+     return gi->format != VK_FORMAT_UNDEFINED && gi->width && gi->height &&
+            gi->width <= 16384 && gi->height <= 16384 && gi->row_bytes >= gi->width * gi->bpp &&
+            gi->depth <= 2048 && gi->layers <= 2048 &&
+-           gi->slice_bytes * gi->depth * gi->layers <= (64u << 20);
++           guest_image_size(gi) <= (64u << 20);
++}
++
++static bool guest_image(PVGExec *e, uint32_t task, uint32_t ref, GuestImage *gi)
++{
++    return guest_image_ex(e, task, ref, -1, 0, gi);
+ }
+ 
+ static HostImage *host_image(PVGExec *e, uint32_t task, uint32_t ref, const GuestImage *gi,
+@@ -481,8 +550,8 @@ static HostImage *host_image(PVGExec *e, uint32_t task, uint32_t ref, const Gues
+         .imageType = vt == VK_IMAGE_VIEW_TYPE_1D || vt == VK_IMAGE_VIEW_TYPE_1D_ARRAY ?
+                      VK_IMAGE_TYPE_1D : vt == VK_IMAGE_VIEW_TYPE_3D ? VK_IMAGE_TYPE_3D :
+                      VK_IMAGE_TYPE_2D,
+-        .format = gi->format, .extent = { gi->width, gi->height, gi->depth }, .mipLevels = 1,
+-        .arrayLayers = gi->layers, .samples = VK_SAMPLE_COUNT_1_BIT,
++        .format = gi->format, .extent = { gi->width, gi->height, gi->depth },
++        .mipLevels = gi->mips, .arrayLayers = gi->layers, .samples = VK_SAMPLE_COUNT_1_BIT,
+         .tiling = VK_IMAGE_TILING_OPTIMAL,
+         /* only plain 2D images are ever render targets */
+         .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+@@ -493,14 +562,15 @@ static HostImage *host_image(PVGExec *e, uint32_t task, uint32_t ref, const Gues
+     VkImageViewCreateInfo vci = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .viewType = vt,
+         .format = gi->format, .components = gi->swizzle,
+-        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, gi->layers },
++        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, gi->mips, 0, gi->layers },
+     };
+     VkMemoryRequirements req;
+     VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+ 
+     (void)render_target;
+     if (hi && hi->format == gi->format && hi->width == gi->width && hi->height == gi->height &&
+-        hi->depth == gi->depth && hi->layers == gi->layers && hi->view_type == gi->view_type) {
++        hi->depth == gi->depth && hi->layers == gi->layers && hi->view_type == gi->view_type &&
++        hi->mips == gi->mips) {
+         return hi;
+     }
+     if (hi) {
+@@ -530,6 +600,7 @@ static HostImage *host_image(PVGExec *e, uint32_t task, uint32_t ref, const Gues
+     hi->height = gi->height;
+     hi->depth = gi->depth;
+     hi->layers = gi->layers;
++    hi->mips = gi->mips;
+     hi->view_type = gi->view_type;
+     g_hash_table_insert(e->images, key_new(task, ref), hi);
+     return hi;
+@@ -603,8 +674,8 @@ static void barrier(PVGExec *e, VkImage img, VkImageLayout from, VkImageLayout t
+         .oldLayout = from, .newLayout = to,
+         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+-        .image = img, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
+-                                            VK_REMAINING_ARRAY_LAYERS },
++        .image = img, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS,
++                                            0, VK_REMAINING_ARRAY_LAYERS },
+     };
+ 
+     vkCmdPipelineBarrier(e->cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+@@ -614,28 +685,35 @@ static void barrier(PVGExec *e, VkImage img, VkImageLayout from, VkImageLayout t
+ /* guest linear rows → arena → image (left in 'final' layout) */
+ static bool image_upload(PVGExec *e, const GuestImage *gi, HostImage *hi, VkImageLayout final)
+ {
+-    /* layers and 3D slices are consecutive images of slice_bytes each */
+-    uint64_t size = gi->slice_bytes * gi->depth * gi->layers, off = arena_alloc(e, size);
+-    VkBufferImageCopy r = {
+-        .bufferRowLength = gi->row_bytes / gi->bpp,
+-        .bufferImageHeight = (uint32_t)(gi->slice_bytes / gi->row_bytes),
+-        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, gi->layers },
+-        .imageExtent = { gi->width, gi->height, gi->depth },
+-    };
++    /* levels at their recorded offsets; layers and 3D slices are consecutive images */
++    uint64_t size = guest_image_size(gi), off = arena_alloc(e, size);
++    VkBufferImageCopy r[MAX_MIPS];
+ 
+     if (off == UINT64_MAX ||
+         !e->host.read(e->host.opaque, gi->task, gi->va, e->arena_ptr + off, size)) {
+         if (e->upload_failures++ < 20) {
+-            elog(e, "upload failed: task %u va 0x%" G_GINT64_MODIFIER "x %ux%ux%u x%u layers, "
+-                 "%" G_GUINT64_FORMAT " bytes (%s)", gi->task, gi->va, gi->width, gi->height,
+-                 gi->depth, gi->layers, size, off == UINT64_MAX ? "arena full" : "unreadable");
++            elog(e, "upload failed: task %u va 0x%" G_GINT64_MODIFIER "x %ux%ux%u x%u layers "
++                 "%u mips, %" G_GUINT64_FORMAT " bytes (%s)", gi->task, gi->va, gi->width,
++                 gi->height, gi->depth, gi->layers, gi->mips, size,
++                 off == UINT64_MAX ? "arena full" : "unreadable");
+         }
+         return false;
+     }
+-    r.bufferOffset = off;
++    for (uint32_t l = 0; l < gi->mips; l++) {
++        uint32_t row = gi->mip_row[l] ? gi->mip_row[l] : gi->row_bytes;
++
++        r[l] = (VkBufferImageCopy){
++            .bufferOffset = off + gi->mip_off[l],
++            .bufferRowLength = row / gi->bpp,
++            .bufferImageHeight = (uint32_t)(gi->mip_slice[l] / row),
++            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, l, 0, gi->layers },
++            .imageExtent = { MAX(gi->width >> l, 1), MAX(gi->height >> l, 1),
++                             MAX(gi->depth >> l, 1) },
++        };
++    }
+     barrier(e, hi->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+-    vkCmdCopyBufferToImage(e->cmd, e->arena, hi->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+-                           &r);
++    vkCmdCopyBufferToImage(e->cmd, e->arena, hi->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                           gi->mips, r);
+     barrier(e, hi->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, final);
+     e->stats.uploads++;
+     return true;
+@@ -1300,6 +1378,7 @@ static bool submit_wait(PVGExec *e, const VkSubmitInfo *si)
+ 
+ typedef struct Attachment {
+     uint32_t ref, load, store;
++    uint32_t level, slice;      /* rendering into one mip level / array slice / 3D plane */
+     double clear[4];
+     GuestImage gi;
+     HostImage *img;
+@@ -1487,10 +1566,11 @@ static void ds_apply(PVGExec *e, const RenderState *st, bool has_depth, bool has
+     }
+ }
+ 
++/* a level-0, slice-0 attachment: sampling its texture in the pass reads the render target */
+ static bool is_attachment(const Attachment *att, uint32_t natt, uint32_t ref)
+ {
+     for (uint32_t i = 0; i < natt; i++) {
+-        if (att[i].img && att[i].ref == ref) {
++        if (att[i].img && att[i].ref == ref && !att[i].level && !att[i].slice) {
+             return true;
+         }
+     }
+@@ -1542,6 +1622,47 @@ static HostImage *feedback_snapshot(PVGExec *e, uint32_t task, Attachment *a,
+     return snap;
+ }
+ 
++/*
++ * Diagnostics (dump mode): first sight of each sampled texture (task, ref, va, size): log its
++ * shape and how much of it is non-zero, and dump it (to find layers that never reach the screen).
++ */
++static void tex_census(PVGExec *e, uint32_t task, uint32_t ref, const GuestImage *gi)
++{
++    g_autofree char *key = NULL;
++    g_autofree uint8_t *px = NULL;
++    uint64_t size = (uint64_t)gi->row_bytes * gi->height, nz = 0, n = 0;
++
++    if (!e->dump_dir || e->census_count >= 600 || size > (16u << 20)) {
++        return;
++    }
++    key = g_strdup_printf("%u:%u:%" G_GINT64_MODIFIER "x:%ux%u", task, ref, gi->va, gi->width,
++                          gi->height);
++    if (g_hash_table_contains(e->census, key)) {
++        return;
++    }
++    g_hash_table_add(e->census, g_steal_pointer(&key));
++    e->census_count++;
++    px = g_malloc(size);
++    if (!e->host.read(e->host.opaque, gi->task, gi->va, px, size)) {
++        elog(e, "census task %u ref %u %ux%u fmt %d: unreadable", task, ref, gi->width,
++             gi->height, gi->format);
++        return;
++    }
++    for (uint64_t k = 0; k < size; k += 61, n++) {
++        nz += px[k] != 0;
++    }
++    elog(e, "census task %u ref %u %ux%ux%u view %d fmt %d stride %u: nonzero %" G_GUINT64_FORMAT
++         "/%" G_GUINT64_FORMAT, task, ref, gi->width, gi->height, gi->layers, gi->view_type,
++         gi->format, gi->row_bytes, nz, n);
++    if (gi->layers * gi->depth == 1) {
++        g_autofree char *path = g_strdup_printf("%s/tex-%04u-t%u-r%u-fmt%d-%ux%u-s%u.raw",
++                                                e->dump_dir, e->census_count, task, ref,
++                                                gi->format, gi->width, gi->height, gi->row_bytes);
++
++        g_file_set_contents(path, (const char *)px, (gssize)size, NULL);
++    }
++}
++
+ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uint32_t len,
+                                 bool cont)
+ {
+@@ -1605,6 +1726,8 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                 const uint8_t *c = a + (19 + 15 * i) * 4;
+ 
+                 att[i].ref = ldl(c);
++                att[i].level = lduw(c + 8);
++                att[i].slice = lduw(c + 10) + lduw(c + 12);    /* slice or depth plane */
+                 att[i].load = lduw(c + 5 * 4);
+                 att[i].store = lduw(c + 5 * 4 + 2);
+                 for (int k = 0; k < 4; k++) {
+@@ -1628,7 +1751,8 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+     }
+     for (uint32_t i = 0; i < MAX_COLOR; i++) {
+         formats[i] = VK_FORMAT_UNDEFINED;
+-        if (att[i].ref && guest_image(e, task, att[i].ref, &att[i].gi) &&
++        if (att[i].ref &&
++            guest_image_ex(e, task, att[i].ref, att[i].level, att[i].slice, &att[i].gi) &&
+             att[i].gi.view_type == VK_IMAGE_VIEW_TYPE_2D &&
+             (!rw || (att[i].gi.width == rw && att[i].gi.height == rh))) {
+             formats[i] = att[i].gi.format;
+@@ -1683,7 +1807,9 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+         if (!att[i].ref) {
+             continue;
+         }
+-        att[i].img = host_image(e, task, att[i].ref, &att[i].gi, true);
++        /* other levels/slices get their own host image (mip 0 / slice 0 keeps the plain key) */
++        att[i].img = host_image(e, task, att[i].level || att[i].slice ?
++                                att[i].ref | 0x10000000u : att[i].ref, &att[i].gi, true);
+         if (!att[i].img) {
+             vkEndCommandBuffer(e->cmd);
+             return;
+@@ -1723,6 +1849,7 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                     if (hi) {
+                         image_upload(e, &gi, hi, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                     }
++                    tex_census(e, task, refs[i], &gi);
+                     if (att[0].gi.task == 0 && rw >= 1920 && e->stats.uploads < 6000) {
+                         elog(e, "display input task %u ref %u va 0x%" G_GINT64_MODIFIER "x %ux%u "
+                              "stride %u written-by %c", gi.task, refs[i], gi.va, gi.width,
+@@ -1928,7 +2055,8 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                 for (int i = 0; i < MAX_SLOTS; i++) {
+                     for (uint32_t k = 0; st.ftex[i] && (pp->fs_textures >> i & 1) && k < natt;
+                          k++) {
+-                        if (att[k].img && att[k].ref == st.ftex[i]) {
++                        if (att[k].img && att[k].ref == st.ftex[i] && !att[k].level &&
++                            !att[k].slice) {
+                             if (!snaps[k]) {
+                                 snaps[k] = feedback_snapshot(e, task, &att[k], ca, natt, &ri);
+                                 bound = NULL;
+@@ -2130,23 +2258,23 @@ static void exec_blit_segment(PVGExec *e, uint32_t task, const uint8_t *p, uint3
+         off += clen;
+         switch (id) {
+         case 0x12c:     /* CopyFromBufferToTexture */
+-            if (alen >= 0x58 && guest_image(e, task, ldl(a + 4), &gi) && !lduw(a + 0x52)) {
++            if (alen >= 0x58 &&
++                guest_image_ex(e, task, ldl(a + 4), lduw(a + 0x52), lduw(a + 0x50), &gi)) {
+                 uint64_t w = ldq(a + 0x20), h = ldq(a + 0x28), x = ldq(a + 0x38), y = ldq(a + 0x40);
+-                uint64_t bpr = ldq(a + 0x10), slice = lduw(a + 0x50);
++                uint64_t bpr = ldq(a + 0x10);
+ 
+-                if (x + w > gi.width || y + h > gi.height * (slice + 1) || !w || !h ||
++                if (x + w > gi.width || y + h > gi.height || !w || !h ||
+                     !buffer_range(e, task, ldl(a), ldq(a + 8), bpr * (h - 1) + w * gi.bpp, &va)) {
+                     break;
+                 }
+-                /* array slices follow each other in the linear copy */
+-                copy_rows(e, task, va, bpr, gi.task,
+-                          gi.va + (slice * gi.height + y) * gi.row_bytes + x * gi.bpp,
++                copy_rows(e, task, va, bpr, gi.task, gi.va + y * gi.row_bytes + x * gi.bpp,
+                           gi.row_bytes, w * gi.bpp, h);
+                 e->stats.blits++;
+             }
+             break;
+         case 0x12e:     /* CopyFromTextureToBuffer */
+-            if (alen >= 0x58 && guest_image(e, task, ldl(a), &gi) && !lduw(a + 0x52)) {
++            if (alen >= 0x58 &&
++                guest_image_ex(e, task, ldl(a), lduw(a + 0x52), lduw(a + 0x50), &gi)) {
+                 uint64_t x = ldq(a + 8), y = ldq(a + 0x10), w = ldq(a + 0x20), h = ldq(a + 0x28);
+                 uint64_t bpr = ldq(a + 0x40);
+ 
+@@ -2162,9 +2290,10 @@ static void exec_blit_segment(PVGExec *e, uint32_t task, const uint8_t *p, uint3
+             break;
+         case 0x12f:     /* CopyFromTextureToTexture */
+         case 0x130:     /* ...WithOptions: same prefix */
+-            if (alen >= 0x58 && guest_image(e, task, ldl(a), &gi) &&
+-                guest_image(e, task, ldl(a + 4), &gi2) && gi.bpp == gi2.bpp &&
+-                !lduw(a + 0x52) && !lduw(a + 0x56) && !lduw(a + 0x50) && !lduw(a + 0x54)) {
++            if (alen >= 0x58 &&
++                guest_image_ex(e, task, ldl(a), lduw(a + 0x52), lduw(a + 0x50), &gi) &&
++                guest_image_ex(e, task, ldl(a + 4), lduw(a + 0x56), lduw(a + 0x54), &gi2) &&
++                gi.bpp == gi2.bpp) {
+                 uint64_t sx = ldq(a + 8), sy = ldq(a + 0x10), w = ldq(a + 0x20), h = ldq(a + 0x28);
+                 uint64_t dx = ldq(a + 0x38), dy = ldq(a + 0x40);
+ 
+@@ -2334,6 +2463,7 @@ PVGExec *pvg_exec_new(PVGGpu *gpu, const PVGExecHost *host)
+     e->samplers = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
+     e->unnorm = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
+     e->written = g_hash_table_new(g_direct_hash, g_direct_equal);
++    e->census = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+     e->push_descriptor = (PFN_vkCmdPushDescriptorSetKHR)
+         vkGetDeviceProcAddr(gpu->device, "vkCmdPushDescriptorSetKHR");
+     if (!e->push_descriptor || arena_init(e) ||
+@@ -2384,6 +2514,7 @@ void pvg_exec_free(PVGExec *e)
+         g_hash_table_destroy(e->samplers);
+         g_hash_table_destroy(e->unnorm);
+         g_hash_table_destroy(e->written);
++        g_hash_table_destroy(e->census);
+     }
+     for (int i = 0; i < 7; i++) {
+         if (e->dummy[i].view) {
+-- 
+2.43.0
+

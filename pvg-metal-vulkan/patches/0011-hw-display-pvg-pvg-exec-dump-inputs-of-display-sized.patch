@@ -1,0 +1,40 @@
+From acd2f6a17207a1efc2004aaff61d07a65dcee335 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 12:20:57 +0200
+Subject: [PATCH 11/54] hw/display/pvg/pvg-exec: dump inputs of display-sized
+ composite passes (diagnostics)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg/pvg-exec.c | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index 2cb6b15..e5f3159 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -1201,6 +1201,21 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                     if (hi) {
+                         image_upload(e, &gi, hi, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                     }
++                    /* diagnostics: inputs of passes that draw into the 1920x1080 display backing */
++                    if (e->dump_dir && att[0].gi.task == 0 && rw >= 1920 && gi.bpp == 4 &&
++                        e->stats.uploads < 4000) {
++                        uint64_t size = (uint64_t)gi.row_bytes * gi.height;
++                        g_autofree uint8_t *px = g_malloc(size);
++
++                        if (e->host.read(e->host.opaque, gi.task, gi.va, px, size)) {
++                            g_autofree char *path = g_strdup_printf(
++                                "%s/in-%05" G_GUINT64_FORMAT "-t%u-r%u-slot%d-%ux%u-s%u.bgra",
++                                e->dump_dir, e->stats.uploads, task, refs[i], i, gi.width,
++                                gi.height, gi.row_bytes);
++
++                            g_file_set_contents(path, (const char *)px, size, NULL);
++                        }
++                    }
+                 }
+             }
+             o += clen;
+-- 
+2.43.0
+

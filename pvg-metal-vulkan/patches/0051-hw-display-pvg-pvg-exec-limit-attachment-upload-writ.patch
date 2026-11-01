@@ -1,0 +1,328 @@
+From 0998b81df2d7004d15601054bc8e9f50c19df0b4 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Fri, 30 Oct 2026 10:33:42 +0200
+Subject: [PATCH 51/54] hw/display/pvg/pvg-exec: limit attachment
+ upload/write-back to the damage rectangle of a pass
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Union of scissor ∩ viewport over a segment's draws; attachments with load
+action Load or DontCare only transfer that rectangle (~250 MiB saved per 500
+command buffers on the desktop). Property damage-limit (default on).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-pci.c |   6 +-
+ hw/display/pvg/pvg-exec.c  | 152 +++++++++++++++++++++++++++++++++++--
+ hw/display/pvg/pvg-exec.h  |   5 +-
+ hw/display/trace-events    |   2 +-
+ 4 files changed, 155 insertions(+), 10 deletions(-)
+
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index 7dcc1fc..abe884f 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -268,6 +268,7 @@ struct PVGLinuxPCIState {
+      * the worker first, so it never runs concurrently with them.
+      */
+     bool async_exec;
++    bool damage_limit;
+     QemuThread exec_thread;
+     QemuMutex exec_lock;
+     QemuCond exec_cond;
+@@ -1430,7 +1431,8 @@ static void pvg_exec_run_buf(PVGLinuxPCIState *s, uint32_t task, const uint8_t *
+                                   s->exec_max_us, s->exec_read_us / 1000,
+                                   s->exec_read_bytes >> 20, s->exec_write_us / 1000,
+                                   s->exec_write_bytes >> 20, st->gpu_wait_us / 1000);
+-        trace_pvg_linux_exec_pipelines(st->pipeline_us / 1000, st->spv_cache_hits);
++        trace_pvg_linux_exec_pipelines(st->pipeline_us / 1000, st->spv_cache_hits,
++                                       st->damage_saved >> 20);
+         trace_pvg_linux_exec_stats(s->exec_cmdbufs, st->render_passes, st->draws,
+                                    st->skipped_draws, st->pipelines,
+                                    st->pipeline_failures, st->writebacks, st->blits,
+@@ -2070,6 +2072,7 @@ static void pvg_linux_realize(PCIDevice *dev, Error **errp)
+                 }
+                 if (s->exec) {
+                     pvg_exec_set_dry_run(s->exec, s->exec_dry_run);
++                    pvg_exec_set_damage_limit(s->exec, s->damage_limit);
+                 }
+                 if (!s->exec) {
+                     warn_report("pvg-linux-pci: Metal executor initialisation failed");
+@@ -2163,6 +2166,7 @@ static const Property pvg_linux_properties[] = {
+     DEFINE_PROP_UINT32("display-ports", PVGLinuxPCIState, display_ports, 1),
+     DEFINE_PROP_BOOL("guest-fixups", PVGLinuxPCIState, guest_fixups_enable, true),
+     DEFINE_PROP_BOOL("async", PVGLinuxPCIState, async_exec, false),
++    DEFINE_PROP_BOOL("damage-limit", PVGLinuxPCIState, damage_limit, true),
+     DEFINE_PROP_BOOL("gpu", PVGLinuxPCIState, gpu_enable, true),
+     DEFINE_PROP_BOOL("gpu-validation", PVGLinuxPCIState, gpu_validation, false),
+     DEFINE_PROP_BOOL("exec", PVGLinuxPCIState, exec_enable, true),
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index 451f0b2..49ba6c9 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -160,6 +160,7 @@ struct PVGExec {
+     uint32_t upload_failures, ds_kind_logged, ds_states_logged, ds_dumps, blends_logged;
+     GHashTable *spv_cache;      /* SHA-256 of translator inputs -> A2SResult */
+     VkPipelineCache vk_cache;
++    bool damage_limit;          /* upload / write back only what a pass draws */
+     uint8_t unhandled_seen[3][128];   /* command ids already reported */
+     uint32_t texfail_logged, blit_unhandled, resolve_logged, cwb_logged, cio_dumps, buffail_logged, ccmd_logged;
+     DSAttachmentSave last_ds;
+@@ -917,6 +918,38 @@ static bool image_upload(PVGExec *e, const GuestImage *gi, HostImage *hi, VkImag
+     return true;
+ }
+ 
++/* one level-0 rectangle of a single-image attachment: guest rows -> arena -> image */
++static bool image_upload_rect(PVGExec *e, const GuestImage *gi, HostImage *hi, VkRect2D rc,
++                              VkImageLayout final)
++{
++    uint64_t row = (uint64_t)rc.extent.width * gi->bpp, size = row * rc.extent.height;
++    uint64_t off = arena_alloc(e, size);
++    VkBufferImageCopy r = {
++        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++        .imageOffset = { rc.offset.x, rc.offset.y, 0 },
++        .imageExtent = { rc.extent.width, rc.extent.height, 1 },
++    };
++
++    if (off == UINT64_MAX) {
++        return false;
++    }
++    for (uint32_t y = 0; y < rc.extent.height; y++) {
++        if (!e->host.read(e->host.opaque, gi->task,
++                          gi->va + (uint64_t)(rc.offset.y + y) * gi->row_bytes +
++                          (uint64_t)rc.offset.x * gi->bpp, e->arena_ptr + off + y * row, row)) {
++            return false;
++        }
++    }
++    r.bufferOffset = off;
++    barrier(e, hi->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++    vkCmdCopyBufferToImage(e->cmd, e->arena, hi->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                           1, &r);
++    barrier(e, hi->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, final);
++    hi->layout = final;
++    e->stats.uploads++;
++    return true;
++}
++
+ /* ---- samplers: type 7 kind 3, packed MTLSamplerDescriptor at body + 12 ---- */
+ 
+ static VkSamplerAddressMode mtl_address(uint32_t m)
+@@ -1539,6 +1572,61 @@ fail:
+     return p;
+ }
+ 
++/*
++ * Pixels a render segment can change: the union over its draws of scissor ∩ viewport
++ * (Metal defaults: both cover the attachment). Attachments loaded or left undefined only need
++ * that rectangle uploaded and written back.
++ */
++static double ldd(const uint8_t *p);
++
++static VkRect2D segment_damage(const uint8_t *p, uint32_t off, uint32_t len, uint32_t rw,
++                               uint32_t rh)
++{
++    int64_t vx0 = 0, vy0 = 0, vx1 = rw, vy1 = rh, sx0 = 0, sy0 = 0, sx1 = rw, sy1 = rh;
++    int64_t dx0 = rw, dy0 = rh, dx1 = 0, dy1 = 0;
++
++    for (uint32_t o = off; o + 8 <= len;) {
++        uint32_t id = ldl(p + o), clen = ldl(p + o + 4);
++        const uint8_t *a = p + o + 8;
++        uint32_t alen = clen - 8;
++
++        if (clen < 8 || o + clen > len) {
++            break;
++        }
++        o += clen;
++        if ((id == 0x82 && alen >= 48) || (id == 0x83 && alen >= 52 && ldl(a))) {
++            const uint8_t *v = id == 0x82 ? a : a + 4;
++            double x = ldd(v), y = ldd(v + 8), w = ldd(v + 16), h = ldd(v + 24);
++
++            vx0 = (int64_t)floor(MIN(x, x + w));
++            vy0 = (int64_t)floor(MIN(y, y + h));
++            vx1 = (int64_t)ceil(MAX(x, x + w));
++            vy1 = (int64_t)ceil(MAX(y, y + h));
++        } else if ((id == 0x75 && alen >= 32) || (id == 0x76 && alen >= 40 && ldq(a))) {
++            const uint8_t *r = id == 0x75 ? a : a + 8;
++
++            sx0 = (int64_t)ldq(r);
++            sy0 = (int64_t)ldq(r + 8);
++            sx1 = sx0 + (int64_t)ldq(r + 16);
++            sy1 = sy0 + (int64_t)ldq(r + 24);
++        } else if (id == 0x01 || id == 0x03 || id == 0x06 || id == 0x07 || id == 0x09) {
++            dx0 = MIN(dx0, MAX(vx0, sx0));
++            dy0 = MIN(dy0, MAX(vy0, sy0));
++            dx1 = MAX(dx1, MIN(vx1, sx1));
++            dy1 = MAX(dy1, MIN(vy1, sy1));
++        }
++    }
++    dx0 = MAX(dx0, 0);
++    dy0 = MAX(dy0, 0);
++    dx1 = MIN(dx1, (int64_t)rw);
++    dy1 = MIN(dy1, (int64_t)rh);
++    if (dx1 <= dx0 || dy1 <= dy0) {
++        return (VkRect2D){ { 0, 0 }, { 0, 0 } };
++    }
++    return (VkRect2D){ { (int32_t)dx0, (int32_t)dy0 },
++                       { (uint32_t)(dx1 - dx0), (uint32_t)(dy1 - dy0) } };
++}
++
+ /* census: the first time an encoder command id is seen but not executed */
+ static void note_unhandled(PVGExec *e, const char *enc, uint32_t id, uint32_t len)
+ {
+@@ -1721,6 +1809,7 @@ typedef struct Attachment {
+     GuestImage gi;
+     HostImage *img;
+     uint64_t wb_off;
++    VkRect2D damage;            /* region drawn (and uploaded / written back) */
+ } Attachment;
+ 
+ /* DescribeRenderPass depth (bytes 0..39) and stencil (40..75) attachments */
+@@ -2256,12 +2345,31 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+         }
+     }
+ 
++    VkRect2D damage = segment_damage(p, off, len, rw, rh);
++
+     for (uint32_t i = 0; i < natt; i++) {
+         ca[i] = (VkRenderingAttachmentInfo){ .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
+         if (!att[i].img) {
+             continue;
+         }
+-        if (att[i].load == 1) {
++        att[i].damage = (VkRect2D){ { 0, 0 }, { att[i].gi.width, att[i].gi.height } };
++        if (e->damage_limit && att[i].load != 2 && att[i].gi.mips == 1 &&
++            att[i].gi.layers * att[i].gi.depth == 1 &&
++            att[i].gi.width == rw && att[i].gi.height == rh) {
++            att[i].damage = damage;
++        }
++        if (att[i].load == 1 && (att[i].damage.extent.width < att[i].gi.width ||
++                                 att[i].damage.extent.height < att[i].gi.height)) {
++            if (att[i].damage.extent.width && att[i].damage.extent.height) {
++                image_upload_rect(e, &att[i].gi, att[i].img, att[i].damage,
++                                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++            } else {
++                barrier(e, att[i].img->image, VK_IMAGE_LAYOUT_UNDEFINED,
++                        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++            }
++            e->stats.damage_saved += (uint64_t)att[i].gi.row_bytes * att[i].gi.height -
++                (uint64_t)att[i].damage.extent.width * att[i].damage.extent.height * att[i].gi.bpp;
++        } else if (att[i].load == 1) {
+             image_upload(e, &att[i].gi, att[i].img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+         } else {
+             barrier(e, att[i].img->image, VK_IMAGE_LAYOUT_UNDEFINED,
+@@ -2603,13 +2711,19 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+         if (!att[i].img || att[i].store != 1) {
+             continue;
+         }
++        if (!att[i].damage.extent.width || !att[i].damage.extent.height) {
++            continue;           /* nothing drawn into a loaded/undefined attachment */
++        }
+         att[i].wb_off = arena_alloc(e, size);
+         if (att[i].wb_off == UINT64_MAX) {
+             continue;
+         }
+-        r.bufferOffset = att[i].wb_off;
++        /* the arena mirrors the guest layout; only the damage rectangle is copied */
++        r.bufferOffset = att[i].wb_off + (uint64_t)att[i].damage.offset.y * att[i].gi.row_bytes +
++                         (uint64_t)att[i].damage.offset.x * att[i].gi.bpp;
+         r.bufferRowLength = att[i].gi.row_bytes / att[i].gi.bpp;
+-        r.imageExtent = (VkExtent3D){ att[i].gi.width, att[i].gi.height, 1 };
++        r.imageOffset = (VkOffset3D){ att[i].damage.offset.x, att[i].damage.offset.y, 0 };
++        r.imageExtent = (VkExtent3D){ att[i].damage.extent.width, att[i].damage.extent.height, 1 };
+         barrier(e, att[i].img->image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+         vkCmdCopyImageToBuffer(e->cmd, att[i].img->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+@@ -2699,10 +2813,29 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+         }
+         if (att[i].wb_off != UINT64_MAX) {
+             uint64_t n = wb_size(&att[i].gi, (uint64_t)att[i].gi.row_bytes * att[i].gi.height);
++            VkRect2D d = att[i].damage;
+ 
+-            note_write(e, att[i].gi.task, att[i].gi.va, n, 'R');
+-            e->host.write(e->host.opaque, att[i].gi.task, att[i].gi.va,
+-                          e->arena_ptr + att[i].wb_off, n);
++            if (d.extent.width == att[i].gi.width && d.extent.height == att[i].gi.height) {
++                note_write(e, att[i].gi.task, att[i].gi.va, n, 'R');
++                e->host.write(e->host.opaque, att[i].gi.task, att[i].gi.va,
++                              e->arena_ptr + att[i].wb_off, n);
++            } else {
++                uint64_t first = (uint64_t)d.offset.y * att[i].gi.row_bytes +
++                                 (uint64_t)d.offset.x * att[i].gi.bpp;
++                uint64_t w = (uint64_t)d.extent.width * att[i].gi.bpp;
++
++                note_write(e, att[i].gi.task, att[i].gi.va + first,
++                           (uint64_t)(d.extent.height - 1) * att[i].gi.row_bytes + w, 'R');
++                for (uint32_t y = 0; y < d.extent.height; y++) {
++                    uint64_t o = first + (uint64_t)y * att[i].gi.row_bytes;
++
++                    if (o + w <= n) {
++                        e->host.write(e->host.opaque, att[i].gi.task, att[i].gi.va + o,
++                                      e->arena_ptr + att[i].wb_off + o, w);
++                    }
++                }
++                e->stats.damage_saved += n - (uint64_t)d.extent.height * w;
++            }
+             e->stats.writebacks++;
+         }
+     }
+@@ -3594,7 +3727,7 @@ static gboolean match_task_str(gpointer key, gpointer value, gpointer task)
+ 
+ void pvg_exec_reset_wait(PVGExec *e)
+ {
+-    e->stats.gpu_wait_us = e->stats.pipeline_us = 0;
++    e->stats.gpu_wait_us = e->stats.pipeline_us = e->stats.damage_saved = 0;
+ }
+ 
+ void pvg_exec_object_deleted(PVGExec *e, uint32_t task, uint32_t id)
+@@ -3654,6 +3787,11 @@ void pvg_exec_set_dry_run(PVGExec *e, bool dry)
+     e->dry_run = dry;
+ }
+ 
++void pvg_exec_set_damage_limit(PVGExec *e, bool on)
++{
++    e->damage_limit = on;
++}
++
+ void pvg_exec_set_dump_dir(PVGExec *e, const char *dir)
+ {
+     g_free(e->dump_dir);
+diff --git a/hw/display/pvg/pvg-exec.h b/hw/display/pvg/pvg-exec.h
+index d51be4e..a0c510d 100644
+--- a/hw/display/pvg/pvg-exec.h
++++ b/hw/display/pvg/pvg-exec.h
+@@ -30,7 +30,8 @@ typedef struct PVGExecStats {
+     uint64_t uploads, writebacks, blits, skipped_passes, continuations, feedback_copies;
+     uint64_t compute_segments, dispatches;
+     uint64_t gpu_wait_us;       /* since pvg_exec_reset_wait() */
+-    uint64_t spv_cache_hits, pipeline_us;   /* translations reused; time building pipelines */
++    uint64_t spv_cache_hits, pipeline_us;
++    uint64_t damage_saved;      /* bytes not copied thanks to damage rectangles */   /* translations reused; time building pipelines */
+ } PVGExecStats;
+ 
+ typedef struct PVGExec PVGExec;
+@@ -40,6 +41,8 @@ PVGExec *pvg_exec_new(PVGGpu *gpu, const PVGExecHost *host);
+ void pvg_exec_set_dump_dir(PVGExec *e, const char *dir);
+ /* build pipelines and record work but never submit it to the GPU */
+ void pvg_exec_set_dry_run(PVGExec *e, bool dry);
++/* upload / write back only the rectangle a render pass draws into (default on) */
++void pvg_exec_set_damage_limit(PVGExec *e, bool on);
+ void pvg_exec_free(PVGExec *e);
+ void pvg_exec_reset_wait(PVGExec *e);
+ /* Execute one serialized Metal command buffer of a user task */
+diff --git a/hw/display/trace-events b/hw/display/trace-events
+index 86b7e84..71c24a9 100644
+--- a/hw/display/trace-events
++++ b/hw/display/trace-events
+@@ -255,7 +255,7 @@ pvg_linux_ref(uint32_t task, const char *cmd, uint32_t slot, uint32_t ref, uint3
+ pvg_linux_exec(const char *msg) "%s"
+ pvg_linux_exec_stats(uint64_t cmdbufs, uint64_t passes, uint64_t draws, uint64_t skipped, uint64_t pipelines, uint64_t pipe_fail, uint64_t writebacks, uint64_t blits, uint64_t feedback, uint64_t dispatches) "cmdbufs=%"PRIu64" passes=%"PRIu64" draws=%"PRIu64" skipped=%"PRIu64" pipelines=%"PRIu64" failed=%"PRIu64" writebacks=%"PRIu64" blits=%"PRIu64" feedback=%"PRIu64" dispatches=%"PRIu64
+ pvg_linux_exec_time(uint64_t cmdbufs, int64_t exec_ms, int64_t wall_ms, int64_t max_us, int64_t read_ms, uint64_t read_mb, int64_t write_ms, uint64_t write_mb, uint64_t wait_ms) "cmdbufs=%"PRIu64" exec %"PRId64" ms of %"PRId64" ms wall, slowest %"PRId64" us; guest read %"PRId64" ms %"PRIu64" MiB, write %"PRId64" ms %"PRIu64" MiB, gpu wait %"PRIu64" ms"
+-pvg_linux_exec_pipelines(uint64_t pipe_ms, uint64_t spv_hits) "building pipelines %"PRIu64" ms, translations reused %"PRIu64
++pvg_linux_exec_pipelines(uint64_t pipe_ms, uint64_t spv_hits, uint64_t damage_mb) "building pipelines %"PRIu64" ms, translations reused %"PRIu64", damage rectangles saved %"PRIu64" MiB"
+ pvg_linux_child_poke(uint32_t index, uint32_t written, uint32_t read, uint32_t length) "child FIFO %u written=0x%x read=0x%x length=0x%x"
+ pvg_linux_cmd_stub(uint32_t op) "op=0x%02x not implemented, completed"
+ pvg_linux_signal_stamp(uint32_t index, uint32_t value) "stamps[%u]=%u"
+-- 
+2.43.0
+

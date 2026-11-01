@@ -1,0 +1,76 @@
+From 173efe8e733960a1901c2fc45ec8fad31fd9bb30 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Fri, 30 Oct 2026 01:39:17 +0200
+Subject: [PATCH 50/54] hw/display/pvg: skip executor log formatting when
+ tracing is off; reset executor task caches on device reset
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-pci.c | 9 +++++++++
+ hw/display/pvg/pvg-exec.c  | 3 +++
+ hw/display/pvg/pvg-exec.h  | 1 +
+ 3 files changed, 13 insertions(+)
+
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index bee37e0..7dcc1fc 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -1267,6 +1267,11 @@ static void pvg_exec_log(void *opaque, const char *msg)
+     trace_pvg_linux_exec(msg);
+ }
+ 
++static bool pvg_exec_log_enabled(void *opaque)
++{
++    return trace_event_get_state_backends(TRACE_PVG_LINUX_EXEC);
++}
++
+ /* ---- Metal command stream (ExecIndirect2 -> _PGDeserializer) ---- */
+ 
+ #define PVG_MAX_CMDBUF          (4 * MiB)
+@@ -2055,6 +2060,7 @@ static void pvg_linux_realize(PCIDevice *dev, Error **errp)
+                 PVGExecHost host = {
+                     .opaque = s, .read = pvg_exec_read, .write = pvg_exec_write,
+                     .object = pvg_exec_object, .log = pvg_exec_log,
++                    .log_enabled = pvg_exec_log_enabled,
+                     .translate = pvg_exec_translate,
+                 };
+ 
+@@ -2135,6 +2141,9 @@ static void pvg_linux_reset(DeviceState *dev)
+     s->irq_status = 0;
+     s->stamp_status = 0;
+     for (int i = 0; i < PVG_MAX_TASKS; i++) {
++        if (s->tasks[i].root && s->exec) {
++            pvg_exec_task_reset(s->exec, i);    /* task ids start over after a reset */
++        }
+         if (s->tasks[i].mappings) {
+             g_array_free(s->tasks[i].mappings, true);
+         }
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index 361b1a6..451f0b2 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -180,6 +180,9 @@ static void elog(PVGExec *e, const char *fmt, ...)
+     char buf[512];
+     va_list ap;
+ 
++    if (!e->host.log || (e->host.log_enabled && !e->host.log_enabled(e->host.opaque))) {
++        return;
++    }
+     va_start(ap, fmt);
+     vsnprintf(buf, sizeof(buf), fmt, ap);
+     va_end(ap);
+diff --git a/hw/display/pvg/pvg-exec.h b/hw/display/pvg/pvg-exec.h
+index 3cb7842..d51be4e 100644
+--- a/hw/display/pvg/pvg-exec.h
++++ b/hw/display/pvg/pvg-exec.h
+@@ -20,6 +20,7 @@ typedef struct PVGExecHost {
+     uint8_t (*object)(void *opaque, uint32_t task, uint32_t id, void *buf, uint32_t size,
+                       uint32_t *len);
+     void (*log)(void *opaque, const char *msg);
++    bool (*log_enabled)(void *opaque);   /* optional: skip formatting when false */
+     /* guest-physical address of task virtual address va (diagnostics) */
+     bool (*translate)(void *opaque, uint32_t task, uint64_t va, uint64_t *gpa);
+ } PVGExecHost;
+-- 
+2.43.0
+

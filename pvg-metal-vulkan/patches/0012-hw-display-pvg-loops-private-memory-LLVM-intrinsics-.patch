@@ -1,0 +1,1221 @@
+From a2683dddd3d0af64ad62bbb44fb4899a8b6b7bb2 Mon Sep 17 00:00:00 2001
+From: Nassos Yiannopoulos <nassosyian@gmail.com>
+Date: Thu, 29 Oct 2026 12:41:40 +0200
+Subject: [PATCH 12/54] hw/display/pvg: loops, private memory, LLVM intrinsics;
+ blits, samplers, continuations, mip layouts
+
+air2spv: natural loops with OpLoopMerge, dedicated continue blocks and
+split loop headers so inner selections merge inside the loop; selection
+merges clamped into the innermost loop; alloca as Function-storage word
+arrays with offset-tracked pointers; LLVM intrinsics (fmuladd, fma, fabs,
+min/maxnum, ...); forced inlining of helpers; 32-bit derivatives of half
+values. All 141 captured guest shaders now pass spirv-val (vulkan1.3).
+
+pvg-exec: blit segments executed on guest memory (buffer<->texture,
+texture->texture, buffer->buffer, fill); Metal sampler objects decoded
+into VkSamplers; continuation render segments resume the previous pass;
+texture objects with several mip levels; skipped-pass and written-range
+diagnostics.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/pvg-linux-pci.c |   2 +-
+ hw/display/pvg/air2spv.c   | 539 +++++++++++++++++++++++++++++++++----
+ hw/display/pvg/pvg-exec.c  | 336 ++++++++++++++++++++++-
+ hw/display/pvg/pvg-exec.h  |   2 +-
+ hw/display/trace-events    |   2 +-
+ 5 files changed, 811 insertions(+), 70 deletions(-)
+
+diff --git a/hw/display/pvg-linux-pci.c b/hw/display/pvg-linux-pci.c
+index 5316822..82cfe66 100644
+--- a/hw/display/pvg-linux-pci.c
++++ b/hw/display/pvg-linux-pci.c
+@@ -1265,7 +1265,7 @@ static void pvg_cmd_exec_indirect2(PVGLinuxPCIState *s, const uint8_t *p,
+ 
+                 trace_pvg_linux_exec_stats(s->exec_cmdbufs, st->render_passes, st->draws,
+                                            st->skipped_draws, st->pipelines,
+-                                           st->pipeline_failures, st->writebacks);
++                                           st->pipeline_failures, st->writebacks, st->blits);
+             }
+         }
+     }
+diff --git a/hw/display/pvg/air2spv.c b/hw/display/pvg/air2spv.c
+index da43047..54e2d82 100644
+--- a/hw/display/pvg/air2spv.c
++++ b/hw/display/pvg/air2spv.c
+@@ -74,6 +74,10 @@ typedef struct Ctx {
+     uint32_t out_vars[16];      /* fragment render targets / vertex outputs */
+     int nout;
+     LLVMTypeRef ret_ty;
++    /* private memory (alloca): Function-storage uint[] arrays, pointers tracked as byte offsets */
++    struct { LLVMValueRef v; uint32_t var; uint32_t off; uint32_t words; } priv[64];
++    int npriv;
++    uint32_t t_fn_u32_ptr;
+     bool ret_is_struct;
+     bool depth_replacing;
+ } Ctx;
+@@ -751,6 +755,14 @@ typedef struct Cfg {
+     int n;
+     LLVMBasicBlockRef *bb;      /* reverse postorder */
+     int *ipdom;                 /* index into bb, or -1 = function exit */
++    int *loop_merge;            /* per block: merge block if it is a loop header, else -1 */
++    int *loop_continue;         /* per block: continue target (latch) if a loop header */
++    bool *back_edge_block;      /* block's branch goes back to a header */
++    uint32_t *cont_label;       /* per latch: label of the synthetic continue block, 0 = none */
++    uint32_t *split_label;      /* per loop header with an inner selection: second half block */
++    int *inner_loop;            /* per block: header of the innermost loop containing it, or -1 */
++    int *loop_size;             /* per header: number of blocks in its body */
++    uint8_t *bodies;            /* per header: body bitmap (n bytes each) */
+ } Cfg;
+ 
+ static int bb_index(Cfg *g, LLVMBasicBlockRef b)
+@@ -763,75 +775,108 @@ static int bb_index(Cfg *g, LLVMBasicBlockRef b)
+     return -1;
+ }
+ 
+-static void rpo_visit(LLVMBasicBlockRef b, LLVMBasicBlockRef *seen, int *nseen,
+-                      LLVMBasicBlockRef *post, int *npost, bool *loop, LLVMBasicBlockRef *stack,
+-                      int depth)
++static unsigned nsucc(LLVMBasicBlockRef b)
+ {
+-    LLVMValueRef term = LLVMGetBasicBlockTerminator(b);
+-    unsigned ns = term ? LLVMGetNumSuccessors(term) : 0;
+-
+-    seen[(*nseen)++] = b;
+-    stack[depth] = b;
+-    for (unsigned i = 0; i < ns; i++) {
+-        LLVMBasicBlockRef s = LLVMGetSuccessor(term, i);
+-        bool visited = false;
+-
+-        for (int d = 0; d <= depth; d++) {
+-            if (stack[d] == s) {
+-                *loop = true;
+-            }
++    LLVMValueRef t = LLVMGetBasicBlockTerminator(b);
++
++    return t ? LLVMGetNumSuccessors(t) : 0;
++}
++
++static LLVMBasicBlockRef succ(LLVMBasicBlockRef b, unsigned i)
++{
++    return LLVMGetSuccessor(LLVMGetBasicBlockTerminator(b), i);
++}
++
++typedef struct Dfs {
++    LLVMBasicBlockRef *seen, *post, *stack, (*back)[2];
++    int nseen, npost, nback;
++} Dfs;
++
++static void dfs(LLVMBasicBlockRef b, Dfs *d, int depth)
++{
++    d->seen[d->nseen++] = b;
++    d->stack[depth] = b;
++    for (unsigned i = 0; i < nsucc(b); i++) {
++        LLVMBasicBlockRef s = succ(b, i);
++        bool on_stack = false, visited = false;
++
++        for (int k = 0; k <= depth; k++) {
++            on_stack |= d->stack[k] == s;
++        }
++        if (on_stack) {
++            d->back[d->nback][0] = b;
++            d->back[d->nback][1] = s;
++            d->nback++;
++            continue;
+         }
+-        for (int k = 0; k < *nseen; k++) {
+-            if (seen[k] == s) {
+-                visited = true;
+-                break;
+-            }
++        for (int k = 0; k < d->nseen; k++) {
++            visited |= d->seen[k] == s;
+         }
+         if (!visited) {
+-            rpo_visit(s, seen, nseen, post, npost, loop, stack, depth + 1);
++            dfs(s, d, depth + 1);
++        }
++    }
++    d->post[d->npost++] = b;
++}
++
++static bool is_back_edge(Dfs *d, LLVMBasicBlockRef from, LLVMBasicBlockRef to)
++{
++    for (int i = 0; i < d->nback; i++) {
++        if (d->back[i][0] == from && d->back[i][1] == to) {
++            return true;
+         }
+     }
+-    post[(*npost)++] = b;
++    return false;
+ }
+ 
+ static int build_cfg(Ctx *c, Cfg *g)
+ {
+     unsigned total = LLVMCountBasicBlocks(c->fn);
+-    LLVMBasicBlockRef *seen = calloc(total, sizeof(*seen)), *post = calloc(total, sizeof(*post));
+-    LLVMBasicBlockRef *stack = calloc(total + 1, sizeof(*stack));
+-    int nseen = 0, npost = 0, words;
+-    bool loop = false;
++    Dfs d = {
++        .seen = calloc(total, sizeof(*d.seen)), .post = calloc(total, sizeof(*d.post)),
++        .stack = calloc(total + 1, sizeof(*d.stack)), .back = calloc(total + 1, sizeof(*d.back)),
++    };
++    int words;
+     uint64_t *pd;
+ 
+-    rpo_visit(LLVMGetEntryBasicBlock(c->fn), seen, &nseen, post, &npost, &loop, stack, 0);
+-    free(seen);
+-    free(stack);
+-    if (loop) {
+-        free(post);
+-        return fail(c, "loops not supported yet");
+-    }
+-    g->n = npost;
+-    g->bb = calloc(npost, sizeof(*g->bb));
+-    for (int i = 0; i < npost; i++) {
+-        g->bb[i] = post[npost - 1 - i];
++    dfs(LLVMGetEntryBasicBlock(c->fn), &d, 0);
++    g->n = d.npost;
++    g->bb = calloc(g->n, sizeof(*g->bb));
++    g->loop_merge = calloc(g->n, sizeof(int));
++    g->loop_continue = calloc(g->n, sizeof(int));
++    g->back_edge_block = calloc(g->n, sizeof(bool));
++    g->inner_loop = calloc(g->n, sizeof(int));
++    g->cont_label = calloc(g->n, sizeof(uint32_t));
++    g->split_label = calloc(g->n, sizeof(uint32_t));
++    g->loop_size = calloc(g->n, sizeof(int));
++    g->bodies = calloc((size_t)g->n * g->n, 1);
++    for (int i = 0; i < g->n; i++) {
++        g->bb[i] = d.post[g->n - 1 - i];
++        g->loop_merge[i] = g->loop_continue[i] = g->inner_loop[i] = -1;
+     }
+-    free(post);
+ 
+-    /* post-dominator sets over an acyclic CFG: process in postorder (successors first) */
++    /* post-dominator sets on the acyclic graph (back edges removed), successors first */
+     words = (g->n + 63) / 64;
+     pd = calloc((size_t)g->n * words, sizeof(*pd));
+     g->ipdom = calloc(g->n, sizeof(*g->ipdom));
+     for (int i = g->n - 1; i >= 0; i--) {
+-        LLVMValueRef term = LLVMGetBasicBlockTerminator(g->bb[i]);
+-        unsigned ns = LLVMGetNumSuccessors(term);
+         uint64_t *set = pd + (size_t)i * words;
++        bool any = false;
+ 
+-        if (ns > 0) {
+-            memset(set, 0xff, words * sizeof(*set));
+-            for (unsigned s = 0; s < ns; s++) {
+-                int si = bb_index(g, LLVMGetSuccessor(term, s));
+-                uint64_t *ss = pd + (size_t)si * words;
++        for (unsigned s = 0; s < nsucc(g->bb[i]); s++) {
++            LLVMBasicBlockRef sb = succ(g->bb[i], s);
++            int si;
++            uint64_t *ss;
+ 
++            if (is_back_edge(&d, g->bb[i], sb)) {
++                continue;
++            }
++            si = bb_index(g, sb);
++            ss = pd + (size_t)si * words;
++            if (!any) {
++                memcpy(set, ss, words * sizeof(*set));
++                any = true;
++            } else {
+                 for (int w = 0; w < words; w++) {
+                     set[w] &= ss[w];
+                 }
+@@ -843,7 +888,6 @@ static int build_cfg(Ctx *c, Cfg *g)
+         uint64_t *set = pd + (size_t)i * words;
+         int best = -1, bestcount = -1;
+ 
+-        /* immediate post-dominator: the strict post-dominator with the largest set */
+         for (int j = 0; j < g->n; j++) {
+             if (j != i && (set[j / 64] >> (j % 64) & 1)) {
+                 int cnt = 0;
+@@ -860,7 +904,106 @@ static int build_cfg(Ctx *c, Cfg *g)
+         g->ipdom[i] = best;
+     }
+     free(pd);
+-    return 0;
++
++    /* natural loops: one latch per header, one exit block (structurizecfg + unify-loop-exits) */
++    for (int k = 0; k < d.nback; k++) {
++        int latch = bb_index(g, d.back[k][0]), header = bb_index(g, d.back[k][1]);
++        bool *body = calloc(g->n, sizeof(bool));
++        int changed = 1, exit_block = -1;
++
++        if (g->loop_continue[header] >= 0) {
++            free(body);
++            fail(c, "loop with several back edges");
++            goto out;
++        }
++        /* body: header + everything that reaches the latch without passing the header */
++        body[header] = body[latch] = true;
++        while (changed) {
++            changed = 0;
++            for (int i = 0; i < g->n; i++) {
++                if (body[i] || i == header) {
++                    continue;
++                }
++                for (unsigned s = 0; s < nsucc(g->bb[i]); s++) {
++                    int si = bb_index(g, succ(g->bb[i], s));
++
++                    if (si >= 0 && body[si] && si != header) {
++                        body[i] = true;
++                        changed = 1;
++                        break;
++                    }
++                }
++            }
++        }
++        for (int i = 0; i < g->n; i++) {
++            for (unsigned s = 0; body[i] && s < nsucc(g->bb[i]); s++) {
++                int si = bb_index(g, succ(g->bb[i], s));
++
++                if (!body[si]) {
++                    if (exit_block >= 0 && exit_block != si) {
++                        free(body);
++                        fail(c, "loop with several exits");
++                        goto out;
++                    }
++                    exit_block = si;
++                }
++            }
++        }
++        for (int i = 0; i < g->n; i++) {
++            g->bodies[(size_t)header * g->n + i] = body[i];
++            g->loop_size[header] += body[i];
++        }
++        free(body);
++        if (exit_block < 0) {
++            fail(c, "loop without an exit");
++            goto out;
++        }
++        g->loop_merge[header] = exit_block;
++        g->loop_continue[header] = latch;
++        g->back_edge_block[latch] = true;
++        /* a dedicated continue block lets the latch merge selections inside the loop */
++        g->cont_label[latch] = spv_id(&c->m);
++    }
++    /* innermost loop per block; selections inside a loop must merge inside it */
++    for (int h = 0; h < g->n; h++) {
++        if (g->loop_continue[h] < 0) {
++            continue;
++        }
++        for (int i = 0; i < g->n; i++) {
++            int cur = g->inner_loop[i];
++
++            if (g->bodies[(size_t)h * g->n + i] && (cur < 0 || g->loop_size[h] < g->loop_size[cur])) {
++                g->inner_loop[i] = h;
++            }
++        }
++    }
++    for (int i = 0; i < g->n; i++) {
++        int h = g->inner_loop[i];
++
++        if (h >= 0 && h != i && g->ipdom[i] >= 0 && !g->bodies[(size_t)h * g->n + g->ipdom[i]]) {
++            g->ipdom[i] = g->loop_continue[h];
++        }
++    }
++    /* loop headers whose conditional branch is an inner selection get split in two */
++    for (int h = 0; h < g->n; h++) {
++        LLVMValueRef t = LLVMGetBasicBlockTerminator(g->bb[h]);
++        int m = g->loop_merge[h];
++
++        if (m < 0 || !LLVMIsConditional(t) || g->cont_label[h] ||
++            bb_index(g, LLVMGetSuccessor(t, 0)) == m || bb_index(g, LLVMGetSuccessor(t, 1)) == m) {
++            continue;
++        }
++        g->split_label[h] = spv_id(&c->m);
++        if (g->ipdom[h] < 0 || !g->bodies[(size_t)h * g->n + g->ipdom[h]] || g->ipdom[h] == h) {
++            g->ipdom[h] = g->loop_continue[h];
++        }
++    }
++out:
++    free(d.seen);
++    free(d.post);
++    free(d.stack);
++    free(d.back);
++    return c->err[0] ? -1 : 0;
+ }
+ 
+ /* ---- instruction translation ---- */
+@@ -1152,6 +1295,35 @@ static int call_inst(Ctx *c, LLVMValueRef call, uint32_t result)
+     LLVMTypeRef rt = LLVMTypeOf(call);
+     uint32_t rty = ty(c, rt), args[8];
+ 
++    if (full && !strncmp(full, "llvm.", 5)) {
++        static const struct { const char *name; int glsl; } llmap[] = {
++            { "fmuladd", GLSLstd450Fma }, { "fma", GLSLstd450Fma }, { "fabs", GLSLstd450FAbs },
++            { "minnum", GLSLstd450NMin }, { "maxnum", GLSLstd450NMax },
++            { "floor", GLSLstd450Floor }, { "ceil", GLSLstd450Ceil },
++            { "trunc", GLSLstd450Trunc }, { "round", GLSLstd450Round },
++            { "sqrt", GLSLstd450Sqrt }, { "exp2", GLSLstd450Exp2 }, { "log2", GLSLstd450Log2 },
++            { "exp", GLSLstd450Exp }, { "log", GLSLstd450Log }, { "sin", GLSLstd450Sin },
++            { "cos", GLSLstd450Cos }, { "pow", GLSLstd450Pow },
++        };
++        const char *n = full + 5;
++
++        if (!strncmp(n, "lifetime.", 9) || !strncmp(n, "assume", 6) ||
++            !strncmp(n, "experimental.noalias", 20) || !strncmp(n, "dbg.", 4)) {
++            return 0;
++        }
++        for (size_t i = 0; i < sizeof(llmap) / sizeof(llmap[0]); i++) {
++            size_t l = strlen(llmap[i].name);
++
++            if (!strncmp(n, llmap[i].name, l) && n[l] == '.') {
++                for (unsigned k = 0; k < nargs && k < 8; k++) {
++                    args[k] = val(c, LLVMGetOperand(call, k));
++                }
++                ext(c, rty, result, llmap[i].glsl, args, nargs);
++                return 0;
++            }
++        }
++        return fail(c, "unsupported LLVM intrinsic %s", full);
++    }
+     if (!full || strncmp(full, "air.", 4)) {
+         return fail(c, "call to non-AIR function %s", full ? full : "?");
+     }
+@@ -1199,8 +1371,20 @@ static int call_inst(Ctx *c, LLVMValueRef call, uint32_t result)
+         return 0;
+     }
+     if (!strcmp(base, "fwidth") || !strcmp(base, "dfdx") || !strcmp(base, "dfdy")) {
+-        emit(c, base[0] == 'f' ? SpvOpFwidth : base[3] == 'x' ? SpvOpDPdx : SpvOpDPdy, rty,
+-             result, args, 1);
++        uint16_t dop = base[0] == 'f' ? SpvOpFwidth : base[3] == 'x' ? SpvOpDPdx : SpvOpDPdy;
++        LLVMTypeRef et = LLVMGetTypeKind(rt) == LLVMVectorTypeKind ? LLVMGetElementType(rt) : rt;
++
++        if (LLVMGetTypeKind(et) == LLVMHalfTypeKind) {
++            /* derivatives are 32-bit only: widen, differentiate, narrow */
++            uint32_t wt = LLVMGetTypeKind(rt) == LLVMVectorTypeKind ?
++                          spv_type_vec(&c->m, c->t_f32, LLVMGetVectorSize(rt)) : c->t_f32;
++            uint32_t w = emit(c, SpvOpFConvert, wt, 0, args, 1);
++
++            w = emit(c, dop, wt, 0, &w, 1);
++            emit(c, SpvOpFConvert, rty, result, &w, 1);
++        } else {
++            emit(c, dop, rty, result, args, 1);
++        }
+         return 0;
+     }
+     if (!strcmp(base, "convert")) {
+@@ -1335,11 +1519,206 @@ static int emit_return(Ctx *c, LLVMValueRef inst)
+     return 0;
+ }
+ 
++static int priv_find(Ctx *c, LLVMValueRef v)
++{
++    for (int i = 0; i < c->npriv; i++) {
++        if (c->priv[i].v == v) {
++            return i;
++        }
++    }
++    return -1;
++}
++
++/* entry-block declarations for every alloca (must precede other instructions) */
++static int declare_allocas(Ctx *c)
++{
++    for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(c->fn); bb; bb = LLVMGetNextBasicBlock(bb)) {
++        for (LLVMValueRef in = LLVMGetFirstInstruction(bb); in; in = LLVMGetNextInstruction(in)) {
++            LLVMTypeRef at;
++            uint64_t size;
++            uint32_t arr[2], arr_t, ptr_t, ops[3];
++
++            if (LLVMGetInstructionOpcode(in) != LLVMAlloca) {
++                continue;
++            }
++            if (c->npriv == 64 || !LLVMIsAConstantInt(LLVMGetOperand(in, 0))) {
++                return fail(c, "unsupported alloca");
++            }
++            at = LLVMGetAllocatedType(in);
++            size = LLVMABISizeOfType(c->td, at) * LLVMConstIntGetZExtValue(LLVMGetOperand(in, 0));
++            if (!size || size > 64 * 1024) {
++                return fail(c, "alloca of %llu bytes", (unsigned long long)size);
++            }
++            arr[0] = c->t_u32;
++            arr[1] = spv_const_u32(&c->m, (uint32_t)((size + 3) / 4));
++            arr_t = spv_type(&c->m, SpvOpTypeArray, arr, 2);
++            ptr_t = spv_type_ptr(&c->m, SpvStorageFunction, arr_t);
++            ops[0] = ptr_t;
++            ops[1] = spv_id(&c->m);
++            ops[2] = SpvStorageFunction;
++            spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpVariable, ops, 3);
++            c->priv[c->npriv].v = in;
++            c->priv[c->npriv].var = ops[1];
++            c->priv[c->npriv].off = spv_const_u32(&c->m, 0);
++            c->priv[c->npriv].words = (uint32_t)((size + 3) / 4);
++            c->npriv++;
++        }
++    }
++    c->t_fn_u32_ptr = spv_type_ptr(&c->m, SpvStorageFunction, c->t_u32);
++    return 0;
++}
++
++/* GEP on a private pointer: same layout rules as device memory, 32-bit offsets */
++static int priv_gep(Ctx *c, LLVMValueRef inst, int base)
++{
++    LLVMTypeRef t = LLVMGetGEPSourceElementType(inst);
++    unsigned n = LLVMGetNumOperands(inst);
++    uint32_t off = c->priv[base].off;
++
++    if (c->npriv == 64) {
++        return fail(c, "too many private pointers");
++    }
++    for (unsigned i = 1; i < n; i++) {
++        LLVMValueRef idx = LLVMGetOperand(inst, i);
++        uint32_t ops[2], term;
++
++        if (i > 1 && LLVMGetTypeKind(t) == LLVMStructTypeKind) {
++            unsigned field = (unsigned)LLVMConstIntGetZExtValue(idx);
++
++            term = spv_const_u32(&c->m, (uint32_t)LLVMOffsetOfElement(c->td, t, field));
++            t = LLVMStructGetTypeAtIndex(t, field);
++        } else {
++            uint32_t iv;
++
++            if (i > 1) {
++                t = LLVMGetElementType(t);
++            }
++            iv = val(c, idx);
++            if (LLVMGetIntTypeWidth(LLVMTypeOf(idx)) != 32) {
++                iv = emit(c, SpvOpUConvert, c->t_u32, 0, &iv, 1);
++            }
++            ops[0] = iv;
++            ops[1] = spv_const_u32(&c->m, (uint32_t)LLVMABISizeOfType(c->td, t));
++            term = emit(c, SpvOpIMul, c->t_u32, 0, ops, 2);
++        }
++        ops[0] = off;
++        ops[1] = term;
++        off = emit(c, SpvOpIAdd, c->t_u32, 0, ops, 2);
++    }
++    c->priv[c->npriv] = c->priv[base];
++    c->priv[c->npriv].v = inst;
++    c->priv[c->npriv].off = off;
++    c->npriv++;
++    return 0;
++}
++
++/* word index of a private byte offset + k words */
++static uint32_t priv_word_ptr(Ctx *c, int pi, uint32_t k)
++{
++    uint32_t ops[3] = { c->priv[pi].off, spv_const_u32(&c->m, 2) };
++    uint32_t w = emit(c, SpvOpShiftRightLogical, c->t_u32, 0, ops, 2);
++
++    if (k) {
++        ops[0] = w;
++        ops[1] = spv_const_u32(&c->m, k);
++        w = emit(c, SpvOpIAdd, c->t_u32, 0, ops, 2);
++    }
++    ops[0] = c->priv[pi].var;
++    ops[1] = w;
++    return emit(c, SpvOpAccessChain, c->t_fn_u32_ptr, 0, ops, 2);
++}
++
++static bool priv_type_ok(LLVMTypeRef t, unsigned *n)
++{
++    LLVMTypeRef et = LLVMGetTypeKind(t) == LLVMVectorTypeKind ? LLVMGetElementType(t) : t;
++
++    *n = LLVMGetTypeKind(t) == LLVMVectorTypeKind ? LLVMGetVectorSize(t) : 1;
++    return (LLVMGetTypeKind(et) == LLVMFloatTypeKind ||
++            (LLVMGetTypeKind(et) == LLVMIntegerTypeKind && LLVMGetIntTypeWidth(et) == 32)) &&
++           *n <= 16;
++}
++
++static int priv_load(Ctx *c, int pi, LLVMTypeRef t, uint32_t result)
++{
++    unsigned n;
++    uint32_t parts[16];
++    LLVMTypeRef et = LLVMGetTypeKind(t) == LLVMVectorTypeKind ? LLVMGetElementType(t) : t;
++    uint32_t etid = ty(c, et);
++
++    if (!priv_type_ok(t, &n)) {
++        return fail(c, "private load of an unsupported type");
++    }
++    for (unsigned k = 0; k < n; k++) {
++        uint32_t ptr = priv_word_ptr(c, pi, k);
++        uint32_t w = emit(c, SpvOpLoad, c->t_u32, 0, &ptr, 1);
++
++        parts[k] = etid == c->t_u32 ? w : emit(c, SpvOpBitcast, etid, 0, &w, 1);
++    }
++    if (n == 1) {
++        emit(c, SpvOpCopyObject, etid, result, parts, 1);
++    } else {
++        emit(c, SpvOpCompositeConstruct, ty(c, t), result, parts, n);
++    }
++    return 0;
++}
++
++static int priv_store(Ctx *c, int pi, LLVMValueRef value)
++{
++    LLVMTypeRef t = LLVMTypeOf(value);
++    LLVMTypeRef et = LLVMGetTypeKind(t) == LLVMVectorTypeKind ? LLVMGetElementType(t) : t;
++    uint32_t etid = ty(c, et), v = val(c, value);
++    unsigned n;
++
++    if (!priv_type_ok(t, &n)) {
++        return fail(c, "private store of an unsupported type");
++    }
++    for (unsigned k = 0; k < n; k++) {
++        uint32_t ops[2] = { v, k }, e = n == 1 ? v : emit(c, SpvOpCompositeExtract, etid, 0, ops, 2);
++        uint32_t st[2] = { priv_word_ptr(c, pi, k),
++                           etid == c->t_u32 ? e : emit(c, SpvOpBitcast, c->t_u32, 0, &e, 1) };
++
++        spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpStore, st, 2);
++    }
++    return 0;
++}
++
+ static int instruction(Ctx *c, Cfg *g, int bi, LLVMValueRef inst)
+ {
+     LLVMOpcode op = LLVMGetInstructionOpcode(inst);
+     LLVMTypeRef t = LLVMTypeOf(inst);
+-    uint32_t r = LLVMGetTypeKind(t) != LLVMVoidTypeKind ? val(c, inst) : 0;
++    uint32_t r;
++
++    if (op == LLVMAlloca) {
++        return 0;       /* declared up front */
++    }
++    if ((op == LLVMBitCast || op == LLVMAddrSpaceCast) && priv_find(c, LLVMGetOperand(inst, 0)) >= 0) {
++        int b = priv_find(c, LLVMGetOperand(inst, 0));
++
++        if (c->npriv == 64) {
++            return fail(c, "too many private pointers");
++        }
++        c->priv[c->npriv] = c->priv[b];     /* same memory, same offset */
++        c->priv[c->npriv++].v = inst;
++        return 0;
++    }
++    if (op == LLVMGetElementPtr && priv_find(c, LLVMGetOperand(inst, 0)) >= 0) {
++        return priv_gep(c, inst, priv_find(c, LLVMGetOperand(inst, 0)));
++    }
++    if (op == LLVMLoad && priv_find(c, LLVMGetOperand(inst, 0)) >= 0) {
++        return priv_load(c, priv_find(c, LLVMGetOperand(inst, 0)), t, val(c, inst));
++    }
++    if (op == LLVMStore && priv_find(c, LLVMGetOperand(inst, 1)) >= 0) {
++        return priv_store(c, priv_find(c, LLVMGetOperand(inst, 1)), LLVMGetOperand(inst, 0));
++    }
++    for (unsigned i = 0; c->npriv && i < (unsigned)LLVMGetNumOperands(inst); i++) {
++        LLVMValueRef o = LLVMGetOperand(inst, i);
++
++        if (priv_find(c, o) >= 0 && !(op == LLVMCall && LLVMGetCalledValue(inst) &&
++            !strncmp(vname(LLVMGetCalledValue(inst), NULL), "llvm.lifetime.", 14))) {
++            return fail(c, "unsupported use of private memory (opcode %d)", op);
++        }
++    }
++    r = LLVMGetTypeKind(t) != LLVMVoidTypeKind ? val(c, inst) : 0;
+     uint32_t tid = LLVMGetTypeKind(t) != LLVMVoidTypeKind ? ty(c, t) : 0;
+     uint32_t ops[64];
+ 
+@@ -1549,14 +1928,35 @@ static int instruction(Ctx *c, Cfg *g, int bi, LLVMValueRef inst)
+             return fail(c, "phi too wide");
+         }
+         for (unsigned i = 0; i < n; i++) {
++            int pb = bb_index(g, LLVMGetIncomingBlock(inst, i));
++
+             ops[2 * i] = val(c, LLVMGetIncomingValue(inst, i));
+-            ops[2 * i + 1] = label(c, LLVMGetIncomingBlock(inst, i));
++            ops[2 * i + 1] = pb >= 0 && g->cont_label[pb] ? g->cont_label[pb] :
++                             pb >= 0 && g->split_label[pb] ? g->split_label[pb] :
++                             label(c, LLVMGetIncomingBlock(inst, i));
+         }
+         emit(c, SpvOpPhi, tid, r, ops, 2 * n);
+         return 0;
+     }
+     case LLVMBr:
+-        if (LLVMIsConditional(inst)) {
++        if (g->loop_merge[bi] >= 0) {
++            ops[0] = label(c, g->bb[g->loop_merge[bi]]);
++            ops[1] = g->cont_label[g->loop_continue[bi]];
++            ops[2] = 0;
++            spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpLoopMerge, ops, 3);
++        }
++        if (g->split_label[bi]) {
++            /* second half of a split loop header: an ordinary selection inside the loop */
++            spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpBranch, &g->split_label[bi], 1);
++            spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpLabel, &g->split_label[bi], 1);
++            ops[0] = label(c, g->bb[g->ipdom[bi]]);
++            ops[1] = 0;
++            spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpSelectionMerge, ops, 2);
++        } else if (g->cont_label[bi]) {
++            /* latch: hop into the continue block, which carries the original back edge */
++            spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpBranch, &g->cont_label[bi], 1);
++            spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpLabel, &g->cont_label[bi], 1);
++        } else if (g->loop_merge[bi] < 0 && LLVMIsConditional(inst)) {
+             int m = g->ipdom[bi];
+ 
+             if (m < 0) {
+@@ -1565,6 +1965,8 @@ static int instruction(Ctx *c, Cfg *g, int bi, LLVMValueRef inst)
+             ops[0] = label(c, g->bb[m]);
+             ops[1] = 0;
+             spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpSelectionMerge, ops, 2);
++        }
++        if (LLVMIsConditional(inst)) {
+             ops[0] = val(c, LLVMGetCondition(inst));
+             ops[1] = label(c, LLVMGetSuccessor(inst, 0));
+             ops[2] = label(c, LLVMGetSuccessor(inst, 1));
+@@ -1603,6 +2005,9 @@ static int translate_function(Ctx *c)
+         uint32_t l = label(c, g.bb[i]);
+ 
+         spv_emit(&c->m, SPV_SEC_FUNCS, SpvOpLabel, &l, 1);
++        if (i == 0 && declare_allocas(c)) {
++            break;
++        }
+         if (i == 0) {
+             /* arguments: loads of interface variables / push constants */
+             for (int a = 0; a < c->nargs; a++) {
+@@ -1663,6 +2068,14 @@ static int translate_function(Ctx *c)
+     }
+     free(g.bb);
+     free(g.ipdom);
++    free(g.loop_merge);
++    free(g.loop_continue);
++    free(g.back_edge_block);
++    free(g.inner_loop);
++    free(g.cont_label);
++    free(g.split_label);
++    free(g.loop_size);
++    free(g.bodies);
+     return c->err[0] ? -1 : 0;
+ }
+ 
+@@ -1715,8 +2128,24 @@ int air2spv_translate(const void *bitcode, size_t len, A2SResult *io)
+ 
+     /* structured control flow before emission (target-independent passes) */
+     LLVMSetTarget(c.mod, "");
++    /* the emitter handles a single function: force every helper to be inlined */
++    {
++        unsigned ai = LLVMGetEnumAttributeKindForName("alwaysinline", 12);
++        unsigned ni = LLVMGetEnumAttributeKindForName("noinline", 8);
++        unsigned on = LLVMGetEnumAttributeKindForName("optnone", 7);
++
++        for (LLVMValueRef f = LLVMGetFirstFunction(c.mod); f; f = LLVMGetNextFunction(f)) {
++            if (LLVMIsDeclaration(f)) {
++                continue;
++            }
++            LLVMRemoveEnumAttributeAtIndex(f, LLVMAttributeFunctionIndex, ni);
++            LLVMRemoveEnumAttributeAtIndex(f, LLVMAttributeFunctionIndex, on);
++            LLVMAddAttributeAtIndex(f, LLVMAttributeFunctionIndex,
++                                    LLVMCreateEnumAttribute(c.llctx, ai, 0));
++        }
++    }
+     pbo = LLVMCreatePassBuilderOptions();
+-    perr = LLVMRunPasses(c.mod, "cgscc(inline),function(lower-switch,mergereturn,"
++    perr = LLVMRunPasses(c.mod, "always-inline,cgscc(inline),function(lower-switch,mergereturn,"
+                          "fix-irreducible,unify-loop-exits,structurizecfg)", NULL, pbo);
+     LLVMDisposePassBuilderOptions(pbo);
+     if (perr) {
+diff --git a/hw/display/pvg/pvg-exec.c b/hw/display/pvg/pvg-exec.c
+index e5f3159..aaa9740 100644
+--- a/hw/display/pvg/pvg-exec.c
++++ b/hw/display/pvg/pvg-exec.c
+@@ -113,6 +113,11 @@ struct PVGExec {
+     VkCommandBuffer cmd;
+     VkFence fence;
+     bool disabled;              /* a submit failed or hung: stop using the host GPU */
++    /* last render pass, resumed by continuation segments */
++    bool have_last;
++    uint32_t last_task;
++    uint8_t last_att[8 * 256];  /* Attachment[8] */
++    uint8_t last_st[4096];      /* RenderState */
+     char *dump_dir;
+     bool dry_run;
+     PFN_vkCmdPushDescriptorSetKHR push_descriptor;
+@@ -120,7 +125,10 @@ struct PVGExec {
+     GHashTable *images;         /* key: task << 32 | id → HostImage* */
+     GHashTable *pipelines;      /* key: task << 32 | id → Pipeline* */
+     GHashTable *uploaded;       /* per command buffer: task << 32 | id → arena offset + 1 */
++    GHashTable *samplers;       /* task << 32 | id → VkSampler (as pointer) */
+     HostImage dummy[7];         /* 1x1 placeholders per VkImageViewType */
++    struct { uint32_t task; uint64_t va, len; char kind; } written[1024];   /* diagnostics ring */
++    uint32_t nwritten;
+     bool creating_dummies;
+ };
+ 
+@@ -289,6 +297,31 @@ static uint64_t arena_alloc(PVGExec *e, uint64_t len)
+     return off;
+ }
+ 
++/* ---- diagnostics: which guest ranges did the executor produce ---- */
++
++static void note_write(PVGExec *e, uint32_t task, uint64_t va, uint64_t len, char kind)
++{
++    uint32_t i = e->nwritten++ % G_N_ELEMENTS(e->written);
++
++    e->written[i].task = task;
++    e->written[i].va = va;
++    e->written[i].len = len;
++    e->written[i].kind = kind;
++}
++
++static char written_by(PVGExec *e, uint32_t task, uint64_t va, uint64_t len)
++{
++    uint32_t n = MIN(e->nwritten, G_N_ELEMENTS(e->written));
++
++    for (uint32_t i = 0; i < n; i++) {
++        if (e->written[i].task == task && va < e->written[i].va + e->written[i].len &&
++            e->written[i].va < va + len) {
++            return e->written[i].kind;
++        }
++    }
++    return '-';
++}
++
+ /* ---- objects ---- */
+ 
+ static uint8_t object(PVGExec *e, uint32_t task, uint32_t id, uint8_t *buf, uint32_t *len)
+@@ -342,12 +375,18 @@ static bool guest_image(PVGExec *e, uint32_t task, uint32_t ref, GuestImage *gi)
+ 
+     memset(gi, 0, sizeof(*gi));
+     if ((type == OBJ_TEXTURE_2 || type == OBJ_TEXTURE_3) && len >= 0x74) {
+-        desc = obj + 0x54;
++        /* header 0x18, one 0x24-byte entry per mip level, then dimensions, id, descriptor */
++        uint32_t mips = (len - 0x50) / 0x24, tail = 0x18 + mips * 0x24;
++
++        if (tail + 0x38 > len || tail + 0x38 > MAX_OBJ) {
++            return false;
++        }
++        desc = obj + tail + 0x18;
+         gi->task = task;
+         gi->va = ((uint64_t)ldl(obj + 8) << 12) + ldq(obj + 0x10);
+-        gi->row_bytes = (uint32_t)ldq(obj + 0x34);
+-        gi->width = ldl(obj + 0x3c);
+-        gi->height = ldl(obj + 0x40);
++        gi->row_bytes = (uint32_t)ldq(obj + 0x34);      /* mip 0 */
++        gi->width = ldl(obj + tail);
++        gi->height = ldl(obj + tail + 4);
+     } else if (type == OBJ_BACKING_REF_TEX && len >= 0x34) {
+         uint32_t bid = ldl(obj);
+ 
+@@ -522,6 +561,78 @@ static bool image_upload(PVGExec *e, const GuestImage *gi, HostImage *hi, VkImag
+     return true;
+ }
+ 
++/* ---- samplers: type 7 kind 3, packed MTLSamplerDescriptor at body + 12 ---- */
++
++static VkSamplerAddressMode mtl_address(uint32_t m)
++{
++    switch (m) {
++    case 1: return VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE;
++    case 2: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
++    case 3: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
++    case 4: case 5: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
++    default: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    }
++}
++
++static VkSampler sampler_get(PVGExec *e, uint32_t task, uint32_t ref)
++{
++    gint64 key = key_of(task, ref);
++    gpointer v;
++    uint8_t obj[MAX_OBJ];
++    uint32_t len, w0;
++    float lmin, lmax;
++    VkSampler smp = VK_NULL_HANDLE;
++    VkSamplerCreateInfo sci = { .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
++
++    if (!ref) {
++        return e->sampler;
++    }
++    if (g_hash_table_lookup_extended(e->samplers, &key, NULL, &v)) {
++        return v ? (VkSampler)v : e->sampler;
++    }
++    if (object(e, task, ref, obj, &len) == OBJ_SERIALIZED && len >= 28 && ldl(obj) == 3) {
++        w0 = ldl(obj + 12);
++        memcpy(&lmin, obj + 20, 4);
++        memcpy(&lmax, obj + 24, 4);
++        sci.minFilter = (w0 & 3) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
++        sci.magFilter = (w0 >> 2 & 3) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
++        sci.mipmapMode = (w0 >> 24 & 3) == 2 ? VK_SAMPLER_MIPMAP_MODE_LINEAR :
++                         VK_SAMPLER_MIPMAP_MODE_NEAREST;
++        sci.addressModeU = mtl_address(w0 >> 8 & 0xf);
++        sci.addressModeV = mtl_address(w0 >> 12 & 0xf);
++        sci.addressModeW = mtl_address(w0 >> 16 & 0xf);
++        sci.borderColor = (w0 >> 20 & 0xf) == 2 ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE :
++                          (w0 >> 20 & 0xf) == 1 ? VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK :
++                          VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
++        sci.maxAnisotropy = MAX(1, w0 >> 26 & 0x1f);
++        sci.anisotropyEnable = sci.maxAnisotropy > 1;
++        sci.compareEnable = (w0 >> 5 & 7) != 0;
++        sci.compareOp = (VkCompareOp)(w0 >> 5 & 7);
++        sci.unnormalizedCoordinates = !(w0 >> 31);
++        sci.minLod = lmin;
++        sci.maxLod = (w0 >> 24 & 3) == 0 ? 0.25f : lmax;   /* NotMipmapped: base level only */
++        if (sci.unnormalizedCoordinates) {
++            /* Vulkan restrictions for unnormalised samplers */
++            sci.minFilter = sci.magFilter;
++            sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
++            sci.minLod = sci.maxLod = 0;
++            sci.anisotropyEnable = VK_FALSE;
++            sci.compareEnable = VK_FALSE;
++            if (sci.addressModeU != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER) {
++                sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++            }
++            if (sci.addressModeV != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER) {
++                sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++            }
++        }
++        if (vkCreateSampler(e->gpu->device, &sci, NULL, &smp) != VK_SUCCESS) {
++            smp = VK_NULL_HANDLE;
++        }
++    }
++    g_hash_table_insert(e->samplers, key_new(task, ref), (gpointer)smp);
++    return smp ? smp : e->sampler;
++}
++
+ /* ---- pipelines ---- */
+ 
+ typedef struct PlEntry {
+@@ -936,7 +1047,7 @@ fail:
+ typedef struct RenderState {
+     uint32_t pipeline;
+     Binding vbuf[MAX_SLOTS], fbuf[MAX_SLOTS];
+-    uint32_t ftex[MAX_SLOTS], vtex[MAX_SLOTS];
++    uint32_t ftex[MAX_SLOTS], vtex[MAX_SLOTS], fsmp[MAX_SLOTS], vsmp[MAX_SLOTS];
+     VkViewport viewport;
+     VkRect2D scissor;
+     bool have_viewport, have_scissor;
+@@ -1030,7 +1141,8 @@ static bool bind_and_push(PVGExec *e, uint32_t task, RenderState *st, Pipeline *
+             nw++;
+         }
+         if ((p->vs_samplers | p->fs_samplers) & (1u << i)) {
+-            ii[nw] = (VkDescriptorImageInfo){ .sampler = e->sampler };
++            ii[nw] = (VkDescriptorImageInfo){ .sampler = sampler_get(e, task,
++                i < MAX_SLOTS ? ((p->fs_samplers >> i & 1) ? st->fsmp[i] : st->vsmp[i]) : 0) };
+             w[nw] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                 .dstBinding = A2S_SAMPLER_BINDING + i, .descriptorCount = 1,
+                 .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER, .pImageInfo = &ii[nw] };
+@@ -1091,7 +1203,8 @@ static bool is_attachment(const Attachment *att, uint32_t natt, uint32_t ref)
+     return false;
+ }
+ 
+-static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uint32_t len)
++static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uint32_t len,
++                                bool cont)
+ {
+     RenderState st = { 0 };
+     Attachment att[MAX_COLOR] = { 0 };
+@@ -1107,8 +1220,22 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+     uint32_t seg_draws = 0, seg_skipped = 0, seg_dummy = 0, seg_pipes[8], nseg_pipes = 0;
+ 
+     e->stats.segments++;
++    G_STATIC_ASSERT(sizeof(att) <= sizeof(e->last_att) && sizeof(st) <= sizeof(e->last_st));
++    if (cont) {
++        /* resume the previous pass: its attachments were stored to guest memory */
++        if (!e->have_last || e->last_task != task) {
++            return;
++        }
++        memcpy(att, e->last_att, sizeof(att));
++        memcpy(&st, e->last_st, sizeof(st));
++        for (int i = 0; i < MAX_COLOR; i++) {
++            att[i].load = att[i].ref ? 1 : 0;
++            att[i].img = NULL;
++        }
++        found = true;
++    }
+     /* the render pass descriptor comes first */
+-    while (off + 8 <= len) {
++    while (!cont && off + 8 <= len) {
+         uint32_t id = ldl(p + off), clen = ldl(p + off + 4);
+ 
+         if (clen < 8 || off + clen > len) {
+@@ -1138,6 +1265,11 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+     if (!found) {
+         return;
+     }
++    uint32_t raw_ref[MAX_COLOR];
++
++    for (uint32_t i = 0; i < MAX_COLOR; i++) {
++        raw_ref[i] = att[i].ref;
++    }
+     for (uint32_t i = 0; i < MAX_COLOR; i++) {
+         formats[i] = VK_FORMAT_UNDEFINED;
+         if (att[i].ref && guest_image(e, task, att[i].ref, &att[i].gi) &&
+@@ -1151,6 +1283,20 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+         }
+     }
+     if (!natt) {
++        uint8_t obj[MAX_OBJ];
++        uint32_t olen;
++
++        for (int i = 0; i < MAX_COLOR; i++) {
++            uint32_t ref = raw_ref[i];
++
++            if (ref && e->stats.skipped_passes++ < 200) {
++                uint8_t ty = object(e, task, ref, obj, &olen);
++
++                elog(e, "pass skipped: task %u attachment %d ref %u type 0x%x len 0x%x", task, i,
++                     ref, ty, olen);
++                break;
++            }
++        }
+         return;
+     }
+     e->stats.render_passes++;
+@@ -1201,6 +1347,12 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+                     if (hi) {
+                         image_upload(e, &gi, hi, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                     }
++                    if (att[0].gi.task == 0 && rw >= 1920 && e->stats.uploads < 6000) {
++                        elog(e, "display input task %u ref %u va 0x%" G_GINT64_MODIFIER "x %ux%u "
++                             "stride %u written-by %c", gi.task, refs[i], gi.va, gi.width,
++                             gi.height, gi.row_bytes,
++                             written_by(e, gi.task, gi.va, (uint64_t)gi.row_bytes * gi.height));
++                    }
+                     /* diagnostics: inputs of passes that draw into the 1920x1080 display backing */
+                     if (e->dump_dir && att[0].gi.task == 0 && rw >= 1920 && gi.bpp == 4 &&
+                         e->stats.uploads < 4000) {
+@@ -1251,8 +1403,10 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+ 
+         vkCmdBeginRendering(e->cmd, &ri);
+     }
+-    st.viewport = (VkViewport){ 0, (float)rh, (float)rw, -(float)rh, 0, 1 };
+-    st.scissor = (VkRect2D){ { 0, 0 }, { rw, rh } };
++    if (!cont) {
++        st.viewport = (VkViewport){ 0, (float)rh, (float)rw, -(float)rh, 0, 1 };
++        st.scissor = (VkRect2D){ { 0, 0 }, { rw, rh } };
++    }
+ 
+     while (off + 8 <= len) {
+         uint32_t id = ldl(p + off), clen = ldl(p + off + 4);
+@@ -1281,6 +1435,8 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+             }
+             break;
+         case 0x72: set_refs(st.ftex, a, alen); break;
++        case 0x70: case 0x71: set_refs(st.fsmp, a, alen); break;    /* SetFragmentSamplerStates[LODClamp] */
++        case 0x7f: case 0x80: set_refs(st.vsmp, a, alen); break;    /* SetVertexSamplerStates[LODClamp] */
+         case 0x82:      /* SetViewport: 6 doubles */
+             if (alen >= 48) {
+                 double x = ldd(a), y = ldd(a + 8), w = ldd(a + 16), h = ldd(a + 24);
+@@ -1430,12 +1586,138 @@ static void exec_render_segment(PVGExec *e, uint32_t task, const uint8_t *p, uin
+             }
+         }
+         if (att[i].wb_off != UINT64_MAX) {
++            note_write(e, att[i].gi.task, att[i].gi.va,
++                       (uint64_t)att[i].gi.row_bytes * att[i].gi.height, 'R');
+             e->host.write(e->host.opaque, att[i].gi.task, att[i].gi.va,
+                           e->arena_ptr + att[i].wb_off,
+                           (uint64_t)att[i].gi.row_bytes * att[i].gi.height);
+             e->stats.writebacks++;
+         }
+     }
++    memcpy(e->last_att, att, sizeof(att));
++    memcpy(e->last_st, &st, sizeof(st));
++    e->last_task = task;
++    e->have_last = true;
++}
++
++/* ---- blit segments: executed on guest memory (the executor's source of truth) ---- */
++
++static bool buffer_range(PVGExec *e, uint32_t task, uint32_t ref, uint64_t off, uint64_t len,
++                         uint64_t *va)
++{
++    uint8_t obj[MAX_OBJ];
++    uint32_t olen;
++
++    if (object(e, task, ref, obj, &olen) != OBJ_BUFFER || olen < 0x10 ||
++        off + len > ldq(obj) || off + len < off) {
++        return false;
++    }
++    *va = ((uint64_t)ldl(obj + 8) << 12) + off;
++    return true;
++}
++
++/* copy 'rows' rows of 'row' bytes between strided guest ranges through a bounce buffer */
++static bool copy_rows(PVGExec *e, uint32_t stask, uint64_t sva, uint64_t sstride,
++                      uint32_t dtask, uint64_t dva, uint64_t dstride, uint64_t row, uint64_t rows)
++{
++    g_autofree uint8_t *tmp = g_malloc(row);
++
++    for (uint64_t y = 0; y < rows; y++) {
++        if (!e->host.read(e->host.opaque, stask, sva + y * sstride, tmp, row) ||
++            !e->host.write(e->host.opaque, dtask, dva + y * dstride, tmp, row)) {
++            return false;
++        }
++    }
++    note_write(e, dtask, dva, dstride * (rows ? rows - 1 : 0) + row, 'B');
++    return true;
++}
++
++static void exec_blit_segment(PVGExec *e, uint32_t task, const uint8_t *p, uint32_t len)
++{
++    for (uint32_t off = 0; off + 8 <= len;) {
++        uint32_t id = ldl(p + off), clen = ldl(p + off + 4);
++        const uint8_t *a = p + off + 8;
++        uint32_t alen = clen - 8;
++        GuestImage gi, gi2;
++        uint64_t va, va2;
++
++        if (clen < 8 || off + clen > len) {
++            return;
++        }
++        off += clen;
++        switch (id) {
++        case 0x12c:     /* CopyFromBufferToTexture */
++            if (alen >= 0x58 && guest_image(e, task, ldl(a + 4), &gi) && !lduw(a + 0x52)) {
++                uint64_t w = ldq(a + 0x20), h = ldq(a + 0x28), x = ldq(a + 0x38), y = ldq(a + 0x40);
++                uint64_t bpr = ldq(a + 0x10), slice = lduw(a + 0x50);
++
++                if (x + w > gi.width || y + h > gi.height * (slice + 1) || !w || !h ||
++                    !buffer_range(e, task, ldl(a), ldq(a + 8), bpr * (h - 1) + w * gi.bpp, &va)) {
++                    break;
++                }
++                /* array slices follow each other in the linear copy */
++                copy_rows(e, task, va, bpr, gi.task,
++                          gi.va + (slice * gi.height + y) * gi.row_bytes + x * gi.bpp,
++                          gi.row_bytes, w * gi.bpp, h);
++                e->stats.blits++;
++            }
++            break;
++        case 0x12e:     /* CopyFromTextureToBuffer */
++            if (alen >= 0x58 && guest_image(e, task, ldl(a), &gi) && !lduw(a + 0x52)) {
++                uint64_t x = ldq(a + 8), y = ldq(a + 0x10), w = ldq(a + 0x20), h = ldq(a + 0x28);
++                uint64_t bpr = ldq(a + 0x40);
++
++                if (x + w > gi.width || y + h > gi.height || !w || !h ||
++                    !buffer_range(e, task, ldl(a + 4), ldq(a + 0x38), bpr * (h - 1) + w * gi.bpp,
++                                  &va)) {
++                    break;
++                }
++                copy_rows(e, gi.task, gi.va + y * gi.row_bytes + x * gi.bpp, gi.row_bytes, task,
++                          va, bpr, w * gi.bpp, h);
++                e->stats.blits++;
++            }
++            break;
++        case 0x12f:     /* CopyFromTextureToTexture */
++        case 0x130:     /* ...WithOptions: same prefix */
++            if (alen >= 0x58 && guest_image(e, task, ldl(a), &gi) &&
++                guest_image(e, task, ldl(a + 4), &gi2) && gi.bpp == gi2.bpp &&
++                !lduw(a + 0x52) && !lduw(a + 0x56) && !lduw(a + 0x50) && !lduw(a + 0x54)) {
++                uint64_t sx = ldq(a + 8), sy = ldq(a + 0x10), w = ldq(a + 0x20), h = ldq(a + 0x28);
++                uint64_t dx = ldq(a + 0x38), dy = ldq(a + 0x40);
++
++                if (sx + w > gi.width || sy + h > gi.height || dx + w > gi2.width ||
++                    dy + h > gi2.height || !w || !h) {
++                    break;
++                }
++                copy_rows(e, gi.task, gi.va + sy * gi.row_bytes + sx * gi.bpp, gi.row_bytes,
++                          gi2.task, gi2.va + dy * gi2.row_bytes + dx * gi2.bpp, gi2.row_bytes,
++                          w * gi.bpp, h);
++                e->stats.blits++;
++            }
++            break;
++        case 0x12d:     /* CopyFromBufferToBuffer {src, dst, u64 soff, u64 doff, u64 size} */
++            if (alen >= 0x20 && ldq(a + 0x18) &&
++                buffer_range(e, task, ldl(a), ldq(a + 8), ldq(a + 0x18), &va) &&
++                buffer_range(e, task, ldl(a + 4), ldq(a + 0x10), ldq(a + 0x18), &va2)) {
++                copy_rows(e, task, va, 0, task, va2, 0, ldq(a + 0x18), 1);
++                e->stats.blits++;
++            }
++            break;
++        case 0x132:     /* FillBuffer {buf, u64 location, u64 length, u8 value} */
++            if (alen >= 0x15 && ldq(a + 0xc) && ldq(a + 0xc) <= (64u << 20) &&
++                buffer_range(e, task, ldl(a), ldq(a + 4), ldq(a + 0xc), &va)) {
++                g_autofree uint8_t *fill = g_malloc(ldq(a + 0xc));
++
++                memset(fill, a[0x14], ldq(a + 0xc));
++                e->host.write(e->host.opaque, task, va, fill, ldq(a + 0xc));
++                note_write(e, task, va, ldq(a + 0xc), 'F');
++                e->stats.blits++;
++            }
++            break;
++        default:        /* mipmaps, optimise, synchronise, fences: nothing to do in v0 */
++            break;
++        }
++    }
+ }
+ 
+ void pvg_exec_cmdbuf(PVGExec *e, uint32_t task, const uint8_t *buf, uint64_t len)
+@@ -1454,8 +1736,13 @@ void pvg_exec_cmdbuf(PVGExec *e, uint32_t task, const uint8_t *buf, uint64_t len
+         if (seglen < 8 || off + seglen > len) {
+             return;
+         }
+-        if (enc == 0 && !buf[off + 5]) {
+-            exec_render_segment(e, task, buf + off + 8, seglen - 8);
++        if (enc == 2) {
++            exec_blit_segment(e, task, buf + off + 8, seglen - 8);
++        } else if (enc == 0) {
++            if (buf[off + 5]) {
++                e->stats.continuations++;
++            }
++            exec_render_segment(e, task, buf + off + 8, seglen - 8, buf[off + 5]);
+             /* a segment's uploads are only valid until its submit completed */
+             e->arena_used = 0;
+             g_hash_table_remove_all(e->uploaded);
+@@ -1476,7 +1763,19 @@ static gboolean match_task_str(gpointer key, gpointer value, gpointer task)
+ 
+ void pvg_exec_task_reset(PVGExec *e, uint32_t task)
+ {
++    GHashTableIter it;
++    gpointer k, v;
++
+     vkQueueWaitIdle(e->gpu->queue);
++    g_hash_table_iter_init(&it, e->samplers);
++    while (g_hash_table_iter_next(&it, &k, &v)) {
++        if ((uint32_t)(*(gint64 *)k >> 32) == task) {
++            if (v) {
++                vkDestroySampler(e->gpu->device, (VkSampler)v, NULL);
++            }
++            g_hash_table_iter_remove(&it);
++        }
++    }
+     g_hash_table_foreach_remove(e->images, match_task, GUINT_TO_POINTER(task));
+     g_hash_table_foreach_remove(e->pipelines, match_task_str, GUINT_TO_POINTER(task));
+ }
+@@ -1548,6 +1847,7 @@ PVGExec *pvg_exec_new(PVGGpu *gpu, const PVGExecHost *host)
+     e->images = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, image_free);
+     e->pipelines = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, pipeline_free);
+     e->uploaded = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
++    e->samplers = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
+     e->push_descriptor = (PFN_vkCmdPushDescriptorSetKHR)
+         vkGetDeviceProcAddr(gpu->device, "vkCmdPushDescriptorSetKHR");
+     if (!e->push_descriptor || arena_init(e) ||
+@@ -1585,6 +1885,18 @@ void pvg_exec_free(PVGExec *e)
+     g_hash_table_destroy(e->images);
+     g_hash_table_destroy(e->pipelines);
+     g_hash_table_destroy(e->uploaded);
++    {
++        GHashTableIter it;
++        gpointer k, v;
++
++        g_hash_table_iter_init(&it, e->samplers);
++        while (g_hash_table_iter_next(&it, &k, &v)) {
++            if (v) {
++                vkDestroySampler(d, (VkSampler)v, NULL);
++            }
++        }
++        g_hash_table_destroy(e->samplers);
++    }
+     for (int i = 0; i < 7; i++) {
+         if (e->dummy[i].view) {
+             vkDestroyImageView(d, e->dummy[i].view, NULL);
+diff --git a/hw/display/pvg/pvg-exec.h b/hw/display/pvg/pvg-exec.h
+index 13c9737..49f8dff 100644
+--- a/hw/display/pvg/pvg-exec.h
++++ b/hw/display/pvg/pvg-exec.h
+@@ -24,7 +24,7 @@ typedef struct PVGExecHost {
+ 
+ typedef struct PVGExecStats {
+     uint64_t segments, render_passes, draws, skipped_draws, pipelines, pipeline_failures;
+-    uint64_t uploads, writebacks;
++    uint64_t uploads, writebacks, blits, skipped_passes, continuations;
+ } PVGExecStats;
+ 
+ typedef struct PVGExec PVGExec;
+diff --git a/hw/display/trace-events b/hw/display/trace-events
+index d23a329..92ba9a3 100644
+--- a/hw/display/trace-events
++++ b/hw/display/trace-events
+@@ -249,7 +249,7 @@ pvg_linux_segment_bad(uint32_t task, uint64_t off, uint32_t seglen, uint64_t len
+ pvg_linux_gpu(const char *name, bool validation) "host GPU %s (validation %d)"
+ pvg_linux_ref(uint32_t task, const char *cmd, uint32_t slot, uint32_t ref, uint32_t type, uint32_t len, uint32_t kind, uint32_t w0, uint32_t w1) "task %u %s[%u] -> object %u type=0x%x len=0x%x kind=0x%x body=0x%x,0x%x"
+ pvg_linux_exec(const char *msg) "%s"
+-pvg_linux_exec_stats(uint64_t cmdbufs, uint64_t passes, uint64_t draws, uint64_t skipped, uint64_t pipelines, uint64_t pipe_fail, uint64_t writebacks) "cmdbufs=%"PRIu64" passes=%"PRIu64" draws=%"PRIu64" skipped=%"PRIu64" pipelines=%"PRIu64" failed=%"PRIu64" writebacks=%"PRIu64
++pvg_linux_exec_stats(uint64_t cmdbufs, uint64_t passes, uint64_t draws, uint64_t skipped, uint64_t pipelines, uint64_t pipe_fail, uint64_t writebacks, uint64_t blits) "cmdbufs=%"PRIu64" passes=%"PRIu64" draws=%"PRIu64" skipped=%"PRIu64" pipelines=%"PRIu64" failed=%"PRIu64" writebacks=%"PRIu64" blits=%"PRIu64
+ pvg_linux_child_poke(uint32_t index, uint32_t written, uint32_t read, uint32_t length) "child FIFO %u written=0x%x read=0x%x length=0x%x"
+ pvg_linux_cmd_stub(uint32_t op) "op=0x%02x not implemented, completed"
+ pvg_linux_signal_stamp(uint32_t index, uint32_t value) "stamps[%u]=%u"
+-- 
+2.43.0
+
