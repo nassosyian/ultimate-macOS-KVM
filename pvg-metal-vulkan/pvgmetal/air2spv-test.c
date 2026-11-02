@@ -58,17 +58,27 @@ static int vk_init(void)
     VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
                                     .queueFamilyIndex = 0, .queueCount = 1,
                                     .pQueuePriorities = &prio };
+    /* fragment barycentrics and PrimitiveId, as pvg-gpu.c enables them when present */
+    const char *dev_exts[] = { VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME };
+    VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR fbary = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR,
+        .fragmentShaderBarycentric = VK_TRUE };
     VkPhysicalDeviceVulkan13Features f13 = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
         .shaderDemoteToHelperInvocation = VK_TRUE };
     VkPhysicalDeviceVulkan12Features f12 = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &f13,
         .bufferDeviceAddress = VK_TRUE, .scalarBlockLayout = VK_TRUE, .shaderInt8 = VK_TRUE,
-        .shaderFloat16 = VK_TRUE, .storageBuffer8BitAccess = VK_TRUE };
+        .shaderFloat16 = VK_TRUE, .storageBuffer8BitAccess = VK_TRUE,
+        /* argument buffers (A2S_INDIRECT_SET), as pvg-gpu.c enables them */
+        .runtimeDescriptorArray = VK_TRUE, .descriptorBindingPartiallyBound = VK_TRUE,
+        .shaderSampledImageArrayNonUniformIndexing = VK_TRUE,
+        .shaderStorageImageArrayNonUniformIndexing = VK_TRUE };
     VkPhysicalDeviceFeatures2 f2 = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f12,
         .features = { .shaderInt64 = VK_TRUE, .shaderInt16 = VK_TRUE,
-                      .fragmentStoresAndAtomics = VK_TRUE, .shaderFloat64 = VK_TRUE } };
+                      .fragmentStoresAndAtomics = VK_TRUE, .shaderFloat64 = VK_TRUE,
+                      .geometryShader = VK_TRUE } };
     VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f2,
                                .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci };
     PFN_vkCreateDebugUtilsMessengerEXT mk;
@@ -85,6 +95,19 @@ static int vk_init(void)
     if (vkEnumeratePhysicalDevices(instance, &npd, pd) != VK_SUCCESS || !npd) {
         fprintf(stderr, "no Vulkan device\n");
         return -1;
+    }
+    {
+        VkExtensionProperties ext[512];
+        uint32_t next = 512;
+
+        vkEnumerateDeviceExtensionProperties(pd[0], NULL, &next, ext);
+        for (uint32_t i = 0; i < next; i++) {
+            if (!strcmp(ext[i].extensionName, dev_exts[0])) {
+                f13.pNext = &fbary;
+                dci.enabledExtensionCount = 1;
+                dci.ppEnabledExtensionNames = dev_exts;
+            }
+        }
     }
     if (vkCreateDevice(pd[0], &dci, NULL, &device) != VK_SUCCESS) {
         fprintf(stderr, "vkCreateDevice failed\n");

@@ -201,3 +201,17 @@
 - [ ] Blender 4.5: Metal backend needs argument buffers tier 2, barycentrics and MTLGPUFamilyMac2
       (Apple's x86 PVG plugin has no argument buffers at all); crashes in GPU_storagebuf_update
       instead of reporting it. Blender 4.5 has no OpenGL backend on macOS (3.6 LTS untested)
+      Host-side pieces (guest side not changed: the x86 plugin reports no argument buffers):
+  - [x] air2spv barycentrics + primitive_id (BaryCoordKHR, PrimitiveId), VK extension (offline tested)
+  - [x] device-info property: GetDeviceInfo overrides without rebuild (KEY:VALUE/...)
+  - [x] tried 0x21/0x26/0x27/0x2a/0x2b in the guest: no change (Blender's 3 checks still fail)
+  - [x] UseResources / UseHeaps (0x86/0x87/0x89/0x1b) decoded into a per-encoder set
+  - [x] FIFO 0x44 SetObjectAndPlacementList + placement lookup for the executor
+  - [x] air2spv: resource handles and device pointers loaded from memory (bindless + VA translation)
+  - [x] executor: per-command-buffer translation table + bindless descriptor arrays from UseSet
+  - [x] argument buffers: render-stage write-backs; useHeap(s) moot on x86 (newHeapWithDescriptor: returns nil), logged
+  - [x] validation (gpu-validation=on, desktop): 11 errors fixed (feedback snapshot / write-back
+        hard-coded COLOR_ATTACHMENT for GENERAL mip-chain targets; compute storage descriptors
+        written before every slot was prepared): 0 errors in the next validation run
+  - [~] QEMU SIGSEGV on quit after a guest run with gpu-validation=on: not reproduced after the layout fixes (1 run)
+  - [x] confirmed the AIR spelling with real guest-compiled shaders (guest/metal-probe.js)
