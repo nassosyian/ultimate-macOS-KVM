@@ -31,6 +31,7 @@ This was all written by Claude Opus 5.5 (high).
 | Path | What |
 |------|------|
 | `patches/` | the QEMU changes, as `git format-patch` files on top of QEMU v11.1.3 |
+| `scripts/setup.sh` | guided first-time setup on Linux: checks every step below in order and offers to do the missing ones (`--check`: report only) |
 | `scripts/build-qemu.sh` | clones QEMU, applies the patches and builds it into `src/qemu/build` (Linux, or MSYS2 UCRT64 on Windows) |
 | `scripts/collect-rom.sh`, `collect-rom.ps1` | one-time copy of the PVG option ROM out of the guest (Linux, Windows) |
 | `scripts/run-pvg-vm.sh`, `run-pvg-vm.ps1` | boots the ULTMOS VM with the paravirtual GPU (Linux, Windows) |
@@ -42,6 +43,19 @@ After `build-qemu.sh`, the device sources are in `src/qemu/hw/display/pvg-linux-
 device: FIFOs, tasks, display, EFI framebuffer) and `src/qemu/hw/display/pvg/` (`pvg-exec.c`:
 Metal command buffer executor on Vulkan; `air2spv.c`: AIR (Metal shader bitcode) to SPIR-V
 translator; `pvg-guest-fixups.c`: guest-memory patches for Tahoe x86 Metal bugs, see below).
+
+## First run
+
+```sh
+scripts/setup.sh                 # guided: asks before downloading, installing or booting anything
+scripts/setup.sh --check         # only show what is missing
+```
+
+The steps, in order: 1. host build packages, 2. KVM access, 3. an installed macOS Tahoe VM from
+ULTMOS AutoPilot (found automatically in or next to this checkout, or `ULTMOS=`; the answer is
+kept in `local.conf`), 4. QEMU ([Build](#build)), 5. the option ROM ([Collect](#collect-the-option-rom-once)),
+then optionally the qemu-rdw viewer, bridged networking and clipboard/file sharing. The launchers
+run the same checks and, when something is missing, show this list and offer the guided setup.
 
 ## Build
 

@@ -23,6 +23,16 @@ if [ "$WINDOWS" = 1 ] && [ "${MSYSTEM:-}" != UCRT64 ]; then
     echo "run this in an MSYS2 UCRT64 shell (MSYSTEM=UCRT64)" >&2
     exit 1
 fi
+# name the missing packages before downloading QEMU, not as a configure error later
+if [ "$WINDOWS" = 0 ]; then
+    . "$ROOT/scripts/lib/setup-common.sh"
+    DEPS=$(pvg_missing_build_deps)
+    if [ -n "$DEPS" ]; then
+        echo "missing build dependencies: $(pvg_dep_labels <<<"$DEPS")" >&2
+        echo "install them: $(pvg_dep_install_cmd <<<"$DEPS")   (or run scripts/setup.sh)" >&2
+        exit 1
+    fi
+fi
 
 if [ ! -d "$SRC/.git" ]; then
     echo "== cloning QEMU $TAG"

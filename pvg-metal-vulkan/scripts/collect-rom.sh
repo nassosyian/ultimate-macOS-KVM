@@ -10,18 +10,22 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-if [ -z "${ULTMOS:-}" ]; then
-    if [ -f "$ROOT/../main.py" ]; then ULTMOS="$(cd "$ROOT/.." && pwd)"
-    else ULTMOS="$(cd "$ROOT/.." && pwd)/ultimate-macOS-KVM"; fi
-fi
+. "$ROOT/scripts/lib/setup-common.sh"
+pvg_resolve_ultmos
 BOOT_SCRIPT="${BOOT_SCRIPT:-$ULTMOS/boot.sh}"
 XFER_DIR="$ROOT/re/transfer"
 IMG="$XFER_DIR/transfer.img"
 ROM="$ROOT/re/collected/collected/frameworks/ParavirtualizedGraphics.framework/Versions/A/Resources/AppleParavirtEFI.rom"
 
-[ -f "$BOOT_SCRIPT" ] || { echo "no boot script at $BOOT_SCRIPT: create the VM with ULTMOS AutoPilot first" >&2; exit 1; }
+if [ ! -f "$BOOT_SCRIPT" ]; then
+    echo "no boot script at $BOOT_SCRIPT: this step needs an installed ULTMOS VM (setup step 3)" >&2
+    VM=$(pvg_find_vms | head -1)
+    if [ -n "$VM" ]; then echo "found one in $VM: ULTMOS=$VM $0" >&2
+    else echo "create it with ULTMOS AutoPilot ($PVG_ULTMOS_URL), or run scripts/setup.sh" >&2; fi
+    exit 1
+fi
 for t in mkfs.fat mcopy; do
-    command -v "$t" >/dev/null || { echo "missing $t: install dosfstools and mtools" >&2; exit 1; }
+    command -v "$t" >/dev/null || { echo "missing $t: install dosfstools and mtools ($(pvg_dep_install_cmd <<<"x|dosfstools mtools|dosfstools mtools|dosfstools mtools"))" >&2; exit 1; }
 done
 
 mkdir -p "$XFER_DIR"

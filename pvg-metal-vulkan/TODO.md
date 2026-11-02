@@ -115,6 +115,10 @@
 - [x] Device reset (system_reset) verified; executor caches reset; log formatting skipped when tracing off
 - [ ] Trim remaining always-on diagnostics (tex_census, display-input logs) once stable
 - [ ] Guest fixup: verify signature on other macOS builds; make it data-driven
+- [x] New-user guidance: scripts/setup.sh (ordered checks, offers each missing step), launcher preflight
+- [ ] setup.sh: verify the yes-paths by hand (dependency install, build, ROM copy, qemu-rdw build) on a fresh checkout
+- [ ] setup.sh: dnf / pacman package names untested (only apt-get checked on this host)
+- [ ] Same guidance for run-pvg-vm.ps1 (Windows already has setup-windows.cmd)
 
 ## Done
 - Boot picker without VGA; wallpaper colours; icons; Spotlight; crash loop (guest fixup); perf (cached arena)

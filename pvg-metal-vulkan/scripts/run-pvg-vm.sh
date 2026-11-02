@@ -37,12 +37,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-# the ULTMOS VM: the ultimate-macOS-KVM checkout this folder sits in (pvg-metal-vulkan/ in its root),
-# else one next to this folder
-if [ -z "${ULTMOS:-}" ]; then
-    if [ -f "$ROOT/../main.py" ]; then ULTMOS="$(cd "$ROOT/.." && pwd)"
-    else ULTMOS="$(cd "$ROOT/.." && pwd)/ultimate-macOS-KVM"; fi
-fi
+# the ULTMOS VM: $ULTMOS / local.conf, else the ultimate-macOS-KVM checkout this folder sits in
+# (pvg-metal-vulkan/ in its root), else one next to this folder
+. "$ROOT/scripts/lib/setup-common.sh"
+pvg_resolve_ultmos
+QEMU_OVERRIDE="${QEMU:-}"
 QEMU="${QEMU:-$ROOT/src/qemu/build/qemu-system-x86_64}"
 QEMU_IMG="$ROOT/src/qemu/build/qemu-img"
 ROM="$ROOT/re/collected/collected/frameworks/ParavirtualizedGraphics.framework/Versions/A/Resources/AppleParavirtEFI.rom"
@@ -51,8 +50,9 @@ RUN_DIR="$ROOT/re/vm"
 SOCK_DIR="${XDG_RUNTIME_DIR:-/tmp}/kvm-osx"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 
-[ -x "$QEMU" ] || { echo "build QEMU first: ninja -C src/qemu/build qemu-system-x86_64" >&2; exit 1; }
-[ -f "$ROM" ] || { echo "missing AppleParavirtEFI.rom (guest collect step): $ROM" >&2; exit 1; }
+# first run: say what is missing, in setup order, and offer scripts/setup.sh
+pvg_preflight run
+[ -x "$QEMU" ] || { echo "QEMU=$QEMU is not an executable" >&2; exit 1; }
 if pgrep -f "file=$ULTMOS/HDD.qcow2" >/dev/null || pgrep -f "file=$RUN_DIR/hdd-overlay.qcow2" >/dev/null; then
     echo "another VM is using the disk (the ULTMOS VM or a trace VM); stop it first" >&2
     exit 1

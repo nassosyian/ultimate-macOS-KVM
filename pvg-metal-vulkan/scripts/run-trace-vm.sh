@@ -9,12 +9,10 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-# the ULTMOS VM: the ultimate-macOS-KVM checkout this folder sits in (pvg-metal-vulkan/ in its root),
-# else one next to this folder
-if [ -z "${ULTMOS:-}" ]; then
-    if [ -f "$ROOT/../main.py" ]; then ULTMOS="$(cd "$ROOT/.." && pwd)"
-    else ULTMOS="$(cd "$ROOT/.." && pwd)/ultimate-macOS-KVM"; fi
-fi
+# the ULTMOS VM: $ULTMOS / local.conf, else the ultimate-macOS-KVM checkout this folder sits in
+# (pvg-metal-vulkan/ in its root), else one next to this folder
+. "$ROOT/scripts/lib/setup-common.sh"
+pvg_resolve_ultmos
 QEMU="$ROOT/src/qemu/build/qemu-system-x86_64"
 QEMU_IMG="$ROOT/src/qemu/build/qemu-img"
 RUN_DIR="$ROOT/re/vm"
@@ -33,6 +31,7 @@ if [ "${USB:-xhci}" = ehci ]; then USB_ARGS="-usb -device usb-kbd -device usb-ta
 SERIAL_ARGS=""; if [ -n "${SERIAL_LOG:-}" ]; then SERIAL_ARGS="-serial file:$SERIAL_LOG"; fi
 if [ -n "${TRACE_EVENTS:-}" ]; then TRACE_ARGS="-trace events=$TRACE_EVENTS"; else TRACE_ARGS="-trace pvg_linux_*"; fi
 
+pvg_preflight trace
 mkdir -p "$SOCK_DIR" "$RUN_DIR" "$ROOT/logs"
 # NET=bridge: libvirt's NAT bridge virbr0 with vhost-net (needs scripts/setup-bridge-net.sh once);
 # NET=user: QEMU's user-mode network (slirp; stalls on QUIC/UDP, e.g. Safari + iCloud Private Relay).
